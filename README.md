@@ -129,13 +129,6 @@ npm run lint
 
 ---
 
-## 开源与隐私安全提示
 
-在执行 `git add` / `git push` 到 GitHub 前，请确认以下本地敏感数据与大文件已被 `.gitignore` 正确排除：
-- `.env` / `.env.local`：包含环境变量中的 API Key；
-- `data/`：包含 `settings.json`（网页设置里填入的 `customApiKey`）和 `db.json`；
-- `courses/`：包含你本地上传的教材 PDF 原文件、切片及生成的个人学习课件；
-- `public/assets/aistudio/`：开发调试时的临时截图附件；
-- `.venv/`、`node_modules/`、`dist/`：本地依赖与构建产物。
 
 若此前曾在本地初始化过 Git 并误跟踪过上述目录，建议在首次推送前检查：`git status`，必要时用 `git rm -r --cached data courses .env` 取消跟踪。
