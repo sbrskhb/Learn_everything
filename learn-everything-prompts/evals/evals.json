@@ -1,0 +1,29 @@
+{
+  "skill_name": "learn-everything-prompts",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "用户上传了《模拟电子技术基础》关于运算放大器与负反馈章节的讲义，学习目标是“15天掌握运算放大器线性应用、虚短虚断推导与频率响应稳定性分析”，请使用 learn-everything-prompts 生成连续15天的学习计划大纲 JSON 以及第1天的教材级课件 JSON（包含 LaTeX 公式推导、纯黑背景 SVG 框图和离线客观练习题）。",
+      "expected_output": "包含15天递进大纲的 JSON 以及第1天完整的理工科课件 JSON（含 LaTeX 公式、SVG 电路/信号框图及带解析的选择/填空题）。",
+      "files": [],
+      "expectations": [
+        "大纲包含连续递进的日程安排，标题具体明确",
+        "正文包含标准 LaTeX 行内公式 ($...$) 与独立公式块 ($$...$$)",
+        "包含适配纯黑背景 (#050505) 的内联 <svg> 原理框图",
+        "配套练习题均为客观题（choice 或 fill），包含唯一明确的标准答案与详细解析，可离线判分"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "用户创建了一门英语课程“六级核心词汇与外刊精读”，通过词库集合运算（六级词库 - 高考已掌握词库）筛选出今日待学词汇：alleviate, paradigm, scrutinize, resilient, asymmetry, empirical。用户个人兴趣是“人工智能监管与宏观经济”，文章生成方式为“检索并参考 The Economist / The New Yorker 真实外刊主题”。请生成今日英语课件 JSON。",
+      "expected_output": "自然融入全部6个目标词汇的外刊风格深度阅读 JSON，含逐段双语对照、音标例句卡片、长难句拆解和离线客观题。",
+      "files": [],
+      "expectations": [
+        "全部6个今日目标词汇自然融入连贯的英文论述段落中，无机械生硬造句",
+        "targetWords 列表完整包含每个目标词的音标、词义、英文例句与例句翻译",
+        "paragraphs 数组提供逐段对应的 english 原文与 chinese 译文",
+        "包含长难句语法拆解笔记与可离线判分的单选/填空练习题"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Learn_everything",
+  "description": "极简本地每日学习与课件生成系统，支持根据学习资料、目标与期限按日期规划并生成每日课程。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

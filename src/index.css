@@ -1,0 +1,174 @@
+@import "tailwindcss";
+@import "katex/dist/katex.min.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: #000000;
+    color: #f5f5f5;
+    font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    letter-spacing: 0.01em;
+  }
+
+  code, pre, .font-mono {
+    font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .font-serif-reading {
+    font-family: "Source Serif 4", Georgia, "Songti SC", serif;
+  }
+}
+
+/* Markdown & KaTeX reading typography on pure black background */
+.lesson-prose {
+  color: #e5e5e5;
+  line-height: 1.8;
+  font-size: 1rem;
+}
+
+.lesson-prose h1,
+.lesson-prose h2,
+.lesson-prose h3,
+.lesson-prose h4 {
+  color: #ffffff;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin-top: 1.75rem;
+  margin-bottom: 0.75rem;
+  line-height: 1.35;
+}
+
+.lesson-prose h1 {
+  font-size: 1.5rem;
+  border-bottom: 1px solid #262626;
+  padding-bottom: 0.5rem;
+}
+
+.lesson-prose h2 {
+  font-size: 1.25rem;
+  border-bottom: 1px solid #1f1f1f;
+  padding-bottom: 0.4rem;
+}
+
+.lesson-prose h3 {
+  font-size: 1.1rem;
+}
+
+.lesson-prose p {
+  margin-top: 0.85rem;
+  margin-bottom: 0.85rem;
+}
+
+.lesson-prose ul,
+.lesson-prose ol {
+  margin-top: 0.75rem;
+  margin-bottom: 0.75rem;
+  padding-left: 1.5rem;
+}
+
+.lesson-prose ul {
+  list-style-type: disc;
+}
+
+.lesson-prose ol {
+  list-style-type: decimal;
+}
+
+.lesson-prose li {
+  margin-top: 0.35rem;
+  margin-bottom: 0.35rem;
+}
+
+.lesson-prose pre {
+  background-color: #0a0a0a;
+  border: 1px solid #262626;
+  border-radius: 0.375rem;
+  padding: 1rem;
+  overflow-x: auto;
+  margin-top: 1rem;
+  margin-bottom: 1rem;
+  font-size: 0.875rem;
+}
+
+.lesson-prose code {
+  background-color: #141414;
+  border: 1px solid #262626;
+  border-radius: 0.25rem;
+  padding: 0.125rem 0.375rem;
+  font-size: 0.875em;
+  color: #f5f5f5;
+}
+
+.lesson-prose pre code {
+  background-color: transparent;
+  border: none;
+  padding: 0;
+}
+
+.lesson-prose blockquote {
+  border: 1px solid #262626;
+  background-color: #0a0a0a;
+  padding: 0.875rem 1.125rem;
+  border-radius: 0.375rem;
+  color: #a3a3a3;
+  margin: 1rem 0;
+}
+
+.lesson-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.25rem 0;
+  font-size: 0.925rem;
+}
+
+.lesson-prose th,
+.lesson-prose td {
+  border: 1px solid #262626;
+  padding: 0.625rem 0.875rem;
+  text-align: left;
+}
+
+.lesson-prose th {
+  background-color: #0d0d0d;
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.lesson-prose img,
+.lesson-prose svg {
+  max-width: 100%;
+  height: auto;
+  margin: 1.25rem auto;
+  display: block;
+}
+
+.lesson-prose img {
+  cursor: zoom-in;
+  border-radius: 0.375rem;
+  border: 1px solid #262626;
+  transition: border-color 0.15s ease;
+}
+
+.lesson-prose img:hover {
+  border-color: #525252;
+}
+
+.diagram-svg-frame svg,
+.floating-diagram-svg svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.75rem 0;
+  margin: 1rem 0;
+}

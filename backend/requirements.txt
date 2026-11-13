@@ -1,0 +1,3 @@
+# Learn_everything Python Backend Dependencies
+# backend/server.py uses Python 3.8+ standard library modules only (zero mandatory pip packages).
+# Add optional third-party packages below if you extend backend/server.py later.
