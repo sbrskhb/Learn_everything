@@ -56,7 +56,7 @@
 
 ```bash
 # 1. 克隆仓库并进入目录
-git clone https://github.com/<your-username>/Learn_everything.git
+git clone https://github.com/sbrskhb/Learn_everything.git
 cd Learn_everything
 
 # 2. 安装前端与 Node 服务端依赖
