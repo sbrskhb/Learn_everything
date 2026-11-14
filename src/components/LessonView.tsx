@@ -1,5 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { AnimatePresence, motion } from 'motion/react';
 import {
+  AlertTriangle,
   ArrowLeft,
   Check,
   ChevronDown,
@@ -27,8 +30,6 @@ import {
   Trash2,
   Upload,
   X,
-  ZoomIn,
-  ZoomOut,
 } from 'lucide-react';
 import type { OutlineWorkbenchStep } from './CourseOutlineModal';
 import type {
@@ -36,27 +37,58 @@ import type {
   CourseGenerationMode,
   DailyLessonContent,
   DailyPlanSlot,
+  ExerciseQuestion,
+  ExerciseVariantCheck,
+  LessonDiagram,
+  PdfSplitPlanItem,
+  StudyStats,
   VocabItem,
 } from '../types';
 import {
+  extractDiagramSuffix,
+  normalizeDiagramIdKey,
   renderInlineMathWithLatex,
   renderMarkdownWithLatex,
   type VisualAssetRef,
 } from '../utils/markdownMath';
 import { enhanceDiagramSvg, normalizeSvgLatexCommands } from '../utils/svgMath';
-import { gradeExerciseSet, normalizeWordKey } from '../utils/learningLogic';
+import {
+  getEvaluatedSectionMinutes,
+  getSlotExerciseSubmission,
+  getTodayDateString,
+  gradeExerciseSet,
+  gradeSingleExercise,
+  normalizeWordKey,
+  resolveSlotPdfSegments,
+} from '../utils/learningLogic';
 import {
   detectUnresolvedImageRefs,
   parseImportedLessonContent,
   resolveLessonAssetReferences,
   stripAiCitationArtifacts,
 } from '../utils/coursewareParser';
+import {
+  applyCoursewareRepairPatch,
+  auditCoursewareRendering,
+  auditRawCoursewareInput,
+  buildStageRepairPrompt,
+  type LessonGenerationStage,
+} from '../utils/coursewareDiagnostics';
+import {
+  annotateKatexSymbolsInContainer,
+  buildLessonSymbolIndex,
+  lookupSymbolInIndex,
+  type ResolvedLessonSymbol,
+} from '../utils/latexSymbols';
 import { copyCourseFileToClipboard } from '../utils/clipboardFile';
+import { generateLessonWithProgressStream } from '../utils/streamLessonClient';
+import type { GenerationProgressEvent } from '../utils/streamProgress';
 
 interface LessonViewProps {
   course: Course;
   slot: DailyPlanSlot;
-  onBack: () => void;
+  backLabel?: string;
+  onBack: (e?: React.MouseEvent) => void;
   onSelectDayIndex?: (dayIndex: number) => void;
   onCourseUpdated: (updatedCourse: Course) => void;
   onOpenAgentModal: (course: Course) => void;
@@ -64,6 +96,9 @@ interface LessonViewProps {
     course: Course,
     step?: OutlineWorkbenchStep
   ) => void;
+  onLiveStudySecondsChange?: (seconds: number) => void;
+  onStudyStatsUpdated?: (stats: StudyStats) => void;
+  showContentCategoryBadges?: boolean;
 }
 
 const DIFFICULTY_LABELS: Record<string, string> = {
@@ -75,21 +110,26 @@ const DIFFICULTY_LABELS: Record<string, string> = {
 export const LessonView: React.FC<LessonViewProps> = ({
   course,
   slot,
+  backLabel = '时间轴',
   onBack,
   onSelectDayIndex,
   onCourseUpdated,
   onOpenAgentModal,
   onOpenOutlineModal,
+  onLiveStudySecondsChange,
+  onStudyStatsUpdated,
+  showContentCategoryBadges = false,
 }) => {
   const [isRegenerating, setIsRegenerating] = useState(false);
   const [regenElapsedSec, setRegenElapsedSec] = useState(0);
+  const [regenProgress, setRegenProgress] = useState<GenerationProgressEvent | null>(null);
   const [regenSuccessSummary, setRegenSuccessSummary] = useState<string | null>(null);
   const [isDeletingLesson, setIsDeletingLesson] = useState(false);
   const [regenError, setRegenError] = useState<string | null>(null);
 
   // Quick Section Material Access states
   const [copiedQuickPrompt, setCopiedQuickPrompt] = useState(false);
-  const [copiedQuickPdf, setCopiedQuickPdf] = useState(false);
+  const [copiedQuickPdfKey, setCopiedQuickPdfKey] = useState<string | null>(null);
   const [pdfCopyNotice, setPdfCopyNotice] = useState<string | null>(null);
   const [isCuttingSegment, setIsCuttingSegment] = useState(false);
 
@@ -106,6 +146,9 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
   // Inline Agent Mode states (same level as Chat Mode, no modal popup required)
   const [agentPromptText, setAgentPromptText] = useState<string>('');
+  const [agentStage1Prompt, setAgentStage1Prompt] = useState<string>('');
+  const [agentStage2Prompt, setAgentStage2Prompt] = useState<string>('');
+  const [agentInlineStage, setAgentInlineStage] = useState<'stage1' | 'stage2'>('stage1');
   const [agentWorkspaceDir, setAgentWorkspaceDir] = useState<string>('');
   const [isLoadingAgentPrompt, setIsLoadingAgentPrompt] = useState(false);
   const [copiedAgentPrompt, setCopiedAgentPrompt] = useState(false);
@@ -139,7 +182,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
   const [revealedHeuristics, setRevealedHeuristics] = useState<Record<string, boolean>>({});
 
   // Exercise states (persisted + graded offline, plus per-question hint & instant offline check)
-  const savedSubmission = course.exerciseSubmissions?.[slot.date];
+  const savedSubmission = getSlotExerciseSubmission(course, slot);
   const [userAnswers, setUserAnswers] = useState<Record<string, string>>(
     savedSubmission?.userAnswers || {}
   );
@@ -148,18 +191,60 @@ export const LessonView: React.FC<LessonViewProps> = ({
   const [revealedSingleExercises, setRevealedSingleExercises] = useState<Record<string, boolean>>(
     {}
   );
+  const [variantAnswers, setVariantAnswers] = useState<Record<string, string>>({});
+  const [variantSubmitted, setVariantSubmitted] = useState<Record<string, boolean>>({});
 
   // Reverse explanation self-check states (persisted locally offline)
-  const savedReverseNotes = course.reverseCheckNotes?.[slot.date] || {};
+  const savedReverseNotes =
+    course.reverseCheckNotes?.[slot.id] || course.reverseCheckNotes?.[slot.date] || {};
   const [reverseDrafts, setReverseDrafts] = useState<Record<string, string>>(savedReverseNotes);
   const [revealedReverseChecks, setRevealedReverseChecks] = useState<Record<string, boolean>>({});
+
+  // Hideable qualityCheck state (persisted in localStorage)
+  const [hideQualityCheck, setHideQualityCheck] = useState<boolean>(() => {
+    try {
+      const stored = window.localStorage.getItem('learn_everything_hide_quality_check_v1');
+      return stored === null ? true : stored === '1';
+    } catch {
+      return true;
+    }
+  });
+  const handleToggleQualityCheckVisibility = (nextHidden: boolean) => {
+    setHideQualityCheck(nextHidden);
+    try {
+      window.localStorage.setItem('learn_everything_hide_quality_check_v1', nextHidden ? '1' : '0');
+    } catch {
+      // ignore storage failure
+    }
+  };
+
+  // Automatic render audit & repair prompt UI states
+  const [copiedImportRepairPrompt, setCopiedImportRepairPrompt] = useState(false);
+  const [showImportRepairPromptPreview, setShowImportRepairPromptPreview] = useState(false);
+  const [copiedActiveRepairPrompt, setCopiedActiveRepairPrompt] = useState(false);
+  const [copiedStageKey, setCopiedStageKey] = useState<LessonGenerationStage | null>(null);
+  const [stageRepairPreview, setStageRepairPreview] = useState<{
+    stage: LessonGenerationStage;
+    prompt: string;
+  } | null>(null);
+  const [showActiveAuditDetails, setShowActiveAuditDetails] = useState(false);
+  const [dismissedActiveAuditKey, setDismissedActiveAuditKey] = useState<string | null>(null);
+  const [showQuickRepairBox, setShowQuickRepairBox] = useState(false);
+  const [quickRepairInput, setQuickRepairInput] = useState('');
+  const [isApplyingQuickRepair, setIsApplyingQuickRepair] = useState(false);
+  const [quickRepairNotice, setQuickRepairNotice] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
+  const [importReplaceHint, setImportReplaceHint] = useState<string | null>(null);
+  const chatImportBoxRef = useRef<HTMLTextAreaElement | null>(null);
+  const quickRepairBoxRef = useRef<HTMLTextAreaElement | null>(null);
 
   // Floating non-blocking diagram / image mini-window states
   const [floatingVisualId, setFloatingVisualId] = useState<string | null>(null);
   const [floatingTempVisual, setFloatingTempVisual] = useState<VisualAssetRef | null>(null);
   const [isFloatingExpanded, setIsFloatingExpanded] = useState(false);
   const [isFloatingCollapsed, setIsFloatingCollapsed] = useState(false);
-  const [floatingScale, setFloatingScale] = useState(1);
   const [floatingOffset, setFloatingOffset] = useState<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
   const dragStateRef = useRef<{
     dragging: boolean;
@@ -169,15 +254,40 @@ export const LessonView: React.FC<LessonViewProps> = ({
     origDy: number;
   }>({ dragging: false, startX: 0, startY: 0, origDx: 0, origDy: 0 });
 
+  // Interactive LaTeX symbol explanation popover states (for symbols explained earlier in the lesson)
+  const articleRef = useRef<HTMLElement | null>(null);
+  const [activeSymbolPopover, setActiveSymbolPopover] = useState<{
+    entry: ResolvedLessonSymbol;
+    rect: { left: number; top: number; bottom: number; width: number };
+  } | null>(null);
+
   // Active displayed lesson: either previewLesson (when previewing in Chat Mode) or slot.lesson
   const activeLesson = previewLesson || slot.lesson;
+
+  const boundSegments = useMemo(
+    () => resolveSlotPdfSegments(slot, course.pdfSplitPlan),
+    [slot, course.pdfSplitPlan]
+  );
+  const slicedBoundSegments = useMemo(
+    () =>
+      boundSegments.filter(
+        (seg) =>
+          seg.status === 'sliced' ||
+          Boolean(seg.segmentRelPath || seg.segmentFileName)
+      ),
+    [boundSegments]
+  );
+  const primaryBoundSegment =
+    slicedBoundSegments[0] || boundSegments[0] || slot.pdfSegment;
 
   const hasPdfSource = useMemo(
     () =>
       course.materials?.some(
         (m) => m.isPdf || m.fileName.toLowerCase().endsWith('.pdf')
-      ) || Boolean(slot.pdfSegment),
-    [course.materials, slot.pdfSegment]
+      ) ||
+      boundSegments.length > 0 ||
+      Boolean(slot.pdfSegment),
+    [course.materials, boundSegments.length, slot.pdfSegment]
   );
 
   const sortedSlots = useMemo(
@@ -200,6 +310,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
     setPendingAssets({});
     setPdfCopyNotice(null);
     setRegenError(null);
+    setRegenProgress(null);
     setRegenSuccessSummary(null);
     setAgentSyncMsg(null);
     setAgentSyncErr(null);
@@ -214,12 +325,21 @@ export const LessonView: React.FC<LessonViewProps> = ({
     setFloatingTempVisual(null);
     setIsFloatingExpanded(false);
     setIsFloatingCollapsed(false);
-    setFloatingScale(1);
     setFloatingOffset({ dx: 0, dy: 0 });
-    const sub = course.exerciseSubmissions?.[slot.date];
+    setShowQuickRepairBox(false);
+    setQuickRepairInput('');
+    setQuickRepairNotice(null);
+    setImportReplaceHint(null);
+    const sub = getSlotExerciseSubmission(course, slot);
     setUserAnswers(sub?.userAnswers || {});
     setIsSubmitted(Boolean(sub));
-    setReverseDrafts(course.reverseCheckNotes?.[slot.date] || {});
+    setVariantAnswers({});
+    setVariantSubmitted({});
+    setStageRepairPreview(null);
+    setCopiedStageKey(null);
+    setReverseDrafts(
+      course.reverseCheckNotes?.[slot.id] || course.reverseCheckNotes?.[slot.date] || {}
+    );
     setIsChatWorkbenchOpen(
       !slot.lesson && (course.generationMode === 'chat' || course.generationMode === 'agent')
     );
@@ -234,6 +354,63 @@ export const LessonView: React.FC<LessonViewProps> = ({
     }, 200);
     return () => window.clearInterval(timer);
   }, [isRegenerating]);
+
+  // Track real active study time inside LessonView and flush periodically + on unmount
+  const unsyncedStudySecRef = useRef(0);
+  const studyCourseIdRef = useRef(course.id);
+  const onLiveStudySecondsChangeRef = useRef(onLiveStudySecondsChange);
+  const onStudyStatsUpdatedRef = useRef(onStudyStatsUpdated);
+  studyCourseIdRef.current = course.id;
+  onLiveStudySecondsChangeRef.current = onLiveStudySecondsChange;
+  onStudyStatsUpdatedRef.current = onStudyStatsUpdated;
+
+  useEffect(() => {
+    unsyncedStudySecRef.current = 0;
+    onLiveStudySecondsChangeRef.current?.(0);
+
+    const flushStudyTime = (useKeepalive = false) => {
+      const pending = unsyncedStudySecRef.current;
+      if (pending <= 0) return;
+      unsyncedStudySecRef.current = 0;
+      onLiveStudySecondsChangeRef.current?.(0);
+      const payload = JSON.stringify({
+        date: getTodayDateString(),
+        courseId: studyCourseIdRef.current,
+        deltaSeconds: pending,
+      });
+      fetch('/api/stats/study-time', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload,
+        keepalive: useKeepalive,
+      })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (data?.studyStats) {
+            onStudyStatsUpdatedRef.current?.(data.studyStats);
+          }
+        })
+        .catch(() => {
+          // ignore transient sync failure
+        });
+    };
+
+    const tickTimer = window.setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return;
+      }
+      unsyncedStudySecRef.current += 1;
+      onLiveStudySecondsChangeRef.current?.(unsyncedStudySecRef.current);
+      if (unsyncedStudySecRef.current >= 10) {
+        flushStudyTime(false);
+      }
+    }, 1000);
+
+    return () => {
+      window.clearInterval(tickTimer);
+      flushStudyTime(true);
+    };
+  }, [course.id, slot.dayIndex]);
 
   useEffect(() => {
     if (!floatingVisualId) return;
@@ -277,6 +454,16 @@ export const LessonView: React.FC<LessonViewProps> = ({
       .then((res) => res.json())
       .then((data) => {
         if (data.lessonPrompt) setChatLessonPrompt(data.lessonPrompt);
+        if (data.agentStage1Prompt) setAgentStage1Prompt(data.agentStage1Prompt);
+        if (data.agentStage2Prompt) {
+          setAgentStage2Prompt(data.agentStage2Prompt);
+          if (slot.stage1Draft && !slot.lesson) {
+            setAgentInlineStage('stage2');
+          }
+        } else {
+          setAgentStage2Prompt('');
+          setAgentInlineStage('stage1');
+        }
       })
       .catch(() => {
         // ignore
@@ -284,7 +471,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
       .finally(() => {
         setIsLoadingChatPrompt(false);
       });
-  }, [course.id, slot.dayIndex]);
+  }, [course.id, slot.dayIndex, slot.stage1Draft, slot.lesson]);
 
   useEffect(() => {
     setIsLoadingAgentPrompt(true);
@@ -333,7 +520,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          sectionId: slot.pdfSegment?.sectionId || slot.regionId || slot.id,
+          sectionId: primaryBoundSegment?.sectionId || slot.pdfSegment?.sectionId || slot.regionId || slot.id,
         }),
       });
       const data = await res.json();
@@ -346,11 +533,20 @@ export const LessonView: React.FC<LessonViewProps> = ({
     }
   };
 
-  const handleCopyPdfFileToClipboard = async () => {
+  const handleCopyPdfFileToClipboard = async (
+    targetSegmentOrEvent?: PdfSplitPlanItem | React.MouseEvent,
+    copyKey = 'default'
+  ) => {
+    const targetSegment =
+      targetSegmentOrEvent &&
+      typeof targetSegmentOrEvent === 'object' &&
+      'sectionId' in targetSegmentOrEvent
+        ? targetSegmentOrEvent
+        : primaryBoundSegment;
     setRegenError(null);
     setPdfCopyNotice(null);
-    const relPath = slot.pdfSegment
-      ? `segments/${slot.pdfSegment.segmentFileName || `${slot.pdfSegment.sectionId || slot.id}.pdf`}`
+    const relPath = targetSegment
+      ? `segments/${targetSegment.segmentFileName || `${targetSegment.sectionId || slot.id}.pdf`}`
       : firstPdfMaterial
         ? `sources/${firstPdfMaterial.fileName}`
         : '';
@@ -358,8 +554,10 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
     try {
       const result = await copyCourseFileToClipboard(course.id, relPath);
-      setCopiedQuickPdf(true);
-      setTimeout(() => setCopiedQuickPdf(false), 2500);
+      setCopiedQuickPdfKey(copyKey);
+      setTimeout(() => {
+        setCopiedQuickPdfKey((prev) => (prev === copyKey ? null : prev));
+      }, 2500);
       if (result.copiedToOsClipboard) {
         setPdfCopyNotice(
           `已将 ${result.fileName || relPath} 复制到系统剪贴板，等效资源管理器 Ctrl+C，可直接按 Ctrl+V 粘贴给 AI 对话框或文件夹。`
@@ -379,6 +577,48 @@ export const LessonView: React.FC<LessonViewProps> = ({
     () => ({ ...(course.customAssets || {}), ...pendingAssets }),
     [course.customAssets, pendingAssets]
   );
+
+  const importAuditResult = useMemo(
+    () => auditRawCoursewareInput(rawImportInput, slot, combinedAssets),
+    [rawImportInput, slot, combinedAssets]
+  );
+
+  const quickRepairAuditResult = useMemo(() => {
+    const trimmed = quickRepairInput.trim();
+    if (!trimmed) return null;
+    if (activeLesson) {
+      try {
+        const { mergedLesson, appliedSummary, appliedMode } = applyCoursewareRepairPatch(
+          activeLesson,
+          trimmed,
+          slot,
+          combinedAssets
+        );
+        const report = auditCoursewareRendering(mergedLesson, combinedAssets);
+        return {
+          report,
+          parsedLesson: mergedLesson,
+          appliedSummary,
+          appliedMode,
+        };
+      } catch {
+        // Fallback to raw input audit so JSON syntax errors are reported clearly
+      }
+    }
+    const rawAudit = auditRawCoursewareInput(trimmed, slot, combinedAssets);
+    return rawAudit
+      ? {
+          ...rawAudit,
+          appliedSummary: undefined,
+          appliedMode: undefined,
+        }
+      : null;
+  }, [quickRepairInput, activeLesson, slot, combinedAssets]);
+
+  const activeLessonAudit = useMemo(() => {
+    if (!activeLesson) return null;
+    return auditCoursewareRendering(activeLesson, combinedAssets);
+  }, [activeLesson, combinedAssets]);
 
   const existingLessonUnresolvedRefs = useMemo(() => {
     if (!activeLesson?.markdownBody) return [];
@@ -403,9 +643,25 @@ export const LessonView: React.FC<LessonViewProps> = ({
         stageLabel: d.stageLabel ? stripAiCitationArtifacts(d.stageLabel) : undefined,
         caption: d.caption ? stripAiCitationArtifacts(d.caption) : undefined,
         kind: 'svg',
-        svgCode: enhanceDiagramSvg(d.svgCode),
+        svgCode: enhanceDiagramSvg(d.svgCode || ''),
         index: idx + 1,
       });
+    });
+
+    (resolvedActiveLesson.exercises || []).forEach((ex, exIdx) => {
+      if (ex.svgCode && ex.svgCode.includes('<svg')) {
+        const exDiagId = (ex.diagramId || `diag-${ex.id || `ex-${exIdx + 1}`}`).trim();
+        if (!visuals.some((v) => v.id.toLowerCase() === exDiagId.toLowerCase())) {
+          visuals.push({
+            id: exDiagId,
+            title: stripAiCitationArtifacts(ex.diagramTitle || `练习题 #${exIdx + 1} 配图`),
+            caption: ex.diagramCaption ? stripAiCitationArtifacts(ex.diagramCaption) : undefined,
+            kind: 'svg',
+            svgCode: enhanceDiagramSvg(ex.svgCode),
+            index: visuals.length + 1,
+          });
+        }
+      }
     });
 
     const seenImgUrls = new Set<string>();
@@ -458,6 +714,53 @@ export const LessonView: React.FC<LessonViewProps> = ({
     setIsFloatingCollapsed(false);
   };
 
+  const symbolIndex = useMemo(
+    () => buildLessonSymbolIndex(resolvedActiveLesson || activeLesson),
+    [resolvedActiveLesson, activeLesson]
+  );
+
+  // Close symbol popover when switching lessons or pressing Escape / clicking outside
+  useEffect(() => {
+    setActiveSymbolPopover(null);
+    if (articleRef.current) {
+      articleRef.current
+        .querySelectorAll('.latex-symbol-active')
+        .forEach((el) => el.classList.remove('latex-symbol-active'));
+    }
+  }, [slot.dayIndex, slot.date, activeLesson?.title]);
+
+  useEffect(() => {
+    if (!activeSymbolPopover) return;
+    const handleKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') {
+        setActiveSymbolPopover(null);
+        articleRef.current
+          ?.querySelectorAll('.latex-symbol-active')
+          .forEach((el) => el.classList.remove('latex-symbol-active'));
+      }
+    };
+    const handleDocClick = (ev: MouseEvent) => {
+      const target = ev.target as HTMLElement | null;
+      if (!target) return;
+      if (
+        target.closest('[data-testid="latex-symbol-popover"]') ||
+        target.closest('[data-latex-symbol]')
+      ) {
+        return;
+      }
+      setActiveSymbolPopover(null);
+      articleRef.current
+        ?.querySelectorAll('.latex-symbol-active')
+        .forEach((el) => el.classList.remove('latex-symbol-active'));
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('mousedown', handleDocClick);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('mousedown', handleDocClick);
+    };
+  }, [activeSymbolPopover]);
+
   /**
    * Build interleaved closed-loop flow so heuristic questions ("先思考，后讲解"),
    * teaching diagrams ("图文同步"), and immediate exercises ("知识点闭环即时练习")
@@ -473,6 +776,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
           | { kind: 'exercise'; exIdx: number }
         >,
         comprehensiveExerciseIndices: [] as number[],
+        exerciseDiagramsByExId: {} as Record<string, LessonDiagram>,
       };
     }
 
@@ -487,14 +791,45 @@ export const LessonView: React.FC<LessonViewProps> = ({
     const usedExIndices = new Set<number>();
 
     const findDiagramIdx = (token: string): number => {
-      const clean = token.trim();
-      const byId = diagrams.findIndex(
-        (d, idx) => (d.id || `diag-${idx + 1}`).toLowerCase() === clean.toLowerCase()
+      const clean = token
+        .trim()
+        .replace(/^[\[\(（]+|[\]\)）]+$/g, '')
+        .replace(/^(?:图示|图)\s*/, '')
+        .trim();
+      const byExact = diagrams.findIndex(
+        (d, idx) => (d.id || `diag-${idx + 1}`).trim().toLowerCase() === clean.toLowerCase()
       );
-      if (byId !== -1) return byId;
-      const numMatch = clean.match(/(\d+)/);
-      if (numMatch) {
-        const idx = parseInt(numMatch[1], 10) - 1;
+      if (byExact !== -1) return byExact;
+
+      const cleanKey = normalizeDiagramIdKey(clean).replace(/^diagram/, 'diag');
+      const byNorm = diagrams.findIndex(
+        (d, idx) =>
+          normalizeDiagramIdKey(d.id || `diag-${idx + 1}`).replace(/^diagram/, 'diag') === cleanKey
+      );
+      if (byNorm !== -1) return byNorm;
+
+      const cleanSuffix = extractDiagramSuffix(clean);
+      if (cleanSuffix) {
+        const bySuffix = diagrams.findIndex(
+          (d, idx) => extractDiagramSuffix(d.id || `diag-${idx + 1}`) === cleanSuffix
+        );
+        if (bySuffix !== -1) return bySuffix;
+
+        // Sub-panel parent fallback: e.g. `diag-4c` -> parent `diag-4` (one SVG containing (a)(b)(c) sub-panels)
+        const subPanelMatch = cleanSuffix.match(/^(\d+)[a-z]$/i);
+        if (subPanelMatch) {
+          const parentNum = subPanelMatch[1];
+          const byParentSuffix = diagrams.findIndex(
+            (d, idx) => extractDiagramSuffix(d.id || `diag-${idx + 1}`) === parentNum
+          );
+          if (byParentSuffix !== -1) return byParentSuffix;
+        }
+      }
+
+      // Numeric index fallback ONLY for pure numbers or plain `diag-N` (no letter suffix like 4c)
+      const numOnlyMatch = clean.toLowerCase().match(/^(?:(?:diagram|diag)[-_\s]*)?(\d+)$/);
+      if (numOnlyMatch) {
+        const idx = parseInt(numOnlyMatch[1], 10) - 1;
         if (idx >= 0 && idx < diagrams.length) return idx;
       }
       return -1;
@@ -534,8 +869,9 @@ export const LessonView: React.FC<LessonViewProps> = ({
       | { kind: 'diagram'; diagIdx: number }
       | { kind: 'exercise'; exIdx: number };
 
-    // Step 1: Parse explicit {{heuristic:...}}, {{diagram:...}}, {{exercise:...}} anchors
-    const tokenRegex = /\{\{\s*(heuristic|diagram|exercise)\s*:\s*([^}]+?)\s*\}\}/gi;
+    // Step 1: Parse explicit {{heuristic:...}}, {{diagram:...}}, {{diag:...}}, [[diagram:...]], {{exercise:...}} anchors
+    const tokenRegex =
+      /`?\s*(?:\{\{|\[{2})\s*(heuristic|diagram|diag|exercise)\s*:\s*([^}\]]+?)\s*(?:\}\}|\]{2})\s*`?/gi;
     const initialBlocks: RawBlock[] = [];
     let lastIdx = 0;
     let match: RegExpExecArray | null;
@@ -545,7 +881,8 @@ export const LessonView: React.FC<LessonViewProps> = ({
       if (before) {
         initialBlocks.push({ kind: 'markdown', md: before });
       }
-      const kind = match[1].toLowerCase();
+      const rawKind = match[1].toLowerCase();
+      const kind = rawKind === 'diag' ? 'diagram' : rawKind;
       const refId = match[2].trim();
       if (kind === 'heuristic') {
         const idx = findHqIdx(refId);
@@ -573,6 +910,48 @@ export const LessonView: React.FC<LessonViewProps> = ({
     if (tail) {
       initialBlocks.push({ kind: 'markdown', md: tail });
     }
+
+    // Step 1.5: Claim exercise-dedicated diagrams (via ex.diagramId, ex.svgCode, or diag-ex-* in question)
+    // so they render directly inside the exercise card rather than getting interleaved into prose sections.
+    const exerciseDiagramsByExId: Record<string, LessonDiagram> = {};
+    exercises.forEach((ex, exIdx) => {
+      const exId = ex.id || `ex-${exIdx + 1}`;
+      let matchedDiagIdx = -1;
+
+      if (ex.diagramId) {
+        matchedDiagIdx = findDiagramIdx(ex.diagramId);
+      }
+      if (matchedDiagIdx === -1) {
+        // Check if diagrams array has a dedicated diagram like `diag-ex-1` or `diag-${ex.id}`
+        matchedDiagIdx = diagrams.findIndex((d, dIdx) => {
+          const dId = (d.id || `diag-${dIdx + 1}`).trim().toLowerCase();
+          return (
+            dId === `diag-${exId.toLowerCase()}` ||
+            dId === `diag-ex-${exIdx + 1}` ||
+            dId === `diag_ex_${exIdx + 1}`
+          );
+        });
+      }
+      if (matchedDiagIdx === -1 && ex.question) {
+        // Check if the question explicitly references a dedicated exercise diagram like `diag-ex-1`
+        const exDiagRefMatch = ex.question.match(/\b(diag(?:ram)?[-_]?ex[-_]?\w+)\b/i);
+        if (exDiagRefMatch) {
+          matchedDiagIdx = findDiagramIdx(exDiagRefMatch[1]);
+        }
+      }
+
+      if (matchedDiagIdx !== -1 && diagrams[matchedDiagIdx]) {
+        exerciseDiagramsByExId[exId] = diagrams[matchedDiagIdx];
+        usedDiagIndices.add(matchedDiagIdx);
+      } else if (ex.svgCode && ex.svgCode.includes('<svg')) {
+        exerciseDiagramsByExId[exId] = {
+          id: ex.diagramId || `diag-${exId}`,
+          title: ex.diagramTitle || `练习题 #${exIdx + 1} 配图`,
+          caption: ex.diagramCaption || '',
+          svgCode: ex.svgCode,
+        };
+      }
+    });
 
     // Step 2: Check for any un-anchored heuristics, diagrams, or inline exercises
     const remainingHqIndices = heuristics
@@ -707,8 +1086,25 @@ export const LessonView: React.FC<LessonViewProps> = ({
       .map((_, idx) => idx)
       .filter((idx) => !usedExIndices.has(idx));
 
-    return { blocks, comprehensiveExerciseIndices };
+    return { blocks, comprehensiveExerciseIndices, exerciseDiagramsByExId };
   }, [activeLesson, combinedAssets, lessonVisuals]);
+
+  // Annotate rendered KaTeX symbols that were explained earlier in the lesson
+  useEffect(() => {
+    if (!articleRef.current) return;
+    annotateKatexSymbolsInContainer(articleRef.current, symbolIndex);
+  }, [
+    symbolIndex,
+    interleavedLessonFlow,
+    activeLesson,
+    isSubmitted,
+    revealedHeuristicHints,
+    revealedHeuristics,
+    revealedExerciseHints,
+    revealedSingleExercises,
+    revealedReverseChecks,
+    hideQualityCheck,
+  ]);
 
   const renderedGrammarNotes = useMemo(() => {
     if (!activeLesson?.englishPayload?.grammarAndUsageNotes) return '';
@@ -742,15 +1138,19 @@ export const LessonView: React.FC<LessonViewProps> = ({
     setIsRegenerating(true);
     setRegenError(null);
     setRegenSuccessSummary(null);
+    setRegenProgress({
+      type: 'progress',
+      stage: 'connecting',
+      step: 1,
+      percent: 4,
+      message: '正在连接后端并准备本节教材 PDF 上下文...',
+    });
     try {
-      const res = await fetch(
-        `/api/courses/${course.id}/days/${slot.dayIndex}/generate`,
-        { method: 'POST' }
+      const data = await generateLessonWithProgressStream(
+        course.id,
+        slot.dayIndex,
+        (ev) => setRegenProgress(ev)
       );
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || '重新生成课件失败');
-      }
       setPreviewLesson(null);
       onCourseUpdated(data.course);
       const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
@@ -768,13 +1168,19 @@ export const LessonView: React.FC<LessonViewProps> = ({
       setRegenError(err?.message || '生成课件失败，请检查设置或使用下方 Chat / Agent 模式导入');
     } finally {
       setIsRegenerating(false);
+      setRegenProgress(null);
     }
   };
 
+  const effectiveAgentInlinePrompt =
+    agentInlineStage === 'stage2' && agentStage2Prompt
+      ? agentStage2Prompt
+      : agentStage1Prompt || agentPromptText;
+
   const handleCopyAgentPromptInline = async () => {
-    if (!agentPromptText) return;
+    if (!effectiveAgentInlinePrompt) return;
     try {
-      await navigator.clipboard.writeText(agentPromptText);
+      await navigator.clipboard.writeText(effectiveAgentInlinePrompt);
       setCopiedAgentPrompt(true);
       setTimeout(() => setCopiedAgentPrompt(false), 2000);
     } catch {
@@ -783,12 +1189,12 @@ export const LessonView: React.FC<LessonViewProps> = ({
   };
 
   const handleDownloadAgentPromptInline = () => {
-    if (!agentPromptText) return;
-    const blob = new Blob([agentPromptText], { type: 'text/markdown;charset=utf-8' });
+    if (!effectiveAgentInlinePrompt) return;
+    const blob = new Blob([effectiveAgentInlinePrompt], { type: 'text/markdown;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${course.folderName || course.name}_AGENT_TASK_PROMPT.md`;
+    a.download = `${course.folderName || course.name}_${slot.id}_agent-${agentInlineStage}-prompt.md`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -1035,6 +1441,149 @@ export const LessonView: React.FC<LessonViewProps> = ({
     }
   };
 
+  const handleApplyQuickRepair = async (overrideText?: string) => {
+    const sourceText = (overrideText ?? quickRepairInput).trim();
+    if (!sourceText) {
+      setQuickRepairNotice({
+        ok: false,
+        message: '请先粘贴 AI 输出的增量修复补丁 JSON、单独 SVG 代码块或修复后内容。',
+      });
+      return;
+    }
+    setIsApplyingQuickRepair(true);
+    setQuickRepairNotice(null);
+    try {
+      let targetLesson: DailyLessonContent;
+      if (activeLesson) {
+        const patched = applyCoursewareRepairPatch(
+          activeLesson,
+          sourceText,
+          slot,
+          combinedAssets
+        );
+        targetLesson = patched.mergedLesson;
+      } else {
+        const check = auditRawCoursewareInput(sourceText, slot, combinedAssets);
+        if (
+          check &&
+          !check.parsedLesson &&
+          check.report.issues[0]?.category === 'json_syntax_error'
+        ) {
+          throw new Error(check.report.issues[0].detail);
+        }
+        targetLesson =
+          check?.parsedLesson ||
+          parseImportedLessonContent(sourceText, slot, 'chat', combinedAssets).lesson;
+      }
+
+      const res = await fetch(`/api/courses/${course.id}/days/${slot.dayIndex}/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          rawContent: JSON.stringify(targetLesson, null, 2),
+          lessonData: targetLesson,
+          uploadedAssets: pendingAssets,
+          sourceMode: activeLesson?.sourceMode || 'chat',
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || '保存修复后课件失败');
+      }
+      setPreviewLesson(null);
+      setQuickRepairInput('');
+      setShowQuickRepairBox(false);
+      setShowActiveAuditDetails(false);
+      setDismissedActiveAuditKey(null);
+      onCourseUpdated(data.course);
+    } catch (err: any) {
+      setQuickRepairNotice({
+        ok: false,
+        message:
+          err?.message ||
+          '解析或应用修复补丁失败，请检查粘贴内容是否为增量补丁 JSON、SVG 代码块或合法课件格式。',
+      });
+    } finally {
+      setIsApplyingQuickRepair(false);
+    }
+  };
+
+  const handlePasteClipboardToQuickRepair = async () => {
+    setShowQuickRepairBox(true);
+    setQuickRepairNotice(null);
+    try {
+      if (!navigator.clipboard?.readText) {
+        throw new Error('no-clipboard-read');
+      }
+      const clipText = (await navigator.clipboard.readText()).trim();
+      if (!clipText) {
+        setQuickRepairNotice({
+          ok: false,
+          message: '剪贴板当前为空，请先复制 AI 返回的增量补丁或修复内容，再点击或在下方输入框直接 Ctrl+V。',
+        });
+        window.setTimeout(() => quickRepairBoxRef.current?.focus(), 40);
+        return;
+      }
+      setQuickRepairInput(clipText);
+      if (activeLesson) {
+        try {
+          const patched = applyCoursewareRepairPatch(activeLesson, clipText, slot, combinedAssets);
+          const postAudit = auditCoursewareRendering(patched.mergedLesson, combinedAssets);
+          if (postAudit.errorCount === 0) {
+            await handleApplyQuickRepair(clipText);
+            return;
+          }
+          setQuickRepairNotice({
+            ok: false,
+            message: `${patched.appliedSummary}，但仍余 ${postAudit.errorCount} 处问题，请核对下方提示或点击“立即应用补丁并保存”。`,
+          });
+          return;
+        } catch {
+          // Fall through to raw check
+        }
+      }
+      const check = auditRawCoursewareInput(clipText, slot, combinedAssets);
+      if (check && check.parsedLesson && check.report.errorCount === 0) {
+        await handleApplyQuickRepair(clipText);
+      } else if (check && check.report.issues.length > 0) {
+        setQuickRepairNotice({
+          ok: false,
+          message: `已粘贴剪贴板内容，但仍检测到 ${check.report.errorCount} 处问题，请核对下方提示或手动修改后再应用。`,
+        });
+      }
+    } catch {
+      setQuickRepairNotice({
+        ok: false,
+        message: '浏览器未授予自动读取剪贴板权限，请直接在下方输入框按 Ctrl+V / Cmd+V 粘贴后点击“立即应用补丁并保存”。',
+      });
+      window.setTimeout(() => quickRepairBoxRef.current?.focus(), 40);
+    }
+  };
+
+  const handlePasteClipboardToImportBox = async () => {
+    setImportReplaceHint(null);
+    try {
+      if (!navigator.clipboard?.readText) {
+        throw new Error('no-clipboard-read');
+      }
+      const clipText = (await navigator.clipboard.readText()).trim();
+      if (!clipText) {
+        setImportReplaceHint('剪贴板为空，请先复制 AI 修复后的内容，再粘贴到上方输入框。');
+        chatImportBoxRef.current?.focus();
+        return;
+      }
+      setRawImportInput(clipText);
+      setImportError(null);
+      setPreviewLesson(null);
+      setImportReplaceHint('已从剪贴板替换上方输入内容并自动完成重检。');
+    } catch {
+      setRawImportInput('');
+      setPreviewLesson(null);
+      setImportReplaceHint('已清空上方输入框并聚焦，请直接按 Ctrl+V / Cmd+V 粘贴 AI 修复后的内容。');
+      window.setTimeout(() => chatImportBoxRef.current?.focus(), 30);
+    }
+  };
+
   const handleSaveEditedLesson = async () => {
     setIsSavingEdit(true);
     try {
@@ -1094,6 +1643,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          sectionId: slot.id,
           date: slot.date,
           userAnswers,
           score: result.score,
@@ -1121,6 +1671,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          sectionId: slot.id,
           date: slot.date,
           checkId,
           userExplanation: reverseDrafts[checkId] || '',
@@ -1133,6 +1684,198 @@ export const LessonView: React.FC<LessonViewProps> = ({
     } catch {
       // Offline local state already updated
     }
+  };
+
+  const renderDiagramTopologySpec = (topologySpec?: string) => {
+    const cleanSpec = (topologySpec || '').trim();
+    if (!cleanSpec) return null;
+    return (
+      <details className="mt-2 border border-neutral-800/80 rounded bg-neutral-950/70 px-3 py-2 text-[11px] text-neutral-300">
+        <summary className="cursor-pointer select-none font-mono text-neutral-400 hover:text-neutral-200 transition-colors">
+          查看前置结构规格（节点 / 连接 / 参考方向 / 关键参数）
+        </summary>
+        <div
+          className="mt-2 pt-2 border-t border-neutral-800/70 text-neutral-300 leading-relaxed whitespace-pre-wrap [&>p]:m-0"
+          dangerouslySetInnerHTML={{
+            __html: renderMarkdownWithLatex(cleanSpec, lessonVisuals),
+          }}
+        />
+      </details>
+    );
+  };
+
+  const renderExerciseRemediationAndVariant = (q: ExerciseQuestion) => {
+    const hasRemediation = Boolean(q.remediation?.trim());
+    const rawVariant = q.variantCheck;
+    const variantObj: ExerciseVariantCheck | null =
+      rawVariant && typeof rawVariant === 'object'
+        ? rawVariant
+        : typeof rawVariant === 'string' && rawVariant.trim()
+        ? { question: rawVariant.trim(), answer: '', explanation: '' }
+        : null;
+    const hasVariant = Boolean(variantObj?.question?.trim());
+    if (!hasRemediation && !hasVariant) return null;
+
+    const variantQuestion: ExerciseQuestion | null =
+      variantObj && variantObj.answer?.trim()
+        ? {
+            id: `${q.id}-variant`,
+            type:
+              Array.isArray(variantObj.options) && variantObj.options.length > 0
+                ? 'choice'
+                : 'fill',
+            question: variantObj.question,
+            options: variantObj.options,
+            answer: variantObj.answer,
+            explanation: variantObj.explanation || '',
+          }
+        : null;
+    const currentVariantVal = variantAnswers[q.id] || '';
+    const isVariantChecked = Boolean(variantSubmitted[q.id]);
+    const variantReport =
+      variantQuestion && isVariantChecked
+        ? gradeSingleExercise(variantQuestion, currentVariantVal)
+        : null;
+
+    return (
+      <div className="space-y-3 pt-1">
+        {hasRemediation && (
+          <div
+            data-testid={`exercise-remediation-${q.id}`}
+            className="p-3 rounded border border-amber-900/50 bg-amber-950/20 text-xs text-amber-100/90 leading-relaxed [&>p]:m-0"
+            dangerouslySetInnerHTML={{
+              __html: renderMarkdownWithLatex(
+                `**针对性补救讲解：** ${q.remediation}`,
+                lessonVisuals
+              ),
+            }}
+          />
+        )}
+
+        {variantObj && hasVariant && (
+          <div
+            data-testid={`exercise-variant-${q.id}`}
+            className="p-3 rounded border border-sky-900/50 bg-sky-950/15 space-y-2.5 text-xs"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-mono text-[11px] px-1.5 py-0.5 rounded border border-sky-800/80 bg-sky-950/50 text-sky-200">
+                变式再检验 · 同原理迁移核对
+              </span>
+              {variantReport && (
+                <span
+                  className={`font-mono text-[11px] ${
+                    variantReport.isCorrect ? 'text-emerald-400' : 'text-amber-300'
+                  }`}
+                >
+                  {variantReport.isCorrect ? '✓ 变式通过' : '↻ 需再核对'}
+                </span>
+              )}
+            </div>
+
+            <div
+              className="text-neutral-200 leading-relaxed [&>p]:m-0"
+              dangerouslySetInnerHTML={{
+                __html: renderMarkdownWithLatex(variantObj.question, lessonVisuals),
+              }}
+            />
+
+            {variantQuestion && (
+              <>
+                {Array.isArray(variantObj.options) && variantObj.options.length > 0 ? (
+                  <div className="grid grid-cols-1 gap-1.5">
+                    {variantObj.options.map((opt: string) => {
+                      const letterMatch = opt.match(/^([A-Da-d])(?:\b|[.、:：\s])/);
+                      const optKey = letterMatch ? letterMatch[1].toUpperCase() : opt;
+                      const selected =
+                        currentVariantVal.toUpperCase() === optKey.toUpperCase() ||
+                        currentVariantVal === opt;
+                      return (
+                        <label
+                          key={opt}
+                          className={`flex items-center gap-2.5 p-2 rounded border text-xs cursor-pointer transition-colors ${
+                            selected
+                              ? 'border-sky-500/70 bg-sky-950/40 text-white'
+                              : 'border-neutral-800 bg-black/60 text-neutral-300 hover:border-neutral-700'
+                          }`}
+                        >
+                          <input
+                            type="radio"
+                            name={`variant-${q.id}`}
+                            value={optKey}
+                            checked={selected}
+                            onChange={() =>
+                              setVariantAnswers((prev) => ({ ...prev, [q.id]: optKey }))
+                            }
+                            className="accent-sky-400"
+                          />
+                          <span
+                            className="flex-1 [&>p]:m-0"
+                            dangerouslySetInnerHTML={{
+                              __html: renderInlineMathWithLatex(opt, lessonVisuals),
+                            }}
+                          />
+                        </label>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <input
+                    type="text"
+                    value={currentVariantVal}
+                    onChange={(e) =>
+                      setVariantAnswers((prev) => ({ ...prev, [q.id]: e.target.value }))
+                    }
+                    placeholder="输入变式题答案或核心表达式..."
+                    className="w-full bg-black border border-neutral-800 rounded px-2.5 py-1.5 text-xs font-mono text-white focus:outline-none focus:border-sky-600"
+                  />
+                )}
+
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setVariantSubmitted((prev) => ({ ...prev, [q.id]: true }))
+                    }
+                    className="px-2.5 py-1 rounded border border-sky-700/80 bg-sky-950/40 hover:bg-sky-900/50 text-sky-200 font-medium transition-colors"
+                  >
+                    {isVariantChecked ? '重新核对变式答案' : '检验变式答案'}
+                  </button>
+                </div>
+
+                {isVariantChecked && (
+                  <div className="p-2.5 rounded border border-neutral-800 bg-black/80 space-y-1.5 text-xs">
+                    <div
+                      className={
+                        variantReport?.isCorrect ? 'text-emerald-300' : 'text-amber-300'
+                      }
+                    >
+                      参考答案：
+                      <span
+                        className="font-mono font-medium ml-1"
+                        dangerouslySetInnerHTML={{
+                          __html: renderInlineMathWithLatex(variantObj.answer, lessonVisuals),
+                        }}
+                      />
+                    </div>
+                    {variantObj.explanation && (
+                      <div
+                        className="text-neutral-300 leading-relaxed [&>p]:m-0"
+                        dangerouslySetInnerHTML={{
+                          __html: renderMarkdownWithLatex(
+                            `**变式解析：** ${variantObj.explanation}`,
+                            lessonVisuals
+                          ),
+                        }}
+                      />
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    );
   };
 
   const renderHighlightedEnglishParagraph = (
@@ -1192,17 +1935,21 @@ export const LessonView: React.FC<LessonViewProps> = ({
   const currentMode: CourseGenerationMode = course.generationMode || 'api';
 
   return (
-    <div className="min-h-screen bg-black text-neutral-100 pb-24">
+    <div
+      className={`min-h-screen bg-black text-neutral-100 pb-24 ${
+        showContentCategoryBadges ? 'lesson-show-category-badges' : 'lesson-hide-category-badges'
+      }`}
+    >
       <header className="sticky top-0 z-30 bg-black/95 border-b border-neutral-900 px-6 py-4">
         <div className="max-w-4xl mx-auto flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2.5 min-w-0">
             <button
               type="button"
-              onClick={onBack}
+              onClick={(e) => onBack(e)}
               className="inline-flex items-center gap-1.5 text-xs font-medium text-neutral-400 hover:text-white transition-colors whitespace-nowrap shrink-0"
             >
               <ArrowLeft className="w-4 h-4" />
-              <span>时间轴</span>
+              <span>{backLabel}</span>
             </button>
             <span className="text-neutral-700" aria-hidden="true">
               /
@@ -1232,12 +1979,15 @@ export const LessonView: React.FC<LessonViewProps> = ({
                   onChange={(e) => onSelectDayIndex(Number(e.target.value))}
                   className="bg-black border border-neutral-800 hover:border-neutral-600 rounded px-2 py-1 text-xs font-mono text-neutral-200 max-w-[220px] focus:outline-none"
                 >
-                  {sortedSlots.map((s) => (
-                    <option key={s.dayIndex} value={s.dayIndex}>
-                      第 {s.dayIndex}/{course.durationDays} 讲 {s.lesson ? '✓' : '·'}{' '}
-                      {normalizeSvgLatexCommands(stripAiCitationArtifacts(s.title))}
-                    </option>
-                  ))}
+                  {sortedSlots.map((s) => {
+                    const mins = getEvaluatedSectionMinutes(s);
+                    return (
+                      <option key={s.dayIndex} value={s.dayIndex}>
+                        第 {s.dayIndex} 讲 (第 {s.scheduledDay || s.dayIndex}/{course.durationDays} 天 · {mins !== undefined ? `${mins}m` : '待评估'}) {s.lesson ? '✓' : '·'}{' '}
+                        {normalizeSvgLatexCommands(stripAiCitationArtifacts(s.title))}
+                      </option>
+                    );
+                  })}
                 </select>
                 <button
                   type="button"
@@ -1252,7 +2002,11 @@ export const LessonView: React.FC<LessonViewProps> = ({
               </div>
             ) : (
               <span className="text-xs font-mono text-neutral-400">
-                {slot.date} (第 {slot.dayIndex}/{course.durationDays} 天)
+                {slot.date} · {slot.id} (排程第 {slot.scheduledDay || slot.dayIndex}/{course.durationDays} 天 ·{' '}
+                {(() => {
+                  const mins = getEvaluatedSectionMinutes(slot);
+                  return mins !== undefined ? `预计 ${mins} 分钟` : '待生成后评估学时';
+                })()})
               </span>
             )}
           </div>
@@ -1277,30 +2031,6 @@ export const LessonView: React.FC<LessonViewProps> = ({
                 <span>课程工作台</span>
               </button>
             )}
-
-            {/* 独立的一键 API 生成按钮（不再依赖模式下拉框，避免切到 API 仍停留在提示词界面的错觉） */}
-            <button
-              type="button"
-              onClick={handleRegenerateLesson}
-              disabled={isRegenerating}
-              title="直接调用后端配置的 API 多模态模型自动生成本节完整课件"
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 disabled:opacity-60 ${
-                isRegenerating
-                  ? 'border border-sky-500/70 bg-sky-950/40 text-sky-200'
-                  : !slot.lesson && !isChatWorkbenchOpen
-                    ? 'bg-white text-black hover:bg-neutral-200'
-                    : 'border border-neutral-700 hover:border-neutral-500 text-neutral-200 hover:text-white'
-              }`}
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${isRegenerating ? 'animate-spin' : ''}`} />
-              <span>
-                {isRegenerating
-                  ? `API 生成中 (${regenElapsedSec.toFixed(1)}s)...`
-                  : slot.lesson
-                    ? 'API 重新生成'
-                    : 'API 生成课件'}
-              </span>
-            </button>
 
             {/* 统一的 Chat / Agent / 直接编辑同级工作台入口 */}
             <button
@@ -1342,75 +2072,132 @@ export const LessonView: React.FC<LessonViewProps> = ({
       </header>
 
       <main className="max-w-4xl mx-auto px-6 pt-8">
+        <AnimatePresence mode="wait">
+          <motion.div
+            key={`${course.id}-${slot.dayIndex}`}
+            initial={{ opacity: 0, scale: 0.975, filter: 'blur(5px)' }}
+            animate={{
+              opacity: 1,
+              scale: 1,
+              filter: 'blur(0px)',
+              transitionEnd: { filter: 'none', transform: 'none' },
+            }}
+            exit={{ opacity: 0, scale: 1.02, filter: 'blur(5px)' }}
+            transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+            style={{ transformOrigin: '50% 25%' }}
+          >
         {regenError && (
           <div className="mb-6 text-xs text-red-400 border border-red-900/60 bg-red-950/30 rounded px-4 py-3">
             {regenError}
           </div>
         )}
 
-        {/* API 生成实时多阶段进度反馈与完成摘要 */}
+        {/* 真实服务端驱动的流式多阶段进度反馈与字段追踪 */}
         {isRegenerating && (
           <section
             aria-label="API 课件生成实时进度"
             className="mb-6 border border-sky-800/70 bg-sky-950/20 rounded p-5 space-y-4"
           >
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex items-center gap-2.5">
-                <RefreshCw className="w-4 h-4 text-sky-400 animate-spin shrink-0" />
-                <div>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="flex items-start gap-2.5 min-w-0 flex-1">
+                <RefreshCw className="w-4 h-4 text-sky-400 animate-spin shrink-0 mt-0.5" />
+                <div className="min-w-0">
                   <div className="text-sm font-semibold text-white">
-                    正在通过 API 多模态生成第 {slot.dayIndex}/{course.durationDays} 讲课件
+                    正在通过 API 真实流式生成第 {slot.dayIndex} 讲课件（{slot.id} · 排程第 {slot.scheduledDay || slot.dayIndex}/{course.durationDays} 天）
                   </div>
-                  <div className="text-xs text-neutral-400 mt-0.5">
-                    模型正在深入解析本节教材 PDF 切片与大纲目标，推导公式并绘制 SVG 图示，请稍候...
+                  <div
+                    data-testid="regen-progress-message"
+                    className="text-xs text-sky-200/90 mt-0.5 break-words"
+                  >
+                    {regenProgress?.message || '正在向后端发起流式生成请求...'}
                   </div>
                 </div>
               </div>
-              <span className="px-2.5 py-1 rounded bg-sky-950/80 border border-sky-700/60 text-xs font-mono text-sky-200">
-                已耗时 {regenElapsedSec.toFixed(1)}s
-              </span>
+              <div className="flex items-center gap-2 shrink-0">
+                <span
+                  data-testid="regen-progress-percent"
+                  className="px-2.5 py-1 rounded bg-sky-950/90 border border-sky-600/70 text-xs font-mono font-semibold text-sky-100"
+                >
+                  {regenProgress?.percent ?? 0}%
+                </span>
+                <span className="px-2.5 py-1 rounded bg-neutral-950 border border-neutral-800 text-xs font-mono text-neutral-300">
+                  已耗时 {regenElapsedSec.toFixed(1)}s
+                </span>
+              </div>
             </div>
 
-            <div className="w-full h-1.5 bg-neutral-900 rounded-full overflow-hidden">
+            <div className="w-full h-2 bg-neutral-900 rounded-full overflow-hidden border border-neutral-800">
               <div
-                className="h-full bg-sky-400 transition-all duration-300"
+                data-testid="regen-progress-bar"
+                className="h-full bg-sky-400 transition-all duration-200"
                 style={{
-                  width: `${Math.min(94, Math.max(12, Math.round(regenElapsedSec * 5.5)))}%`,
+                  width: `${Math.max(2, Math.min(100, regenProgress?.percent ?? 0))}%`,
                 }}
               />
             </div>
+
+            {(regenProgress?.model ||
+              regenProgress?.pdfSummary ||
+              typeof regenProgress?.charsReceived === 'number' ||
+              typeof regenProgress?.thinkingChars === 'number') && (
+              <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-neutral-300">
+                {regenProgress?.model && (
+                  <span className="px-2 py-0.5 rounded bg-black/70 border border-neutral-800">
+                    模型：{regenProgress.model}
+                  </span>
+                )}
+                {regenProgress?.pdfSummary && (
+                  <span className="px-2 py-0.5 rounded bg-black/70 border border-neutral-800">
+                    上下文：{regenProgress.pdfSummary}
+                  </span>
+                )}
+                {typeof regenProgress?.charsReceived === 'number' && (
+                  <span
+                    data-testid="regen-stream-bytes"
+                    className="px-2 py-0.5 rounded bg-black/70 border border-neutral-800 text-sky-200"
+                  >
+                    已接收 {regenProgress.charsReceived.toLocaleString()} 字符 ·{' '}
+                    {regenProgress.chunksReceived ?? 0} chunks
+                  </span>
+                )}
+                {typeof regenProgress?.thinkingChars === 'number' &&
+                  regenProgress.thinkingChars > 0 && (
+                    <span className="px-2 py-0.5 rounded bg-black/70 border border-neutral-800 text-amber-300">
+                      思考输出 {regenProgress.thinkingChars.toLocaleString()} 字符
+                    </span>
+                  )}
+              </div>
+            )}
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
               {[
                 {
                   step: 1,
-                  threshold: 0,
-                  label: '1. 读取本节大纲目标与教材 PDF 物理页切片上下文',
+                  label: '1. 准备本节大纲与教材 PDF 物理页上下文',
                 },
                 {
                   step: 2,
-                  threshold: 2.5,
-                  label: '2. 推导核心数学/物理公式、构建“先思考后讲解”启发式问题',
+                  label: '2. 模型推理与流式输出核心公式、正文讲义 (markdownBody)',
                 },
                 {
                   step: 3,
-                  threshold: 6.0,
-                  label: '3. 绘制图文同步 SVG 教学图示与分层闭环练习题',
+                  label: '3. 流式生成图文同步 SVG、启发式思考题与分层练习 (diagrams / exercises)',
                 },
                 {
                   step: 4,
-                  threshold: 10.5,
-                  label: `4. 执行中间步骤与量纲自检并写入 lessons/${slot.id}.json`,
+                  label: `4. 复述检验、量纲自检并写入 lessons/${slot.id}.json`,
                 },
-              ].map((st, idx, arr) => {
+              ].map((st) => {
+                const currentStep = regenProgress?.step ?? 1;
                 const isDone =
-                  idx < arr.length - 1 && regenElapsedSec >= arr[idx + 1].threshold;
+                  regenProgress?.stage === 'done' || currentStep > st.step;
                 const isActive =
-                  regenElapsedSec >= st.threshold &&
-                  (idx === arr.length - 1 || regenElapsedSec < arr[idx + 1].threshold);
+                  regenProgress?.stage !== 'done' && currentStep === st.step;
                 return (
                   <div
                     key={st.step}
+                    data-stage-step={st.step}
+                    data-stage-state={isDone ? 'done' : isActive ? 'active' : 'pending'}
                     className={`flex items-center gap-2 px-3 py-2 rounded border ${
                       isActive
                         ? 'border-sky-700/70 bg-sky-950/40 text-sky-100 font-medium'
@@ -1431,6 +2218,58 @@ export const LessonView: React.FC<LessonViewProps> = ({
                 );
               })}
             </div>
+
+            {regenProgress?.detectedFields && regenProgress.detectedFields.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-mono">
+                <span className="text-neutral-400 mr-1">已检测输出字段：</span>
+                {(course.category === 'english'
+                  ? [
+                      'title',
+                      'summary',
+                      'englishPayload',
+                      'markdownBody',
+                      'diagrams',
+                      'heuristicQuestions',
+                      'exercises',
+                      'reverseChecks',
+                      'qualityCheck',
+                    ]
+                  : [
+                      'title',
+                      'summary',
+                      'markdownBody',
+                      'diagrams',
+                      'heuristicQuestions',
+                      'exercises',
+                      'reverseChecks',
+                      'qualityCheck',
+                    ]
+                ).map((field) => {
+                  const seen = regenProgress.detectedFields?.includes(field);
+                  return (
+                    <span
+                      key={field}
+                      className={`px-2 py-0.5 rounded border ${
+                        seen
+                          ? 'border-emerald-800/80 bg-emerald-950/40 text-emerald-300'
+                          : 'border-neutral-900 bg-black/40 text-neutral-600'
+                      }`}
+                    >
+                      {seen ? `✓ ${field}` : field}
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+
+            {regenProgress?.liveSnippet && (
+              <div
+                data-testid="regen-live-snippet"
+                className="text-[11px] font-mono text-neutral-300 bg-black/80 border border-neutral-800 rounded px-3 py-2 truncate"
+              >
+                流式实时内容：{regenProgress.liveSnippet}
+              </div>
+            )}
           </section>
         )}
 
@@ -1460,28 +2299,39 @@ export const LessonView: React.FC<LessonViewProps> = ({
               <span className="px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-neutral-200">
                 小节 ID：{slot.id}
               </span>
-              <span>第 {slot.dayIndex} 天（{slot.date}）</span>
-              {slot.pdfSegment ? (
+              <span>
+                第 {slot.dayIndex} 讲 · 排程第 {slot.scheduledDay || slot.dayIndex}/{course.durationDays} 天（{slot.date} ·{' '}
+                {(() => {
+                  const mins = getEvaluatedSectionMinutes(slot);
+                  return mins !== undefined ? `预计 ${mins} 分钟` : '待生成后评估学时';
+                })()}）
+              </span>
+              {boundSegments.length > 0 ? (
                 <span className="text-neutral-200">
-                  · 小节 PDF：物理页第 {slot.pdfSegment.physicalStartPage}–{slot.pdfSegment.physicalEndPage} 页
-                  {slot.pdfSegment.printedStartPage != null &&
-                  slot.pdfSegment.printedEndPage != null
-                    ? `（印刷页 ${slot.pdfSegment.printedStartPage}–${slot.pdfSegment.printedEndPage}）`
-                    : ''}{' '}
-                  ({slot.pdfSegment.segmentRelPath})
+                  · 小节 PDF：
+                  {boundSegments
+                    .map(
+                      (seg) =>
+                        `${seg.segmentFileName || `${seg.sectionId}.pdf`}（物理页第 ${seg.physicalStartPage}–${seg.physicalEndPage} 页${
+                          seg.printedStartPage != null && seg.printedEndPage != null
+                            ? `，印刷页 ${seg.printedStartPage}–${seg.printedEndPage}`
+                            : ''
+                        }）`
+                    )
+                    .join(' + ')}
                 </span>
               ) : hasPdfSource ? (
                 <span className="text-neutral-500">· PDF 待切割或可立即按本节切割</span>
               ) : null}
               {course.category === 'english' && slot.assignedWords && (
                 <span className="text-neutral-300">
-                  · 今日目标词汇：{slot.assignedWords.length} 词
+                  · 本节目标词汇：{slot.assignedWords.length} 词
                 </span>
               )}
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
-              {!slot.pdfSegment && hasPdfSource && (
+              {slicedBoundSegments.length === 0 && hasPdfSource && (
                 <button
                   type="button"
                   onClick={handleQuickCutSectionPdf}
@@ -1513,47 +2363,53 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     )}
                   </button>
 
-                  {slot.pdfSegment ? (
-                    <>
-                      <button
-                        type="button"
-                        onClick={handleCopyPdfFileToClipboard}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 hover:text-white rounded transition-colors whitespace-nowrap"
-                        title="将本节 PDF 文件直接复制到系统剪贴板（等效在资源管理器按 Ctrl+C），可直接 Ctrl+V 粘贴"
-                      >
-                        {copiedQuickPdf ? (
-                          <>
-                            <Check className="w-3.5 h-3.5 text-emerald-400" />
-                            <span>已复制本节 PDF</span>
-                          </>
-                        ) : (
-                          <>
-                            <Copy className="w-3.5 h-3.5" />
-                            <span>复制小节 PDF</span>
-                          </>
-                        )}
-                      </button>
-                      <a
-                        href={`/api/courses/${course.id}/segments/${slot.pdfSegment.sectionId || slot.id}/pdf?download=1`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors whitespace-nowrap"
-                      >
-                        <FileText className="w-3.5 h-3.5" />
-                        <span>
-                          下载/打开本节 PDF ({slot.pdfSegment.segmentFileName || `${slot.pdfSegment.sectionId || slot.id}.pdf`})
-                        </span>
-                      </a>
-                    </>
+                  {slicedBoundSegments.length > 0 ? (
+                    slicedBoundSegments.map((seg) => {
+                      const segId = seg.sectionId || slot.id;
+                      const fileName = seg.segmentFileName || `${segId}.pdf`;
+                      const copyKey = `quick-seg-${segId}`;
+                      const isMulti = slicedBoundSegments.length > 1;
+                      return (
+                        <React.Fragment key={segId}>
+                          <button
+                            type="button"
+                            onClick={() => handleCopyPdfFileToClipboard(seg, copyKey)}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 hover:text-white rounded transition-colors whitespace-nowrap"
+                            title={`将 ${fileName} 复制到系统剪贴板（等效在资源管理器按 Ctrl+C），可直接 Ctrl+V 粘贴`}
+                          >
+                            {copiedQuickPdfKey === copyKey ? (
+                              <>
+                                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                <span>已复制 {isMulti ? fileName : '本节 PDF'}</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" />
+                                <span>{isMulti ? `复制 ${fileName}` : '复制小节 PDF'}</span>
+                              </>
+                            )}
+                          </button>
+                          <a
+                            href={`/api/courses/${course.id}/segments/${segId}/pdf?download=1`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors whitespace-nowrap"
+                          >
+                            <FileText className="w-3.5 h-3.5" />
+                            <span>下载/打开 ({fileName})</span>
+                          </a>
+                        </React.Fragment>
+                      );
+                    })
                   ) : firstPdfMaterial ? (
                     <>
                       <button
                         type="button"
-                        onClick={handleCopyPdfFileToClipboard}
+                        onClick={() => handleCopyPdfFileToClipboard(undefined, 'quick-src')}
                         className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 hover:text-white rounded transition-colors whitespace-nowrap"
                         title="将原教材 PDF 文件直接复制到系统剪贴板，等效资源管理器 Ctrl+C"
                       >
-                        {copiedQuickPdf ? (
+                        {copiedQuickPdfKey === 'quick-src' ? (
                           <>
                             <Check className="w-3.5 h-3.5 text-emerald-400" />
                             <span>已复制原 PDF</span>
@@ -1612,13 +2468,13 @@ export const LessonView: React.FC<LessonViewProps> = ({
         {isChatWorkbenchOpen && (
           <section
             aria-label="本节课件生成、导入更新与直接编辑工作台"
-            className="mb-8 border border-neutral-800 rounded p-5 bg-neutral-950/60 space-y-5"
+            className="glow-border mb-8 border border-neutral-800 rounded p-5 bg-neutral-950/60 space-y-5"
           >
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-neutral-900 pb-3">
               <div>
                 <h2 className="text-sm font-semibold text-white">
                   {slot.lesson ? '更新 / 编辑本节课件' : 'Chat / Agent 课件生成工作台'} — 第{' '}
-                  {slot.dayIndex}/{course.durationDays} 讲：
+                  {slot.dayIndex} 讲（{slot.id} · 排程第 {slot.scheduledDay || slot.dayIndex}/{course.durationDays} 天）：
                   <span
                     dangerouslySetInnerHTML={{
                       __html: renderInlineMathWithLatex(slot.title),
@@ -1803,11 +2659,26 @@ export const LessonView: React.FC<LessonViewProps> = ({
                       {agentWorkspaceDir || course.courseDirPath || `courses/${course.folderName || course.id}`}/lessons/{slot.id}.json
                     </span>
                   </div>
-                  {slot.pdfSegment && (
+                  {boundSegments.length > 0 && (
                     <div className="md:col-span-2">
                       <span className="text-neutral-500">本节教材 PDF 切片：</span>
                       <span className="text-neutral-200">
-                        {agentWorkspaceDir || course.courseDirPath || `courses/${course.folderName || course.id}`}/{slot.pdfSegment.segmentRelPath}（物理页第 {slot.pdfSegment.physicalStartPage}–{slot.pdfSegment.physicalEndPage} 页）
+                        {boundSegments
+                          .map((seg) => {
+                            const ws =
+                              agentWorkspaceDir ||
+                              course.courseDirPath ||
+                              `courses/${course.folderName || course.id}`;
+                            const rel =
+                              seg.segmentRelPath ||
+                              `segments/${seg.segmentFileName || `${seg.sectionId}.pdf`}`;
+                            const fullRel =
+                              rel.startsWith('courses/') || rel.startsWith(ws)
+                                ? rel
+                                : `${ws}/${rel}`;
+                            return `${fullRel}（物理页第 ${seg.physicalStartPage}–${seg.physicalEndPage} 页）`;
+                          })
+                          .join('；')}
                       </span>
                     </div>
                   )}
@@ -1815,35 +2686,62 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
                 <div className="space-y-2">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <label
-                      htmlFor="agent-inline-prompt-box"
-                      className="text-xs font-medium text-neutral-300"
-                    >
-                      第一步：复制 Agent 任务提示词（面向 Antigravity / Codex / Claude Code 等具备文件读写能力的 Agent）
-                    </label>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <label
+                        htmlFor="agent-inline-prompt-box"
+                        className="text-xs font-medium text-neutral-300"
+                      >
+                        第一步：复制本节独立 Agent 提示词（prompts/{slot.id}/agent-{agentInlineStage}-prompt.md）
+                      </label>
+                      <div className="inline-flex items-center gap-1 border border-neutral-800 rounded p-0.5 bg-black">
+                        <button
+                          type="button"
+                          onClick={() => setAgentInlineStage('stage1')}
+                          className={`px-2 py-0.5 rounded text-[11px] transition-colors ${
+                            agentInlineStage === 'stage1'
+                              ? 'bg-white text-black font-medium'
+                              : 'text-neutral-400 hover:text-white'
+                          }`}
+                        >
+                          阶段一内容
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setAgentInlineStage('stage2')}
+                          disabled={!agentStage2Prompt}
+                          className={`px-2 py-0.5 rounded text-[11px] transition-colors disabled:opacity-40 ${
+                            agentInlineStage === 'stage2'
+                              ? 'bg-white text-black font-medium'
+                              : 'text-neutral-400 hover:text-white'
+                          }`}
+                        >
+                          阶段二 SVG
+                        </button>
+                      </div>
+                    </div>
                     <div className="flex flex-wrap items-center gap-2">
                       <button
                         type="button"
                         onClick={handleCopyAgentPromptInline}
-                        disabled={isLoadingAgentPrompt || !agentPromptText}
+                        disabled={(isLoadingAgentPrompt && isLoadingChatPrompt) || !effectiveAgentInlinePrompt}
                         className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors whitespace-nowrap"
                       >
                         {copiedAgentPrompt ? (
                           <>
                             <Check className="w-3.5 h-3.5" />
-                            <span>已复制 Agent 提示词</span>
+                            <span>已复制本节 Agent 提示词</span>
                           </>
                         ) : (
                           <>
                             <Copy className="w-3.5 h-3.5" />
-                            <span>一键复制 Agent 提示词</span>
+                            <span>一键复制本节 Agent 提示词</span>
                           </>
                         )}
                       </button>
                       <button
                         type="button"
                         onClick={handleDownloadAgentPromptInline}
-                        disabled={isLoadingAgentPrompt || !agentPromptText}
+                        disabled={(isLoadingAgentPrompt && isLoadingChatPrompt) || !effectiveAgentInlinePrompt}
                         className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-300 rounded transition-colors whitespace-nowrap"
                       >
                         <Download className="w-3.5 h-3.5" />
@@ -1857,9 +2755,9 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     readOnly
                     rows={7}
                     value={
-                      isLoadingAgentPrompt
-                        ? '正在生成本地 Agent 执行提示词...'
-                        : agentPromptText
+                      isLoadingChatPrompt && !effectiveAgentInlinePrompt
+                        ? '正在生成本节独立 Agent 执行提示词...'
+                        : effectiveAgentInlinePrompt
                     }
                     className="w-full bg-black border border-neutral-800 rounded p-3 text-xs font-mono text-neutral-300 leading-relaxed focus:outline-none"
                   />
@@ -1929,43 +2827,57 @@ export const LessonView: React.FC<LessonViewProps> = ({
                       第一步：复制本节教学提示词，连同 PDF 文件一并发送给 ChatGPT / Gemini 等多模态 AI
                     </label>
                     <div className="flex flex-wrap items-center gap-2">
-                      {slot.pdfSegment ? (
-                        <>
-                          <button
-                            type="button"
-                            onClick={handleCopyPdfFileToClipboard}
-                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
-                            title="将本节 PDF 复制到系统剪贴板，等效资源管理器 Ctrl+C"
-                          >
-                            {copiedQuickPdf ? (
-                              <Check className="w-3.5 h-3.5 text-emerald-400" />
-                            ) : (
-                              <Copy className="w-3.5 h-3.5" />
-                            )}
-                            <span>{copiedQuickPdf ? '已复制本节 PDF' : '复制本节 PDF'}</span>
-                          </button>
-                          <a
-                            href={`/api/courses/${course.id}/segments/${slot.pdfSegment.sectionId || slot.id}/pdf?download=1`}
-                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-300 rounded transition-colors whitespace-nowrap"
-                          >
-                            <Download className="w-3.5 h-3.5" />
-                            <span>下载本节 PDF</span>
-                          </a>
-                        </>
+                      {slicedBoundSegments.length > 0 ? (
+                        slicedBoundSegments.map((seg) => {
+                          const segId = seg.sectionId || slot.id;
+                          const fileName = seg.segmentFileName || `${segId}.pdf`;
+                          const copyKey = `chat-seg-${segId}`;
+                          const isMulti = slicedBoundSegments.length > 1;
+                          return (
+                            <React.Fragment key={segId}>
+                              <button
+                                type="button"
+                                onClick={() => handleCopyPdfFileToClipboard(seg, copyKey)}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
+                                title={`将 ${fileName} 复制到系统剪贴板，等效资源管理器 Ctrl+C`}
+                              >
+                                {copiedQuickPdfKey === copyKey ? (
+                                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                ) : (
+                                  <Copy className="w-3.5 h-3.5" />
+                                )}
+                                <span>
+                                  {copiedQuickPdfKey === copyKey
+                                    ? `已复制 ${isMulti ? fileName : '本节 PDF'}`
+                                    : isMulti
+                                      ? `复制 ${fileName}`
+                                      : '复制本节 PDF'}
+                                </span>
+                              </button>
+                              <a
+                                href={`/api/courses/${course.id}/segments/${segId}/pdf?download=1`}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-300 rounded transition-colors whitespace-nowrap"
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                                <span>{isMulti ? `下载 ${fileName}` : '下载本节 PDF'}</span>
+                              </a>
+                            </React.Fragment>
+                          );
+                        })
                       ) : firstPdfMaterial ? (
                         <>
                           <button
                             type="button"
-                            onClick={handleCopyPdfFileToClipboard}
+                            onClick={() => handleCopyPdfFileToClipboard(undefined, 'chat-src')}
                             className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
                             title="将原 PDF 复制到系统剪贴板，等效资源管理器 Ctrl+C"
                           >
-                            {copiedQuickPdf ? (
+                            {copiedQuickPdfKey === 'chat-src' ? (
                               <Check className="w-3.5 h-3.5 text-emerald-400" />
                             ) : (
                               <Copy className="w-3.5 h-3.5" />
                             )}
-                            <span>{copiedQuickPdf ? '已复制原 PDF' : '复制原 PDF'}</span>
+                            <span>{copiedQuickPdfKey === 'chat-src' ? '已复制原 PDF' : '复制原 PDF'}</span>
                           </button>
                           <a
                             href={`/api/courses/${course.id}/files/download?path=${encodeURIComponent(`sources/${firstPdfMaterial.fileName}`)}&download=1`}
@@ -2029,7 +2941,17 @@ export const LessonView: React.FC<LessonViewProps> = ({
                       第二步：将外部 AI 生成的回复粘贴到下方（支持完整 JSON 代码块或含 LaTeX / SVG 的 Markdown），或通过文件导入
                     </label>
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        data-testid="chat-step2-clipboard-paste-btn"
+                        onClick={handlePasteClipboardToImportBox}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 hover:text-white rounded transition-colors whitespace-nowrap"
+                      >
+                        <Copy className="w-3.5 h-3.5" />
+                        <span>从剪贴板一键粘贴</span>
+                      </button>
+
                       <label className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded cursor-pointer transition-colors whitespace-nowrap">
                         <Upload className="w-3.5 h-3.5" />
                         <span>从文件导入 (.json / .md / .txt)</span>
@@ -2056,13 +2978,174 @@ export const LessonView: React.FC<LessonViewProps> = ({
                   </div>
 
                   <textarea
+                    ref={chatImportBoxRef}
                     id="chat-import-box"
                     rows={7}
                     value={rawImportInput}
-                    onChange={(e) => setRawImportInput(e.target.value)}
+                    onChange={(e) => {
+                      setRawImportInput(e.target.value);
+                      if (importReplaceHint) setImportReplaceHint(null);
+                    }}
                     placeholder="在此粘贴外部 AI 输出的课件内容（支持 ```json ... ``` 代码块或完整 Markdown 讲义）..."
                     className="w-full bg-black border border-neutral-800 rounded p-3 text-xs font-mono text-neutral-200 leading-relaxed focus:outline-none focus:border-neutral-500"
                   />
+
+                  {/* 自动渲染与图示引用自检面板（输入课件内容后实时检测失败部分并生成修改提示词） */}
+                  {importAuditResult && (
+                    <div
+                      data-testid="import-render-audit"
+                      className={`rounded border p-3.5 space-y-2.5 text-xs ${
+                        importAuditResult.report.issues.length > 0
+                          ? 'border-red-900/70 bg-red-950/25 text-neutral-200'
+                          : 'border-emerald-900/60 bg-emerald-950/20 text-emerald-300'
+                      }`}
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2 font-medium">
+                          {importAuditResult.report.issues.length > 0 ? (
+                            <>
+                              <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                              <span className="text-red-200">
+                                {importAuditResult.report.summaryText}
+                              </span>
+                            </>
+                          ) : (
+                            <>
+                              <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+                              <span>{importAuditResult.report.summaryText}</span>
+                            </>
+                          )}
+                        </div>
+
+                        {importAuditResult.report.issues.length > 0 ? (
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setShowImportRepairPromptPreview((v) => !v)
+                              }
+                              className="px-2.5 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors"
+                            >
+                              {showImportRepairPromptPreview
+                                ? '收起增量补丁提示词'
+                                : '查看增量补丁提示词'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                try {
+                                  await navigator.clipboard.writeText(
+                                    importAuditResult.report.repairPrompt
+                                  );
+                                  setCopiedImportRepairPrompt(true);
+                                  setTimeout(() => setCopiedImportRepairPrompt(false), 2000);
+                                } catch {
+                                  setShowImportRepairPromptPreview(true);
+                                }
+                              }}
+                              className="inline-flex items-center gap-1.5 px-3 py-1 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors"
+                            >
+                              {copiedImportRepairPrompt ? (
+                                <>
+                                  <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                  <span>已复制增量补丁提示词</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3.5 h-3.5" />
+                                  <span>复制增量补丁提示词（无需重生成全文）</span>
+                                </>
+                              )}
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="import-clipboard-replace-btn"
+                              onClick={handlePasteClipboardToImportBox}
+                              className="px-2.5 py-1 border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 hover:text-white rounded transition-colors"
+                            >
+                              从剪贴板一键替换并重检
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="import-clear-focus-btn"
+                              onClick={() => {
+                                setRawImportInput('');
+                                setPreviewLesson(null);
+                                setImportReplaceHint(
+                                  '已清空上方输入框，请直接按 Ctrl+V / Cmd+V 粘贴 AI 修复后的内容。'
+                                );
+                                window.setTimeout(() => chatImportBoxRef.current?.focus(), 20);
+                              }}
+                              className="px-2.5 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-300 hover:text-white rounded transition-colors"
+                            >
+                              清空并聚焦粘贴
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => handleConfirmSaveImport(false)}
+                            disabled={isSavingImport}
+                            className="px-3 py-1 bg-emerald-400 text-black hover:bg-emerald-300 font-medium rounded transition-colors disabled:opacity-50"
+                          >
+                            {isSavingImport ? '保存中...' : '一键保存本节课件'}
+                          </button>
+                        )}
+                      </div>
+
+                      {importReplaceHint && (
+                        <div className="text-[11px] text-sky-300 font-mono">
+                          {importReplaceHint}
+                        </div>
+                      )}
+
+                      {importAuditResult.report.issues.length > 0 && (
+                        <>
+                          <ul className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
+                            {importAuditResult.report.issues.map((iss) => (
+                              <li
+                                key={iss.id}
+                                className="border border-red-900/40 bg-black/70 rounded px-3 py-2 space-y-1"
+                              >
+                                <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
+                                  <span
+                                    className={`px-1.5 py-0.5 rounded border ${
+                                      iss.severity === 'error'
+                                        ? 'border-red-800 bg-red-950/60 text-red-300'
+                                        : 'border-amber-800 bg-amber-950/50 text-amber-300'
+                                    }`}
+                                  >
+                                    {iss.categoryLabel}
+                                  </span>
+                                  <span className="text-neutral-300">{iss.locationLabel}</span>
+                                </div>
+                                <div className="text-[11px] font-mono text-red-300/90 break-all bg-neutral-950 border border-neutral-900 rounded px-2 py-1">
+                                  {iss.rawSnippet}
+                                </div>
+                                <div className="text-[11px] text-neutral-400">
+                                  {iss.detail}
+                                </div>
+                              </li>
+                            ))}
+                          </ul>
+
+                          {showImportRepairPromptPreview && (
+                            <div className="space-y-1 pt-1">
+                              <div className="text-[11px] text-neutral-400">
+                                可直接复制以下提示词发给 AI 修复上述错误（只改报错片段，保留其余正确内容）：
+                              </div>
+                              <textarea
+                                readOnly
+                                rows={7}
+                                value={importAuditResult.report.repairPrompt}
+                                className="w-full bg-black border border-neutral-800 rounded p-2.5 text-[11px] font-mono text-neutral-200 leading-relaxed focus:outline-none"
+                              />
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
 
                   {/* 检测到的未绑定图片引用提示 */}
                   {unresolvedImages.length > 0 && (
@@ -2164,7 +3247,11 @@ export const LessonView: React.FC<LessonViewProps> = ({
           !isChatWorkbenchOpen ? (
             <div className="border border-neutral-800 rounded p-8 my-8 space-y-4">
               <div className="text-xs font-mono text-neutral-500">
-                {slot.date} · 第 {slot.dayIndex}/{course.durationDays} 讲 · 尚未生成本节课件
+                {slot.date} · {slot.id} · 第 {slot.dayIndex} 讲（排程第 {slot.scheduledDay || slot.dayIndex}/{course.durationDays} 天 ·{' '}
+                {(() => {
+                  const mins = getEvaluatedSectionMinutes(slot);
+                  return mins !== undefined ? `预计 ${mins} 分钟` : '待生成后评估学时';
+                })()}）· 尚未生成本节课件
               </div>
               <h1
                 className="text-xl font-semibold text-white"
@@ -2194,15 +3281,25 @@ export const LessonView: React.FC<LessonViewProps> = ({
               </div>
 
               <div className="flex flex-wrap items-center gap-3 pt-2">
-                <button
-                  type="button"
-                  onClick={handleRegenerateLesson}
-                  disabled={isRegenerating}
-                  className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors disabled:opacity-50"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isRegenerating ? 'animate-spin' : ''}`} />
-                  <span>{isRegenerating ? '正在生成完整课件...' : 'API 自动生成本节课件'}</span>
-                </button>
+                {onOpenOutlineModal && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onOpenOutlineModal(
+                        course,
+                        course.outlineConfirmed
+                          ? 'lessons'
+                          : hasPdfSource
+                            ? 'split_vocab'
+                            : 'outline'
+                      )
+                    }
+                    className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors"
+                  >
+                    <ListChecks className="w-3.5 h-3.5" />
+                    <span>打开课程工作台 (API 分步生成 / 切分)</span>
+                  </button>
+                )}
 
                 <button
                   type="button"
@@ -2232,6 +3329,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
           ) : null
         ) : (
           <article
+            ref={articleRef}
             className="space-y-10"
             onClick={(e) => {
               const target = e.target as HTMLElement;
@@ -2241,6 +3339,37 @@ export const LessonView: React.FC<LessonViewProps> = ({
                 if (refId) {
                   e.preventDefault();
                   openFloatingVisual(refId);
+                }
+                return;
+              }
+              const symEl = target.closest('[data-latex-symbol]') as HTMLElement | null;
+              if (symEl) {
+                const symKey = symEl.getAttribute('data-latex-symbol') || '';
+                const matchedEntry =
+                  symbolIndex.byKey.get(symKey) || lookupSymbolInIndex(symbolIndex, symKey);
+                if (matchedEntry) {
+                  e.stopPropagation();
+                  const wasSameActive = symEl.classList.contains('latex-symbol-active');
+                  articleRef.current
+                    ?.querySelectorAll('.latex-symbol-active')
+                    .forEach((el) => el.classList.remove('latex-symbol-active'));
+                  if (wasSameActive) {
+                    setActiveSymbolPopover(null);
+                    return;
+                  }
+                  symEl.classList.add('latex-symbol-active');
+                  const anchorBox = (
+                    (symEl.closest('.katex') as HTMLElement | null) || symEl
+                  ).getBoundingClientRect();
+                  setActiveSymbolPopover({
+                    entry: matchedEntry,
+                    rect: {
+                      left: anchorBox.left,
+                      top: anchorBox.top,
+                      bottom: anchorBox.bottom,
+                      width: anchorBox.width,
+                    },
+                  });
                 }
                 return;
               }
@@ -2300,13 +3429,282 @@ export const LessonView: React.FC<LessonViewProps> = ({
               </div>
             )}
 
+            {/* 已加载课件的渲染/引用异常提示与一键复制提示词 + 快速粘贴修复 */}
+            {activeLessonAudit &&
+              activeLessonAudit.issues.length > 0 &&
+              dismissedActiveAuditKey !== `${course.id}-${slot.dayIndex}-${activeLesson.generatedAt || ''}` && (
+                <section
+                  data-testid="active-lesson-render-audit"
+                  className="border border-red-900/60 bg-red-950/20 rounded p-4 space-y-3 text-xs"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-red-200 font-medium">
+                      <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                      <span>{activeLessonAudit.summaryText}</span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowActiveAuditDetails((v) => !v)}
+                        className="px-2.5 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors"
+                      >
+                        {showActiveAuditDetails ? '收起错误详情与提示词' : `查看 ${activeLessonAudit.issues.length} 处详情`}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          setShowQuickRepairBox(true);
+                          try {
+                            await navigator.clipboard.writeText(activeLessonAudit.repairPrompt);
+                            setCopiedActiveRepairPrompt(true);
+                            setTimeout(() => setCopiedActiveRepairPrompt(false), 2000);
+                          } catch {
+                            setShowActiveAuditDetails(true);
+                          }
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3 py-1 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors"
+                      >
+                        {copiedActiveRepairPrompt ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-600" />
+                            <span>已复制增量补丁提示词（下方直接粘贴补丁）</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5" />
+                            <span>复制增量补丁提示词（仅修复错误部分）</span>
+                          </>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        data-testid="toggle-quick-repair-btn"
+                        onClick={() => {
+                          const next = !showQuickRepairBox;
+                          setShowQuickRepairBox(next);
+                          if (next) {
+                            window.setTimeout(() => quickRepairBoxRef.current?.focus(), 40);
+                          }
+                        }}
+                        className={`px-2.5 py-1 border rounded transition-colors ${
+                          showQuickRepairBox
+                            ? 'border-sky-500/80 bg-sky-950/50 text-sky-200'
+                            : 'border-sky-800/80 hover:border-sky-500 text-sky-300 hover:text-white'
+                        }`}
+                      >
+                        {showQuickRepairBox ? '收起增量补丁粘贴框' : '粘贴增量修复补丁'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setDismissedActiveAuditKey(
+                            `${course.id}-${slot.dayIndex}-${activeLesson.generatedAt || ''}`
+                          )
+                        }
+                        aria-label="暂时收起本节渲染检查提示"
+                        className="p-1 text-neutral-400 hover:text-white"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {showQuickRepairBox && (
+                    <div
+                      data-testid="quick-repair-box"
+                      className="border border-sky-900/60 bg-black/80 rounded p-3 space-y-2.5"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-xs font-medium text-sky-200">
+                          增量合并修复（支持粘贴 AI 输出的增量补丁 JSON、单独 &lt;svg&gt;...&lt;/svg&gt; 代码块或完整课件，不会丢失原有章节）
+                        </span>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            data-testid="quick-repair-clipboard-btn"
+                            onClick={handlePasteClipboardToQuickRepair}
+                            disabled={isApplyingQuickRepair}
+                            className="px-2.5 py-1 text-xs border border-sky-700/80 hover:border-sky-400 bg-sky-950/50 text-sky-100 rounded transition-colors disabled:opacity-50"
+                          >
+                            从剪贴板一键粘贴并合并
+                          </button>
+                          {quickRepairInput && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setQuickRepairInput('');
+                                setQuickRepairNotice(null);
+                                quickRepairBoxRef.current?.focus();
+                              }}
+                              className="px-2 py-1 text-[11px] border border-neutral-800 hover:border-neutral-600 text-neutral-400 hover:text-white rounded"
+                            >
+                              清空
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      <textarea
+                        ref={quickRepairBoxRef}
+                        data-testid="quick-repair-textarea"
+                        rows={5}
+                        value={quickRepairInput}
+                        onChange={(e) => {
+                          setQuickRepairInput(e.target.value);
+                          if (quickRepairNotice) setQuickRepairNotice(null);
+                        }}
+                        placeholder='在此直接粘贴 AI 输出的增量修复补丁（如 {"textReplacements": [...], "diagramsToUpsert": [...]} 或单独的 <svg>...</svg> 代码块），自动合并到当前课件，无需重新生成全文...'
+                        className="w-full bg-neutral-950 border border-neutral-800 rounded p-2.5 text-xs font-mono text-neutral-100 leading-relaxed focus:outline-none focus:border-sky-500"
+                      />
+
+                      {quickRepairAuditResult && (
+                        <div
+                          data-testid="quick-repair-status"
+                          className={`text-[11px] font-mono px-2.5 py-1.5 rounded border ${
+                            quickRepairAuditResult.report.issues.length === 0
+                              ? 'border-emerald-800/70 bg-emerald-950/30 text-emerald-300'
+                              : 'border-amber-800/70 bg-amber-950/25 text-amber-200'
+                          }`}
+                        >
+                          {quickRepairAuditResult.report.issues.length === 0
+                            ? `✓ ${quickRepairAuditResult.appliedSummary || '补丁合并后渲染自检已全部通过（0 错误）'}，可直接点击右侧按钮保存。`
+                            : `${quickRepairAuditResult.appliedSummary ? `${quickRepairAuditResult.appliedSummary}；` : ''}合并后仍余 ${quickRepairAuditResult.report.errorCount} 处错误（${quickRepairAuditResult.report.issues[0]?.categoryLabel}：${quickRepairAuditResult.report.issues[0]?.locationLabel}）`}
+                        </div>
+                      )}
+
+                      {quickRepairNotice && (
+                        <div
+                          className={`text-[11px] px-2.5 py-1.5 rounded border ${
+                            quickRepairNotice.ok
+                              ? 'border-emerald-800 bg-emerald-950/30 text-emerald-300'
+                              : 'border-red-800 bg-red-950/30 text-red-300'
+                          }`}
+                        >
+                          {quickRepairNotice.message}
+                        </div>
+                      )}
+
+                      <div className="flex items-center justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setShowQuickRepairBox(false)}
+                          className="px-3 py-1 text-xs border border-neutral-800 text-neutral-400 hover:text-white rounded"
+                        >
+                          取消
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="quick-repair-apply-btn"
+                          onClick={() => handleApplyQuickRepair()}
+                          disabled={isApplyingQuickRepair || !quickRepairInput.trim()}
+                          className="px-3.5 py-1 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors disabled:opacity-50"
+                        >
+                          {isApplyingQuickRepair ? '正在合并保存...' : '立即应用补丁并保存'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {showActiveAuditDetails && (
+                    <div className="space-y-3 pt-1">
+                      <ul className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
+                        {activeLessonAudit.issues.map((iss) => (
+                          <li
+                            key={iss.id}
+                            className="border border-red-900/40 bg-black/70 rounded px-3 py-2 space-y-1"
+                          >
+                            <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
+                              <span className="px-1.5 py-0.5 rounded border border-red-800 bg-red-950/60 text-red-300">
+                                {iss.categoryLabel}
+                              </span>
+                              <span className="text-neutral-300">{iss.locationLabel}</span>
+                            </div>
+                            <div className="text-[11px] font-mono text-red-300/90 break-all bg-neutral-950 border border-neutral-900 rounded px-2 py-1">
+                              {iss.rawSnippet}
+                            </div>
+                            <div className="text-[11px] text-neutral-400">{iss.detail}</div>
+                          </li>
+                        ))}
+                      </ul>
+                      <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                        <span className="text-[11px] font-mono text-neutral-400">
+                          分阶段局部重生成 / 修复提示词（不重生成整节）：
+                        </span>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {(
+                            [
+                              { stage: 'planning_prereq', label: '先修与规划' },
+                              { stage: 'prose_derivation', label: '正文与推导' },
+                              { stage: 'exercises_feedback', label: '练习与反馈' },
+                              { stage: 'diagrams_topology', label: '拓扑与SVG图示' },
+                            ] as const
+                          ).map(({ stage, label }) => (
+                            <button
+                              key={stage}
+                              type="button"
+                              onClick={async () => {
+                                const promptText = buildStageRepairPrompt({
+                                  course,
+                                  slot,
+                                  stage,
+                                  issueSummary: activeLessonAudit.issues
+                                    .map((i) => `- [${i.categoryLabel}] ${i.locationLabel}: ${i.detail}`)
+                                    .join('\n'),
+                                });
+                                setStageRepairPreview({ stage, prompt: promptText });
+                                setShowQuickRepairBox(true);
+                                try {
+                                  await navigator.clipboard.writeText(promptText);
+                                  setCopiedStageKey(stage);
+                                  setTimeout(() => setCopiedStageKey(null), 2000);
+                                } catch {
+                                  // Preview textarea displays promptText
+                                }
+                              }}
+                              className={`px-2 py-0.5 rounded border text-[11px] transition-colors ${
+                                copiedStageKey === stage
+                                  ? 'border-emerald-600 bg-emerald-950/60 text-emerald-200'
+                                  : 'border-neutral-700 hover:border-sky-600 bg-neutral-950 text-neutral-300 hover:text-white'
+                              }`}
+                            >
+                              {copiedStageKey === stage ? `✓ 已复制${label}` : label}
+                            </button>
+                          ))}
+                          {stageRepairPreview && (
+                            <button
+                              type="button"
+                              onClick={() => setStageRepairPreview(null)}
+                              className="px-2 py-0.5 rounded border border-neutral-800 text-[11px] text-neutral-400 hover:text-white"
+                            >
+                              查看综合补丁
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <textarea
+                        readOnly
+                        rows={7}
+                        value={stageRepairPreview?.prompt || activeLessonAudit.repairPrompt}
+                        className="w-full bg-black border border-neutral-800 rounded p-2.5 text-[11px] font-mono text-neutral-200 leading-relaxed focus:outline-none"
+                      />
+                    </div>
+                  )}
+                </section>
+              )}
+
             {/* Lesson Title, Teaching Context (Prerequisites, Scope, Connections) */}
-            <header className="border-b border-neutral-900 pb-6 space-y-4">
+            <header data-symbol-scope="header" className="border-b border-neutral-900 pb-6 space-y-4">
               <div className="flex flex-wrap items-center gap-2 text-xs text-neutral-500 font-mono">
                 <span>{slot.date}</span>
                 <span aria-hidden="true">·</span>
+                <span>{slot.id}</span>
+                <span aria-hidden="true">·</span>
                 <span>
-                  第 {slot.dayIndex} / {course.durationDays} 天
+                  第 {slot.dayIndex} 讲 · 排程第 {slot.scheduledDay || slot.dayIndex}/{course.durationDays} 天 ·{' '}
+                  {(() => {
+                    const mins = getEvaluatedSectionMinutes(slot);
+                    return mins !== undefined ? `预计 ${mins} 分钟` : '待生成后评估学时';
+                  })()}
                 </span>
                 {activeLesson.sourceMode && (
                   <>
@@ -2323,7 +3721,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                 )}
               </div>
               <h1
-                className="text-2xl font-semibold text-white tracking-tight"
+                className="font-display text-2xl sm:text-3xl font-bold text-white tracking-tight"
                 dangerouslySetInnerHTML={{
                   __html: renderInlineMathWithLatex(activeLesson.title, lessonVisuals),
                 }}
@@ -2393,6 +3791,18 @@ export const LessonView: React.FC<LessonViewProps> = ({
                         }}
                       />
                     </div>
+                  )}
+                  {activeLesson.teachingContext.prerequisiteCheck && (
+                    <div
+                      data-testid="lesson-prerequisite-check"
+                      className="md:col-span-2 p-2.5 rounded border border-violet-900/50 bg-violet-950/20 text-xs text-violet-100/90 leading-relaxed [&>p]:m-0"
+                      dangerouslySetInnerHTML={{
+                        __html: renderMarkdownWithLatex(
+                          `**先修微诊断与衔接：** ${activeLesson.teachingContext.prerequisiteCheck}`,
+                          lessonVisuals
+                        ),
+                      }}
+                    />
                   )}
                 </div>
               )}
@@ -2603,7 +4013,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
             {/* Closed-Loop Interleaved Self-Study Flow:
                 先思考后讲解 (Inline Heuristics) + 图文同步 (Inline Diagrams) + 知识点即时练习 (Inline Exercises) */}
             {interleavedLessonFlow.blocks.length > 0 && (
-              <section className="space-y-6">
+              <section data-symbol-scope="body" className="space-y-6">
                 {interleavedLessonFlow.blocks.map((block, bIdx) => {
                   if (block.kind === 'markdown') {
                     return (
@@ -2625,7 +4035,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     return (
                       <div
                         key={`hq-${hqKey}-${bIdx}`}
-                        className="border border-neutral-800 rounded p-4 bg-neutral-950/60 space-y-3 my-4"
+                        className="glow-border border border-neutral-800 rounded p-4 bg-neutral-950/60 space-y-3 my-4"
                       >
                         <div className="flex flex-wrap items-start justify-between gap-3">
                           <div className="space-y-1.5 flex-1">
@@ -2724,7 +4134,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                           <div
                             className="pt-3 border-t border-neutral-900 text-xs text-neutral-300 leading-relaxed lesson-prose"
                             dangerouslySetInnerHTML={{
-                              __html: renderMarkdownWithLatex(hq.answerReveal, lessonVisuals),
+                              __html: renderMarkdownWithLatex(hq.answerReveal || '', lessonVisuals),
                             }}
                           />
                         )}
@@ -2737,7 +4147,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     if (!diag) return null;
                     const diagId = (diag.id || `diag-${block.diagIdx + 1}`).trim();
                     const visualEntry = lessonVisuals.find((v) => v.id === diagId);
-                    const enhancedSvg = visualEntry?.svgCode || enhanceDiagramSvg(diag.svgCode);
+                    const enhancedSvg = visualEntry?.svgCode || enhanceDiagramSvg(diag.svgCode || '');
                     const diagTitle = stripAiCitationArtifacts(diag.title || diagId);
 
                     return (
@@ -2792,6 +4202,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                             }}
                           />
                         )}
+                        {renderDiagramTopologySpec(diag.topologySpec)}
                       </figure>
                     );
                   }
@@ -2812,7 +4223,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     return (
                       <div
                         key={`inline-ex-${q.id}-${bIdx}`}
-                        className="border border-neutral-800 rounded p-5 bg-neutral-950/50 space-y-4 my-5"
+                        className="glow-border border border-neutral-800 rounded p-5 bg-neutral-950/50 space-y-4 my-5"
                       >
                         <div className="flex flex-wrap items-start justify-between gap-3">
                           <div className="space-y-1 flex-1">
@@ -2869,6 +4280,63 @@ export const LessonView: React.FC<LessonViewProps> = ({
                             </button>
                           </div>
                         </div>
+
+                        {(() => {
+                          const exDiag = interleavedLessonFlow.exerciseDiagramsByExId[q.id];
+                          if (!exDiag) return null;
+                          const exDiagId = (exDiag.id || `diag-${q.id}`).trim();
+                          const visualEntry = lessonVisuals.find((v) => v.id === exDiagId);
+                          const enhancedSvg =
+                            visualEntry?.svgCode || enhanceDiagramSvg(exDiag.svgCode || '');
+                          const exDiagTitle = stripAiCitationArtifacts(
+                            exDiag.title || `练习题 #${qIdx + 1} 题设配图`
+                          );
+                          return (
+                            <figure
+                              data-testid={`exercise-svg-${q.id}`}
+                              className="border border-neutral-800/90 rounded p-3.5 bg-black/70 space-y-2.5"
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="text-[11px] font-mono px-1.5 py-0.5 border border-neutral-800 rounded text-neutral-400">
+                                    题目配图 · {exDiagId}
+                                  </span>
+                                  <span
+                                    className="text-xs font-medium text-neutral-200"
+                                    dangerouslySetInnerHTML={{
+                                      __html: renderInlineMathWithLatex(exDiagTitle, lessonVisuals),
+                                    }}
+                                  />
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => openFloatingVisual(exDiagId)}
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] border border-neutral-800 hover:border-neutral-600 rounded text-neutral-300 hover:text-white transition-colors whitespace-nowrap"
+                                  title="在悬浮小窗中打开此题配图，方便演算对照"
+                                >
+                                  <Pin className="w-3 h-3" />
+                                  <span>小窗置顶查看</span>
+                                </button>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => openFloatingVisual(exDiagId)}
+                                aria-label={`点击在小窗中查看题目配图：${exDiagTitle}`}
+                                className="diagram-svg-frame w-full block text-left overflow-x-auto cursor-zoom-in rounded hover:bg-neutral-900/30 transition-colors focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                                dangerouslySetInnerHTML={{ __html: enhancedSvg }}
+                              />
+                              {exDiag.caption && (
+                                <figcaption
+                                  className="text-xs text-neutral-400 leading-relaxed [&>p]:m-0"
+                                  dangerouslySetInnerHTML={{
+                                    __html: renderMarkdownWithLatex(exDiag.caption, lessonVisuals),
+                                  }}
+                                />
+                              )}
+                              {renderDiagramTopologySpec(exDiag.topologySpec)}
+                            </figure>
+                          );
+                        })()}
 
                         {showHint && q.hint && (
                           <div
@@ -2968,15 +4436,17 @@ export const LessonView: React.FC<LessonViewProps> = ({
                                 </span>
                               )}
                             </div>
-                            <div
-                              className="text-neutral-300 leading-relaxed"
-                              dangerouslySetInnerHTML={{
-                                __html: renderMarkdownWithLatex(
-                                  `**解题步骤与解析：** ${singleReport.explanation}`,
-                                  lessonVisuals
-                                ),
-                              }}
-                            />
+                            {singleReport.explanation && (
+                              <div
+                                className="text-neutral-300 leading-relaxed"
+                                dangerouslySetInnerHTML={{
+                                  __html: renderMarkdownWithLatex(
+                                    `**解题步骤与解析：** ${singleReport.explanation}`,
+                                    lessonVisuals
+                                  ),
+                                }}
+                              />
+                            )}
                             {q.wrongOptionsAnalysis && (
                               <div
                                 className="text-neutral-400 leading-relaxed"
@@ -2988,6 +4458,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                                 }}
                               />
                             )}
+                            {renderExerciseRemediationAndVariant(q)}
                           </div>
                         )}
                       </div>
@@ -3012,7 +4483,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
             {/* End-of-Chapter Comprehensive Exercises & Full-Lesson Offline Grading */}
             {activeLesson.exercises && activeLesson.exercises.length > 0 && (
-              <section className="border-t border-neutral-800 pt-8 space-y-6">
+              <section data-symbol-scope="post-body" className="border-t border-neutral-800 pt-8 space-y-6">
                 <div className="flex flex-wrap items-center justify-between gap-4">
                   <div>
                     <h2 className="text-base font-semibold text-white">
@@ -3058,7 +4529,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     return (
                       <div
                         key={q.id}
-                        className="border border-neutral-900 rounded p-5 bg-neutral-950/40 space-y-4"
+                        className="glow-border border border-neutral-900 rounded p-5 bg-neutral-950/40 space-y-4"
                       >
                         <div className="flex flex-wrap items-start justify-between gap-3">
                           <div className="space-y-1 flex-1">
@@ -3120,6 +4591,63 @@ export const LessonView: React.FC<LessonViewProps> = ({
                             </button>
                           </div>
                         </div>
+
+                        {(() => {
+                          const exDiag = interleavedLessonFlow.exerciseDiagramsByExId[q.id];
+                          if (!exDiag) return null;
+                          const exDiagId = (exDiag.id || `diag-${q.id}`).trim();
+                          const visualEntry = lessonVisuals.find((v) => v.id === exDiagId);
+                          const enhancedSvg =
+                            visualEntry?.svgCode || enhanceDiagramSvg(exDiag.svgCode || '');
+                          const exDiagTitle = stripAiCitationArtifacts(
+                            exDiag.title || `综合练习 #${qIdx + 1} 题设配图`
+                          );
+                          return (
+                            <figure
+                              data-testid={`exercise-svg-${q.id}`}
+                              className="ml-5 border border-neutral-800/90 rounded p-3.5 bg-black/70 space-y-2.5"
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="text-[11px] font-mono px-1.5 py-0.5 border border-neutral-800 rounded text-neutral-400">
+                                    题目配图 · {exDiagId}
+                                  </span>
+                                  <span
+                                    className="text-xs font-medium text-neutral-200"
+                                    dangerouslySetInnerHTML={{
+                                      __html: renderInlineMathWithLatex(exDiagTitle, lessonVisuals),
+                                    }}
+                                  />
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => openFloatingVisual(exDiagId)}
+                                  className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] border border-neutral-800 hover:border-neutral-600 rounded text-neutral-300 hover:text-white transition-colors whitespace-nowrap"
+                                  title="在悬浮小窗中打开此题配图，方便演算对照"
+                                >
+                                  <Pin className="w-3 h-3" />
+                                  <span>小窗置顶查看</span>
+                                </button>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => openFloatingVisual(exDiagId)}
+                                aria-label={`点击在小窗中查看题目配图：${exDiagTitle}`}
+                                className="diagram-svg-frame w-full block text-left overflow-x-auto cursor-zoom-in rounded hover:bg-neutral-900/30 transition-colors focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                                dangerouslySetInnerHTML={{ __html: enhancedSvg }}
+                              />
+                              {exDiag.caption && (
+                                <figcaption
+                                  className="text-xs text-neutral-400 leading-relaxed [&>p]:m-0"
+                                  dangerouslySetInnerHTML={{
+                                    __html: renderMarkdownWithLatex(exDiag.caption, lessonVisuals),
+                                  }}
+                                />
+                              )}
+                              {renderDiagramTopologySpec(exDiag.topologySpec)}
+                            </figure>
+                          );
+                        })()}
 
                         {showHint && q.hint && (
                           <div
@@ -3219,15 +4747,17 @@ export const LessonView: React.FC<LessonViewProps> = ({
                                 </span>
                               )}
                             </div>
-                            <div
-                              className="text-neutral-300 leading-relaxed"
-                              dangerouslySetInnerHTML={{
-                                __html: renderMarkdownWithLatex(
-                                  `**解题步骤与解析：** ${singleReport.explanation}`,
-                                  lessonVisuals
-                                ),
-                              }}
-                            />
+                            {singleReport.explanation && (
+                              <div
+                                className="text-neutral-300 leading-relaxed"
+                                dangerouslySetInnerHTML={{
+                                  __html: renderMarkdownWithLatex(
+                                    `**解题步骤与解析：** ${singleReport.explanation}`,
+                                    lessonVisuals
+                                  ),
+                                }}
+                              />
+                            )}
                             {q.wrongOptionsAnalysis && (
                               <div
                                 className="text-neutral-400 leading-relaxed"
@@ -3239,6 +4769,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                                 }}
                               />
                             )}
+                            {renderExerciseRemediationAndVariant(q)}
                           </div>
                         )}
                       </div>
@@ -3261,7 +4792,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
             {/* Reverse Explanation Verification (反向解释检验) */}
             {activeLesson.reverseChecks && activeLesson.reverseChecks.length > 0 && (
-              <section className="border-t border-neutral-800 pt-8 space-y-5">
+              <section data-symbol-scope="post-body" className="border-t border-neutral-800 pt-8 space-y-5">
                 <div>
                   <h2 className="text-base font-semibold text-white">
                     理解检验（反向解释检验）
@@ -3337,15 +4868,17 @@ export const LessonView: React.FC<LessonViewProps> = ({
                                 </ul>
                               </div>
                             )}
-                            <div
-                              className="text-neutral-300 leading-relaxed pt-1"
-                              dangerouslySetInnerHTML={{
-                                __html: renderMarkdownWithLatex(
-                                  `**参考解释：** ${rc.referenceExplanation}`,
-                                  lessonVisuals
-                                ),
-                              }}
-                            />
+                            {rc.referenceExplanation && (
+                              <div
+                                className="text-neutral-300 leading-relaxed pt-1"
+                                dangerouslySetInnerHTML={{
+                                  __html: renderMarkdownWithLatex(
+                                    `**参考解释：** ${rc.referenceExplanation}`,
+                                    lessonVisuals
+                                  ),
+                                }}
+                              />
+                            )}
                           </div>
                         )}
                       </div>
@@ -3355,66 +4888,89 @@ export const LessonView: React.FC<LessonViewProps> = ({
               </section>
             )}
 
-            {/* Strict Correctness Audit & Quality Verification Summary */}
+            {/* Strict Correctness Audit & Quality Verification Summary (hideable) */}
             {activeLesson.qualityCheck && (
               <section className="border-t border-neutral-900 pt-6">
-                <div className="border border-neutral-900 rounded p-4 bg-neutral-950/30 space-y-2 text-xs text-neutral-400">
-                  <div className="font-medium text-neutral-300">
-                    课件内容与中间推理正确性复核说明
+                {hideQualityCheck ? (
+                  <div className="flex justify-end">
+                    <button
+                      type="button"
+                      onClick={() => handleToggleQualityCheckVisibility(false)}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] text-neutral-500 hover:text-neutral-200 border border-neutral-900 hover:border-neutral-700 rounded transition-colors"
+                    >
+                      <Eye className="w-3 h-3" />
+                      <span>显示课件内容与中间推理正确性复核说明</span>
+                    </button>
                   </div>
-                  {activeLesson.qualityCheck.intermediateStepsAuditNote && (
-                    <p className="leading-relaxed">
-                      · 严格正确性检查：
-                      <span
-                        dangerouslySetInnerHTML={{
-                          __html: renderInlineMathWithLatex(
-                            activeLesson.qualityCheck.intermediateStepsAuditNote,
-                            lessonVisuals
-                          ),
-                        }}
-                      />
-                    </p>
-                  )}
-                  {activeLesson.qualityCheck.derivationContinuityNote && (
-                    <p className="leading-relaxed">
-                      · 推导思路与连续性：
-                      <span
-                        dangerouslySetInnerHTML={{
-                          __html: renderInlineMathWithLatex(
-                            activeLesson.qualityCheck.derivationContinuityNote,
-                            lessonVisuals
-                          ),
-                        }}
-                      />
-                    </p>
-                  )}
-                  {activeLesson.qualityCheck.diagramAlignmentNote && (
-                    <p className="leading-relaxed">
-                      · 图文同步与标注：
-                      <span
-                        dangerouslySetInnerHTML={{
-                          __html: renderInlineMathWithLatex(
-                            activeLesson.qualityCheck.diagramAlignmentNote,
-                            lessonVisuals
-                          ),
-                        }}
-                      />
-                    </p>
-                  )}
-                  {activeLesson.qualityCheck.formulaAndUnitNote && (
-                    <p className="leading-relaxed">
-                      · 公式符号与单位：
-                      <span
-                        dangerouslySetInnerHTML={{
-                          __html: renderInlineMathWithLatex(
-                            activeLesson.qualityCheck.formulaAndUnitNote,
-                            lessonVisuals
-                          ),
-                        }}
-                      />
-                    </p>
-                  )}
-                </div>
+                ) : (
+                  <div className="border border-neutral-900 rounded p-4 bg-neutral-950/30 space-y-2 text-xs text-neutral-400">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="font-medium text-neutral-300">
+                        课件内容与中间推理正确性复核说明
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleToggleQualityCheckVisibility(true)}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] text-neutral-400 hover:text-white border border-neutral-800 hover:border-neutral-600 rounded transition-colors"
+                      >
+                        <EyeOff className="w-3 h-3" />
+                        <span>隐藏复核说明</span>
+                      </button>
+                    </div>
+                    {activeLesson.qualityCheck.intermediateStepsAuditNote && (
+                      <p className="leading-relaxed">
+                        · 严格正确性检查：
+                        <span
+                          dangerouslySetInnerHTML={{
+                            __html: renderInlineMathWithLatex(
+                              activeLesson.qualityCheck.intermediateStepsAuditNote,
+                              lessonVisuals
+                            ),
+                          }}
+                        />
+                      </p>
+                    )}
+                    {activeLesson.qualityCheck.derivationContinuityNote && (
+                      <p className="leading-relaxed">
+                        · 推导思路与连续性：
+                        <span
+                          dangerouslySetInnerHTML={{
+                            __html: renderInlineMathWithLatex(
+                              activeLesson.qualityCheck.derivationContinuityNote,
+                              lessonVisuals
+                            ),
+                          }}
+                        />
+                      </p>
+                    )}
+                    {activeLesson.qualityCheck.diagramAlignmentNote && (
+                      <p className="leading-relaxed">
+                        · 图文同步与标注：
+                        <span
+                          dangerouslySetInnerHTML={{
+                            __html: renderInlineMathWithLatex(
+                              activeLesson.qualityCheck.diagramAlignmentNote,
+                              lessonVisuals
+                            ),
+                          }}
+                        />
+                      </p>
+                    )}
+                    {activeLesson.qualityCheck.formulaAndUnitNote && (
+                      <p className="leading-relaxed">
+                        · 公式符号与单位：
+                        <span
+                          dangerouslySetInnerHTML={{
+                            __html: renderInlineMathWithLatex(
+                              activeLesson.qualityCheck.formulaAndUnitNote,
+                              lessonVisuals
+                            ),
+                          }}
+                        />
+                      </p>
+                    )}
+                  </div>
+                )}
               </section>
             )}
 
@@ -3464,101 +5020,119 @@ export const LessonView: React.FC<LessonViewProps> = ({
             )}
           </article>
         )}
+          </motion.div>
+        </AnimatePresence>
       </main>
 
-      {/* 常驻底部保存课件操作栏：当填入待导入课件或正在预览课件时始终悬浮在页面底部，无需滚回顶部 */}
-      {(previewLesson !== null || rawImportInput.trim().length > 0) && (
-        <div
-          role="region"
-          aria-label="课件预览与常驻保存操作栏"
-          className="fixed bottom-0 inset-x-0 z-40 bg-black/95 backdrop-blur border-t border-emerald-800/70 px-6 py-3 shadow-2xl"
-        >
-          <div className="max-w-4xl mx-auto flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-2 text-xs min-w-0">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 shrink-0" />
-              {previewLesson ? (
-                <span className="text-emerald-200 truncate">
-                  正在预览待保存课件：
-                  <strong
-                    className="font-semibold text-white ml-1"
-                    dangerouslySetInnerHTML={{
-                      __html: renderInlineMathWithLatex(previewLesson.title),
-                    }}
-                  />
-                  <span className="text-neutral-400 ml-2 font-mono">
-                    （含 {previewLesson.diagrams?.length || 0} 幅图示 ·{' '}
-                    {previewLesson.exercises?.length || 0} 道练习）
+      {/* 常驻底部保存课件操作栏：直接挂载至 body，确保任何转场动效下都严格悬浮在视口底部 */}
+      {typeof document !== 'undefined' &&
+        (previewLesson !== null || rawImportInput.trim().length > 0) &&
+        createPortal(
+          <div
+            role="region"
+            aria-label="课件预览与常驻保存操作栏"
+            className="fixed bottom-0 inset-x-0 z-40 bg-black/95 backdrop-blur border-t border-emerald-800/70 px-6 py-3 shadow-2xl"
+          >
+            <div className="max-w-4xl mx-auto flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-xs min-w-0">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 shrink-0" />
+                {previewLesson ? (
+                  <span className="text-emerald-200 truncate">
+                    正在预览待保存课件：
+                    <strong
+                      className="font-semibold text-white ml-1"
+                      dangerouslySetInnerHTML={{
+                        __html: renderInlineMathWithLatex(previewLesson.title),
+                      }}
+                    />
+                    <span className="text-neutral-400 ml-2 font-mono">
+                      （含 {previewLesson.diagrams?.length || 0} 幅图示 ·{' '}
+                      {previewLesson.exercises?.length || 0} 道练习）
+                    </span>
                   </span>
-                </span>
-              ) : (
-                <span className="text-neutral-200 truncate">
-                  已填入待导入课件内容（{rawImportInput.trim().length} 字符），可随时预览排版或直接保存本节课件
-                </span>
-              )}
-            </div>
+                ) : (
+                  <span className="text-neutral-200 truncate">
+                    已填入待导入课件内容（{rawImportInput.trim().length} 字符），可随时预览排版或直接保存本节课件
+                  </span>
+                )}
+              </div>
 
-            <div className="flex flex-wrap items-center gap-2 shrink-0">
-              {previewLesson ? (
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                {previewLesson ? (
+                  <button
+                    type="button"
+                    onClick={() => setPreviewLesson(null)}
+                    className="px-3 py-1.5 text-xs border border-neutral-700 hover:border-neutral-500 rounded text-neutral-300 hover:text-white transition-colors"
+                  >
+                    退出预览
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handlePreviewImportedContent}
+                    disabled={!rawImportInput.trim()}
+                    className="px-3 py-1.5 text-xs font-medium border border-neutral-700 hover:border-neutral-500 rounded text-neutral-200 hover:text-white transition-colors disabled:opacity-50"
+                  >
+                    解析并预览课件
+                  </button>
+                )}
+
                 <button
                   type="button"
-                  onClick={() => setPreviewLesson(null)}
-                  className="px-3 py-1.5 text-xs border border-neutral-700 hover:border-neutral-500 rounded text-neutral-300 hover:text-white transition-colors"
-                >
-                  退出预览
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={handlePreviewImportedContent}
-                  disabled={!rawImportInput.trim()}
-                  className="px-3 py-1.5 text-xs font-medium border border-neutral-700 hover:border-neutral-500 rounded text-neutral-200 hover:text-white transition-colors disabled:opacity-50"
-                >
-                  解析并预览课件
-                </button>
-              )}
-
-              <button
-                type="button"
-                onClick={() => handleConfirmSaveImport(false)}
-                disabled={isSavingImport || (!rawImportInput.trim() && !previewLesson)}
-                className={`px-4 py-1.5 text-xs font-medium rounded transition-colors disabled:opacity-50 ${
-                  nextSlot && onSelectDayIndex
-                    ? 'border border-emerald-600/80 bg-emerald-950/60 hover:bg-emerald-900/70 text-emerald-100'
-                    : 'bg-white text-black hover:bg-neutral-200'
-                }`}
-              >
-                {isSavingImport
-                  ? '正在保存...'
-                  : nextSlot
-                    ? '确认保存本节课件'
-                    : '确认保存本节课件'}
-              </button>
-
-              {nextSlot && onSelectDayIndex && (
-                <button
-                  type="button"
-                  onClick={() => handleConfirmSaveImport(true)}
+                  onClick={() => handleConfirmSaveImport(false)}
                   disabled={isSavingImport || (!rawImportInput.trim() && !previewLesson)}
-                  className="px-4 py-1.5 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors disabled:opacity-50"
+                  className={`px-4 py-1.5 text-xs font-medium rounded transition-colors disabled:opacity-50 ${
+                    nextSlot && onSelectDayIndex
+                      ? 'border border-emerald-600/80 bg-emerald-950/60 hover:bg-emerald-900/70 text-emerald-100'
+                      : 'bg-white text-black hover:bg-neutral-200'
+                  }`}
                 >
-                  {isSavingImport ? '正在保存...' : `保存并进入第 ${nextSlot.dayIndex} 讲 →`}
+                  {isSavingImport
+                    ? '正在保存...'
+                    : nextSlot
+                      ? '确认保存本节课件'
+                      : '确认保存本节课件'}
                 </button>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
 
-      {/* 非阻塞悬浮小窗：长推导 / 做题时随时查看已点击的电路图、示意 SVG 或插图 */}
-      {activeFloatingVisual && (
-        <aside
-          role="region"
-          aria-label="悬浮看图小窗"
-          style={{ transform: `translate(${floatingOffset.dx}px, ${floatingOffset.dy}px)` }}
-          className={`fixed bottom-5 right-5 z-50 border border-neutral-700 bg-[#0a0a0a]/98 backdrop-blur rounded-lg shadow-2xl overflow-hidden transition-[width] duration-150 ${
-            isFloatingExpanded ? 'w-[min(92vw,760px)]' : 'w-[min(88vw,390px)]'
-          }`}
-        >
+                {nextSlot && onSelectDayIndex && (
+                  <button
+                    type="button"
+                    onClick={() => handleConfirmSaveImport(true)}
+                    disabled={isSavingImport || (!rawImportInput.trim() && !previewLesson)}
+                    className="px-4 py-1.5 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors disabled:opacity-50"
+                  >
+                    {isSavingImport ? '正在保存...' : `保存并进入第 ${nextSlot.dayIndex} 讲 →`}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
+
+      {/* 非阻塞悬浮小窗：通过 Portal 挂载到 body，避免祖先 transform/filter 破坏 fixed 视口定位 */}
+      {typeof document !== 'undefined' &&
+        createPortal(
+          <AnimatePresence>
+            {activeFloatingVisual && (
+              <aside
+                key="floating-visual-window"
+                role="region"
+                aria-label="悬浮看图小窗"
+                style={{
+                  transform: `translate3d(${floatingOffset.dx}px, ${floatingOffset.dy}px, 0)`,
+                }}
+                className="fixed bottom-5 right-5 z-50"
+              >
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.94 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.96 }}
+                  transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+                  className={`glow-border border border-neutral-700 bg-[#0a0a0a]/98 backdrop-blur rounded-lg shadow-2xl overflow-hidden transition-[width] duration-150 ${
+                    isFloatingExpanded ? 'w-[min(92vw,760px)]' : 'w-[min(88vw,390px)]'
+                  }`}
+                >
           <div
             onPointerDown={(e) => {
               if ((e.target as HTMLElement).closest('button')) return;
@@ -3589,30 +5163,9 @@ export const LessonView: React.FC<LessonViewProps> = ({
             <div className="flex items-center gap-1 shrink-0">
               <button
                 type="button"
-                onClick={() => setFloatingScale((s) => Math.max(0.75, +(s - 0.25).toFixed(2)))}
-                aria-label="缩小悬浮图片"
-                title="缩小"
-                className="p-1 text-neutral-400 hover:text-white rounded hover:bg-neutral-800 transition-colors"
-              >
-                <ZoomOut className="w-3.5 h-3.5" />
-              </button>
-              <span className="text-[11px] font-mono text-neutral-400 min-w-[36px] text-center">
-                {Math.round(floatingScale * 100)}%
-              </span>
-              <button
-                type="button"
-                onClick={() => setFloatingScale((s) => Math.min(2, +(s + 0.25).toFixed(2)))}
-                aria-label="放大悬浮图片"
-                title="放大"
-                className="p-1 text-neutral-400 hover:text-white rounded hover:bg-neutral-800 transition-colors"
-              >
-                <ZoomIn className="w-3.5 h-3.5" />
-              </button>
-              <button
-                type="button"
                 onClick={() => setIsFloatingExpanded((v) => !v)}
-                aria-label={isFloatingExpanded ? '还原小窗尺寸' : '加宽悬浮小窗'}
-                title={isFloatingExpanded ? '还原小窗尺寸' : '加宽查看'}
+                aria-label={isFloatingExpanded ? '还原窗口尺寸' : '放大窗口'}
+                title={isFloatingExpanded ? '还原窗口尺寸' : '放大窗口'}
                 className="p-1 text-neutral-400 hover:text-white rounded hover:bg-neutral-800 transition-colors"
               >
                 {isFloatingExpanded ? (
@@ -3677,7 +5230,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                 {activeFloatingVisual.kind === 'svg' ? (
                   <div
                     className="floating-diagram-svg mx-auto"
-                    style={{ width: `${floatingScale * 100}%` }}
+                    style={{ width: '100%' }}
                     dangerouslySetInnerHTML={{
                       __html: activeFloatingVisual.svgCode || '',
                     }}
@@ -3686,7 +5239,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                   <img
                     src={activeFloatingVisual.imageUrl}
                     alt={activeFloatingVisual.title}
-                    style={{ width: `${floatingScale * 100}%` }}
+                    style={{ width: '100%' }}
                     className="max-w-none h-auto rounded mx-auto block"
                   />
                 ) : null}
@@ -3702,8 +5255,100 @@ export const LessonView: React.FC<LessonViewProps> = ({
               )}
             </>
           )}
-        </aside>
-      )}
+                </motion.div>
+              </aside>
+            )}
+          </AnimatePresence>,
+          document.body
+        )}
+
+      {/* 交互式 LaTeX 上文符号释义浮窗：点击推导/练习中上文已解释的符号弹出 */}
+      {typeof document !== 'undefined' &&
+        activeSymbolPopover &&
+        createPortal(
+          (() => {
+            const { entry, rect } = activeSymbolPopover;
+            const popoverWidth = 340;
+            const vw = typeof window !== 'undefined' ? window.innerWidth : 1280;
+            const vh = typeof window !== 'undefined' ? window.innerHeight : 800;
+            const clampedLeft = Math.max(
+              12,
+              Math.min(vw - popoverWidth - 12, rect.left + rect.width / 2 - popoverWidth / 2)
+            );
+            const showBelow = rect.bottom + 185 < vh;
+            const topPos = showBelow ? rect.bottom + 10 : Math.max(12, rect.top - 175);
+            const cleanSymbolTex = entry.symbol.replace(/^\$+|\$+$/g, '').trim();
+
+            return (
+              <div
+                data-testid="latex-symbol-popover"
+                role="dialog"
+                aria-label={`符号 ${entry.name} 的上文解释`}
+                style={{
+                  left: `${Math.round(clampedLeft)}px`,
+                  top: `${Math.round(topPos)}px`,
+                  width: `${popoverWidth}px`,
+                }}
+                className="fixed z-50 border border-sky-500/50 bg-[#070b12]/98 backdrop-blur-md rounded-lg shadow-2xl p-3.5 space-y-2"
+              >
+                <div className="flex items-start justify-between gap-2 border-b border-neutral-800/80 pb-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span
+                      className="px-2 py-0.5 rounded bg-sky-950/60 border border-sky-500/40 text-sky-100 text-sm shrink-0"
+                      dangerouslySetInnerHTML={{
+                        __html: renderInlineMathWithLatex(`$${cleanSymbolTex}$`, lessonVisuals),
+                      }}
+                    />
+                    <div className="min-w-0">
+                      <div className="text-xs font-semibold text-white truncate">
+                        {entry.name}
+                      </div>
+                      <div className="text-[10px] font-mono text-sky-300/80">
+                        {entry.source === 'glossary' ? '上文符号释义表' : '自动识别自上文讲解'}
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    aria-label="关闭符号释义"
+                    onClick={() => {
+                      setActiveSymbolPopover(null);
+                      articleRef.current
+                        ?.querySelectorAll('.latex-symbol-active')
+                        .forEach((el) => el.classList.remove('latex-symbol-active'));
+                    }}
+                    className="p-1 text-neutral-400 hover:text-white rounded hover:bg-neutral-800 transition-colors shrink-0"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                <div
+                  className="text-xs text-neutral-200 leading-relaxed [&>p]:m-0"
+                  dangerouslySetInnerHTML={{
+                    __html: renderMarkdownWithLatex(entry.definition, lessonVisuals),
+                  }}
+                />
+
+                {entry.unit && (
+                  <div className="pt-1 border-t border-neutral-900 flex items-center gap-2 text-[11px] font-mono text-neutral-400">
+                    <span>常用单位：</span>
+                    <span
+                      className="text-neutral-200"
+                      dangerouslySetInnerHTML={{
+                        __html: renderInlineMathWithLatex(
+                          entry.unit.includes('$') ? entry.unit : `$${entry.unit}$`,
+                          lessonVisuals
+                        ),
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+            );
+          })(),
+          document.body
+        )}
     </div>
   );
 };

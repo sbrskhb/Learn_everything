@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import {
   Check,
   Copy,
@@ -39,8 +40,38 @@ export const AgentModeModal: React.FC<AgentModeModalProps> = ({
   onClose,
   onCourseUpdated,
 }) => {
+  return (
+    <AnimatePresence>
+      {isOpen && course && (
+        <AgentModeModalInner
+          key={course.id}
+          course={course}
+          onClose={onClose}
+          onCourseUpdated={onCourseUpdated}
+        />
+      )}
+    </AnimatePresence>
+  );
+};
+
+const AgentModeModalInner: React.FC<{
+  course: Course;
+  onClose: () => void;
+  onCourseUpdated: (course: Course) => void;
+}> = ({ course, onClose, onCourseUpdated }) => {
+  const isOpen = true;
   const [info, setInfo] = useState<AgentWorkspaceInfo | null>(null);
   const [promptTab, setPromptTab] = useState<'pdf_split' | 'syllabus' | 'lessons'>('pdf_split');
+  const [selectedLessonDay, setSelectedLessonDay] = useState<number | 'index'>('index');
+  const [selectedLessonStage, setSelectedLessonStage] = useState<'stage1' | 'stage2'>('stage1');
+  const [sectionAgentPrompts, setSectionAgentPrompts] = useState<{
+    sectionId: string;
+    stage1: string;
+    stage2: string;
+    stage1Path: string;
+    stage2Path: string;
+  } | null>(null);
+  const [isLoadingSectionPrompt, setIsLoadingSectionPrompt] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -80,14 +111,49 @@ export const AgentModeModal: React.FC<AgentModeModalProps> = ({
       });
   }, [isOpen, course]);
 
-  if (!isOpen || !course) return null;
+  useEffect(() => {
+    if (promptTab !== 'lessons' || selectedLessonDay === 'index') {
+      setSectionAgentPrompts(null);
+      return;
+    }
+    let cancelled = false;
+    setIsLoadingSectionPrompt(true);
+    fetch(`/api/courses/${course.id}/days/${selectedLessonDay}/chat-prompt`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (cancelled || !data) return;
+        setSectionAgentPrompts({
+          sectionId: data.sectionId || `sec-${String(selectedLessonDay).padStart(2, '0')}`,
+          stage1: data.agentStage1Prompt || '',
+          stage2: data.agentStage2Prompt || '',
+          stage1Path: data.agentStage1PromptMdRelPath || '',
+          stage2Path: data.agentStage2PromptMdRelPath || '',
+        });
+        if (!data.agentStage2Prompt && selectedLessonStage === 'stage2') {
+          setSelectedLessonStage('stage1');
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSectionAgentPrompts(null);
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoadingSectionPrompt(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [course.id, promptTab, selectedLessonDay]);
 
   const activePromptText =
     promptTab === 'pdf_split'
       ? info?.agentSplitPrompt || ''
       : promptTab === 'syllabus'
         ? info?.agentSyllabusPrompt || ''
-        : info?.prompt || '';
+        : selectedLessonDay === 'index'
+          ? info?.prompt || ''
+          : selectedLessonStage === 'stage2'
+            ? sectionAgentPrompts?.stage2 || '当前小节暂无阶段二 SVG 规格（需先完成阶段一或本节无需配图）。'
+            : sectionAgentPrompts?.stage1 || '';
 
   const handleCopyPrompt = async () => {
     if (!activePromptText) return;
@@ -111,7 +177,9 @@ export const AgentModeModal: React.FC<AgentModeModalProps> = ({
         ? `${course.folderName || course.name}_AGENT_PDF_SPLIT_PROMPT.md`
         : promptTab === 'syllabus'
           ? `${course.folderName || course.name}_AGENT_SYLLABUS_PROMPT.md`
-          : `${course.folderName || course.name}_AGENT_TASK_PROMPT.md`;
+          : selectedLessonDay === 'index'
+            ? `${course.folderName || course.name}_AGENT_TASK_PROMPT.md`
+            : `${course.folderName || course.name}_${sectionAgentPrompts?.sectionId || `sec-${String(selectedLessonDay).padStart(2, '0')}`}_agent-${selectedLessonStage}-prompt.md`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -197,20 +265,33 @@ export const AgentModeModal: React.FC<AgentModeModalProps> = ({
   };
 
   const generatedCount = course.dailyPlan.filter((d) => Boolean(d.lesson)).length;
-  const folderRel = info?.workspaceDir || course.courseDirPath || `courses/${course.folderName || course.id}`;
+  const folderRel =
+    info?.workspaceDir || course.courseDirPath || `courses/${course.folderName || course.id}`;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4 overflow-y-auto"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="agent-modal-title"
-    >
-      <div className="w-full max-w-3xl bg-black border border-neutral-800 rounded-md p-6 my-8 max-h-[92vh] overflow-y-auto space-y-5">
-        <div className="flex items-center justify-between border-b border-neutral-800 pb-4">
-          <div>
-            <h2 id="agent-modal-title" className="text-lg font-semibold text-white">
-              Agent 课件模式 — 《{course.name}》
+        <motion.div
+          key="agent-modal-backdrop"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-sm p-4 overflow-y-auto"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="agent-modal-title"
+        >
+          <motion.div
+            key="agent-modal-panel"
+            initial={{ opacity: 0, scale: 0.96 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.97 }}
+            transition={{ duration: 0.21, ease: [0.16, 1, 0.3, 1] }}
+            className="glow-border w-full max-w-3xl bg-black border border-neutral-800 rounded-md p-6 my-8 max-h-[92vh] overflow-y-auto space-y-5 shadow-2xl"
+          >
+            <div className="flex items-center justify-between border-b border-neutral-800 pb-4">
+              <div>
+                <h2 id="agent-modal-title" className="font-display text-lg font-semibold text-white">
+                  Agent 课件模式 — 《{course.name}》
             </h2>
             <p className="text-xs text-neutral-500 mt-0.5">
               面向 Antigravity、Codex 等具备文件操作能力的 AI Agent，支持课程目录、PDF 切分与逐节课件生成
@@ -233,7 +314,9 @@ export const AgentModeModal: React.FC<AgentModeModalProps> = ({
               一、本地独立课程文件夹结构与进度
             </span>
             <span className="font-mono text-neutral-300">
-              已完成课件：{generatedCount} / {course.durationDays} 节
+              {course.dailyPlan.length > 0
+                ? `已完成课件：${generatedCount} / ${course.dailyPlan.length} 节`
+                : '已完成课件：0 节（待第 2 步生成课程大纲）'}
             </span>
           </div>
 
@@ -262,10 +345,15 @@ export const AgentModeModal: React.FC<AgentModeModalProps> = ({
               <span className="text-neutral-500">已生成课件目录：</span>
               <span className="text-neutral-200">{folderRel}/lessons/</span>
             </div>
+            <div className="md:col-span-2">
+              <span className="text-neutral-500">单节独立提示词目录：</span>
+              <span className="text-neutral-200">{folderRel}/prompts/sec-XX/</span>
+              <span className="text-neutral-500 ml-2">(agent-stage1-prompt.md / agent-stage2-prompt.md)</span>
+            </div>
           </div>
 
           <p className="text-neutral-500 leading-relaxed">
-            标准三步顺序：1. 先执行「PDF 区域划分与切割」写入 <code className="text-neutral-300">segments/split-plan.json</code> 并用脚本切出 <code className="text-neutral-300">segments/region-XX.pdf</code>；2. 再执行「生成课程大纲」写入 <code className="text-neutral-300">outline.json</code>；3. 最后「逐节生成课件」写入 <code className="text-neutral-300">lessons/sec-01.json</code> ~ <code className="text-neutral-300">sec-{String(course.durationDays).padStart(2, '0')}.json</code>。
+            标准三步顺序：1. 先执行「PDF 区域划分与切割」写入 <code className="text-neutral-300">segments/split-plan.json</code> 并用脚本切出 <code className="text-neutral-300">segments/region-XX.pdf</code>；2. 再执行「生成课程大纲」写入 <code className="text-neutral-300">outline.json</code>；3. 最后「逐节生成课件」写入 <code className="text-neutral-300">lessons/sec-01.json</code> ~ <code className="text-neutral-300">sec-{String(Math.max(1, course.dailyPlan.length || 1)).padStart(2, '0')}.json</code>（写完课件时评估预计学时，再按天自动排程）。
           </p>
         </div>
 
@@ -339,11 +427,73 @@ export const AgentModeModal: React.FC<AgentModeModalProps> = ({
             </div>
           </div>
 
+          {promptTab === 'lessons' && course.dailyPlan.length > 0 && (
+            <div className="flex flex-wrap items-center justify-between gap-2 bg-neutral-950/70 border border-neutral-900 rounded px-3 py-2 text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-neutral-400">提示词粒度：</span>
+                <select
+                  aria-label="选择 Agent 提示词范围"
+                  value={selectedLessonDay}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setSelectedLessonDay(val === 'index' ? 'index' : Number(val));
+                  }}
+                  className="bg-black border border-neutral-800 rounded px-2 py-1 text-xs text-neutral-200 focus:outline-none"
+                >
+                  <option value="index">全课程总览索引 (AGENT_TASK_PROMPT.md)</option>
+                  {course.dailyPlan.map((d) => (
+                    <option key={d.id || d.dayIndex} value={d.dayIndex}>
+                      {d.id} · 第 {d.dayIndex} 讲：{d.title}
+                    </option>
+                  ))}
+                </select>
+                {selectedLessonDay !== 'index' && (
+                  <div className="inline-flex items-center gap-1 border border-neutral-800 rounded p-0.5 bg-black">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedLessonStage('stage1')}
+                      className={`px-2 py-0.5 rounded text-[11px] transition-colors ${
+                        selectedLessonStage === 'stage1'
+                          ? 'bg-white text-black font-medium'
+                          : 'text-neutral-400 hover:text-white'
+                      }`}
+                    >
+                      阶段一内容
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedLessonStage('stage2')}
+                      disabled={!sectionAgentPrompts?.stage2}
+                      className={`px-2 py-0.5 rounded text-[11px] transition-colors disabled:opacity-40 ${
+                        selectedLessonStage === 'stage2'
+                          ? 'bg-white text-black font-medium'
+                          : 'text-neutral-400 hover:text-white'
+                      }`}
+                    >
+                      阶段二 SVG
+                    </button>
+                  </div>
+                )}
+              </div>
+              {selectedLessonDay !== 'index' && sectionAgentPrompts && (
+                <span className="font-mono text-[11px] text-neutral-500">
+                  {selectedLessonStage === 'stage2'
+                    ? sectionAgentPrompts.stage2Path || `prompts/${sectionAgentPrompts.sectionId}/agent-stage2-prompt.md`
+                    : sectionAgentPrompts.stage1Path || `prompts/${sectionAgentPrompts.sectionId}/agent-stage1-prompt.md`}
+                </span>
+              )}
+            </div>
+          )}
+
           <textarea
             id="agent-prompt-textarea"
             readOnly
             rows={12}
-            value={isLoading ? '正在生成 Agent 执行提示词...' : activePromptText}
+            value={
+              isLoading || isLoadingSectionPrompt
+                ? '正在生成 Agent 执行提示词...'
+                : activePromptText
+            }
             className="w-full bg-neutral-950 border border-neutral-800 rounded p-3 text-xs font-mono text-neutral-300 leading-relaxed focus:outline-none"
           />
         </div>
@@ -416,7 +566,7 @@ export const AgentModeModal: React.FC<AgentModeModalProps> = ({
             关闭
           </button>
         </div>
-      </div>
-    </div>
+          </motion.div>
+        </motion.div>
   );
 };

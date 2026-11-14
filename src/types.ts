@@ -9,6 +9,26 @@ export type SubjectProfile =
 
 export type LearnerLevel = 'beginner' | 'intermediate' | 'advanced';
 
+export type LearnerBaselinePreset =
+  | 'zero_base'
+  | 'partial_base'
+  | 'solid_base'
+  | 'custom';
+
+export type LearningDepthPreset =
+  | 'understand_basics'
+  | 'master_textbook'
+  | 'deep_rigorous'
+  | 'custom';
+
+export interface LessonSymbolEntry {
+  symbol: string;
+  aliases?: string[];
+  name: string;
+  definition: string;
+  unit?: string;
+}
+
 export type EnglishArticleMode = 'media_search' | 'llm_original';
 
 export interface PromptModuleToggles {
@@ -36,58 +56,74 @@ export interface VocabItem {
 export type ExerciseDifficulty = 'basic' | 'application' | 'comprehensive';
 export type ExerciseStage = 'inline' | 'comprehensive';
 
+export interface ExerciseVariantCheck {
+  question: string;
+  options?: string[];
+  answer: string;
+  explanation?: string;
+}
+
 export interface ExerciseQuestion {
   id: string;
   stage?: ExerciseStage;           // 'inline' (紧跟核心知识点的即时练习) | 'comprehensive' (章节末综合练习)
   type: 'choice' | 'fill';
   difficulty?: ExerciseDifficulty; // 基础概念辨析 | 直接应用 | 综合与迁移分析
   categoryLabel?: string;          // 例如：概念辨析 / 直接应用 / 错误分析 / 知识迁移
+  diagramId?: string;              // 关联的题目配图 ID（如 "diag-ex-1"），当题目需要复杂描述才能画出的电路/几何/物理图时内嵌展示
+  topologySpec?: string;           // 复杂题设配图生成 SVG 前确定的电路拓扑、节点连接、元件参数与参考方向说明
+  svgCode?: string;                // 可选：直接内联在练习题对象上的 SVG 代码
+  diagramTitle?: string;           // 可选：题目配图标题
+  diagramCaption?: string;         // 可选：题目配图图注说明
   question: string;
   options?: string[];              // For 'choice', e.g. ["A. ...", "B. ...", "C. ...", "D. ..."]
   answer: string;                  // Standard answer, e.g. "A" or exact word/value
   hint?: string;                   // 启发式解题提示（支持离线随时展开）
-  explanation: string;             // Detailed step-by-step solution (离线完整解析)
-  wrongOptionsAnalysis?: string;   // 错误选项原因分析或常见误解说明
+  explanation?: string;            // Detailed step-by-step solution (可选：按教学价值选择性生成)
+  wrongOptionsAnalysis?: string;   // 可选：错误选项原因分析或常见误解说明（错误诊断）
+  remediation?: string;            // 可选：针对典型错误概念根源的针对性补救讲解
+  variantCheck?: ExerciseVariantCheck | string; // 可选：补救后的变式检验题（离线再次检验）
 }
 
 export interface LessonDiagram {
   id?: string;                     // 内联锚点标识，如 "diag-1"，用于在正文 {{diagram:diag-1}} 处图文同步渲染
   title: string;
   stageLabel?: string;             // 例如：阶段一：静态工作点建立 / 阶段二：交流小信号叠加
+  topologySpec?: string;           // 绘图规格：拓扑连接、元件参数、物理量、参考方向及坐标系要求
   caption: string;                 // 图示与正文的对应说明（标明部件、物理量、方向及相互关系）
-  svgCode: string;                 // Clean inline SVG diagram for math/electronics/concepts
+  svgCode?: string;                // 内联 SVG 代码（阶段一仅输出规格时可为空，由阶段二组装补全）
 }
 
 export interface HeuristicQuestionItem {
   id: string;                      // 内联锚点标识，如 "hq-1"，用于在正文 {{heuristic:hq-1}} 处“先思考，后讲解”
   context: string;                 // 对应的推导环节或知识点位置
   question: string;                // 引导性思考问题（先思考再看下一步）
-  hint?: string;                   // 第一层：轻量思考提示
-  approach?: string;               // 第二层：分析切入思路
-  answerReveal: string;            // 第三层：完整推导解释或原理说明（支持 Markdown + LaTeX）
+  hint?: string;                   // 可选第一层：轻量思考提示
+  approach?: string;               // 可选第二层：分析切入思路
+  answerReveal?: string;           // 完整推导解释或原理说明（支持 Markdown + LaTeX）
 }
 
 export interface ReverseCheckItem {
   id: string;
   topic: string;                   // 检验的核心概念或定理
   prompt: string;                  // 要求用户用自己的语言解释的问题（例如说明某结论为什么成立）
-  keyPoints: string[];             // 自测核对要点列表
-  referenceExplanation: string;    // 标准参考解释
+  keyPoints?: string[];            // 可选：自测核对要点列表
+  referenceExplanation?: string;   // 可选：标准参考解释
 }
 
 export interface LessonTeachingContext {
   prerequisites: string[];         // 本节先修知识
+  prerequisiteCheck?: string;      // 先修知识快速诊断与薄弱点补充说明
   learningObjectives: string[];    // 本节具体学习目标
   teachingScope: string;           // 本节教学范围
   connectionNote: string;          // 与前后课程的联系
 }
 
 export interface LessonQualityCheck {
-  coveredPoints: string[];         // 已覆盖的资料/大纲核心知识点
-  formulaAndUnitNote: string;      // 公式符号含义与单位核对说明
-  derivationContinuityNote: string;// 推导思路来源与连续性说明
-  diagramAlignmentNote: string;    // 图文同步与图中变量/方向标注说明
-  intermediateStepsAuditNote?: string; // 独立复核公式、极限、符号、中间推导步骤、图示和练习答案的检查记录
+  coveredPoints?: string[];        // 可选：已覆盖的资料/大纲核心知识点
+  formulaAndUnitNote?: string;     // 可选：公式符号含义与单位核对说明
+  derivationContinuityNote?: string;// 可选：推导思路来源与连续性说明
+  diagramAlignmentNote?: string;   // 可选：图文同步与图中变量/方向标注说明
+  intermediateStepsAuditNote?: string; // 可选兼容字段
 }
 
 export interface EnglishArticleSection {
@@ -155,9 +191,12 @@ export interface DailyLessonContent {
   date: string;                    // YYYY-MM-DD
   title: string;
   summary: string;
+  estimatedMinutes?: number;       // 写完本节具体课件后评估的预计学习时长（分钟，唯一负荷指标）
+  generationStage?: 'stage1_content' | 'complete'; // 两阶段生成状态（省略则视为 complete）
   keyPoints: string[];
   teachingContext?: LessonTeachingContext;
   markdownBody: string;            // 完整课件正文（Markdown + LaTeX $...$, $$...$$）
+  symbolGlossary?: LessonSymbolEntry[]; // 本节公式符号表（供推导中点击符号弹出上文解释）
   diagrams?: LessonDiagram[];
   heuristicQuestions?: HeuristicQuestionItem[];
   englishPayload?: EnglishLessonPayload;
@@ -172,15 +211,27 @@ export interface KnowledgeCatalogNode {
   id: string;
   title: string;
   prerequisites: string[];
-  difficulty: 'low' | 'medium' | 'high';
+  difficulty?: 'low' | 'medium' | 'high' | string; // 历史兼容字段；新版流程以 estimatedMinutes 为唯一负荷指标
+  estimatedMinutes?: number;       // 预计学习时长（分钟）
+  sectionId?: string;              // 关联小节 ID
   coreConcepts: string[];
   assignedDayIndex?: number;
 }
 
+export interface DailyScheduleDay {
+  dayNumber: number;               // 1..durationDays
+  date: string;                    // YYYY-MM-DD
+  sectionIds: string[];            // 当日包含的小节 ID 列表，如 ['sec-01', 'sec-02']
+  estimatedMinutes: number;        // 当日小节总预计时长
+  targetMinutes: number;           // 每日负荷基准 (总时长 / durationDays)
+}
+
 export interface DailyPlanSlot {
   id: string;                      // 稳定唯一小节 ID (例如 "sec-01")，重命名或调整日期后不丢失关联
-  dayIndex: number;                // 1-based (1..durationDays)
-  date: string;                    // YYYY-MM-DD
+  dayIndex: number;                // 1-based 小节序号 (1..sections.length)
+  scheduledDay?: number;           // 1-based 分配到的学习天数序号 (1..durationDays)
+  date: string;                    // 分配到的学习日历日期 YYYY-MM-DD
+  estimatedMinutes?: number;       // AI 评估的小节预计学习时长（分钟，唯一负荷指标）
   title: string;
   objective: string;
   keyTopics: string[];
@@ -188,8 +239,11 @@ export interface DailyPlanSlot {
   teachingScope?: string;          // 本节教学范围
   connectionNote?: string;         // 与前后课程的联系
   regionId?: string;               // 关联的第 1 步切分 PDF 区域 ID（如 "region-01"）
+  regionIds?: string[];            // 关联的多个切分 PDF 区域 ID（当合并多个切分区域时使用）
   assignedWords?: VocabItem[];     // For English courses (随机不重复抽取并稳定保存的每日词汇)
   pdfSegment?: PdfSplitPlanItem;   // 绑定的本节 PDF 切分信息与小节 PDF 路径
+  pdfSegments?: PdfSplitPlanItem[];// 绑定的本节全部 PDF 切分区域列表（多区域覆盖时）
+  stage1Draft?: DailyLessonContent;// 阶段一（教学内容+图示规格）中间产物，阶段二失败或重试时保留
   lesson?: DailyLessonContent;
 }
 
@@ -204,7 +258,14 @@ export interface UploadedMaterial {
   tocEntries?: PdfTocEntry[];
   pages?: PdfPageEntry[];
   sourceRelPath?: string;          // 保存在 courses/<课程名称>/sources/ 下的相对路径
-  base64Data?: string;             // 上传时传递原始二进制以写入 sources/ 目录
+  tempUploadId?: string;           // 分块二进制上传到服务端临时区的标识
+  base64Data?: string;             // 小文件或兼容测试用临时二进制
+}
+
+export interface StudyStats {
+  totalSeconds: number;
+  secondsByDate: Record<string, number>;
+  secondsByCourse: Record<string, number>;
 }
 
 export interface VocabCoverageStats {
@@ -220,6 +281,15 @@ export interface VocabCoverageStats {
   message: string;                 // 覆盖情况与容量提示文案
 }
 
+export interface ExerciseSubmissionRecord {
+  userAnswers: Record<string, string>;
+  submittedAt: string;
+  score: number;
+  total: number;
+  sectionId?: string;
+  date?: string;
+}
+
 export interface Course {
   id: string;
   name: string;
@@ -229,6 +299,10 @@ export interface Course {
   generationMode?: CourseGenerationMode; // 'api' | 'agent' | 'chat'
   subjectProfile?: SubjectProfile;
   learnerLevel?: LearnerLevel;
+  learnerBaseline?: LearnerBaselinePreset;
+  customLearnerBaseline?: string;
+  learningDepth?: LearningDepthPreset;
+  customLearningDepth?: string;
   goal: string;
   startDate: string;               // YYYY-MM-DD
   durationDays: number;
@@ -253,17 +327,13 @@ export interface Course {
     lastAllocatedAt?: string;
   };
   dailyPlan: DailyPlanSlot[];
+  dailySchedule?: DailyScheduleDay[];
   masteredWords: string[];
   exerciseSubmissions: Record<
-    string, // date YYYY-MM-DD or sectionId
-    {
-      userAnswers: Record<string, string>;
-      submittedAt: string;
-      score: number;
-      total: number;
-    }
+    string, // sectionId (e.g. "sec-01") or legacy date YYYY-MM-DD
+    ExerciseSubmissionRecord
   >;
-  reverseCheckNotes?: Record<string, Record<string, string>>; // date -> reverseCheckId -> user's explanation
+  reverseCheckNotes?: Record<string, Record<string, string>>; // sectionId or date -> reverseCheckId -> user's explanation
   createdAt: string;
 }
 
@@ -274,7 +344,12 @@ export interface AppSettings {
   hasCustomApiKey: boolean;
   hasBuiltinGeminiKey: boolean;
   defaultLearnerLevel: LearnerLevel;
+  defaultLearnerBaseline?: LearnerBaselinePreset;
+  defaultCustomLearnerBaseline?: string;
+  defaultLearningDepth?: LearningDepthPreset;
+  defaultCustomLearningDepth?: string;
   showAdvancedWorkflowDetails?: boolean;
+  showContentCategoryBadges?: boolean;
   promptModules: PromptModuleToggles;
   syllabusSystemPrompt: string;
   courseSystemPrompt: string;
@@ -306,4 +381,18 @@ export interface CourseFileListing {
   files: CourseDiskFile[];
   backendEngine?: string;
 }
+
+export interface LastBrowsingState {
+  view: 'timeline' | 'daily' | 'lesson';
+  selectedCourseFilter: string;
+  focusedDate: string | null;
+  activeLessonRef: {
+    courseId: string;
+    dayIndex: number;
+  } | null;
+  scrollY: number;
+  scrollMap?: Record<string, number>;
+  updatedAt: string;
+}
+
 

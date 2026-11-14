@@ -1,11 +1,14 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import {
+  AlertTriangle,
   Archive,
   BookOpen,
   Check,
   Copy,
   Download,
   ExternalLink,
+  Eye,
   FileText,
   FolderOpen,
   FolderSync,
@@ -20,18 +23,34 @@ import {
 import type {
   Course,
   CourseDiskFile,
-  CourseGenerationMode,
+  DailyLessonContent,
   DailyPlanSlot,
   PdfDocumentMeta,
   PdfSplitPlanItem,
 } from '../types';
 import {
   addDaysToDateString,
+  bindAndEnsureAllPdfRegionsCovered,
   computeVocabCoverageStats,
   ensureStableSectionId,
+  getEvaluatedSectionMinutes,
+  resolveSlotPdfSegments,
 } from '../utils/learningLogic';
 import { copyCourseFileToClipboard } from '../utils/clipboardFile';
 import { renderInlineMathWithLatex } from '../utils/markdownMath';
+import { generateLessonWithProgressStream } from '../utils/streamLessonClient';
+import type { GenerationProgressEvent } from '../utils/streamProgress';
+import {
+  applyCoursewareRepairPatch,
+  auditCoursewareRendering,
+  auditRawCoursewareInput,
+} from '../utils/coursewareDiagnostics';
+import {
+  extractPendingDiagramSpecs,
+  mergeStage2DiagramsIntoStage1,
+  parseImportedLessonContent,
+} from '../utils/coursewareParser';
+import { LessonPreviewModal } from './LessonPreviewModal';
 
 export type OutlineWorkbenchStep = 'outline' | 'split_vocab' | 'lessons' | 'files';
 
@@ -58,11 +77,47 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
   onOpenLesson,
   onOpenAgentModal,
 }) => {
+  return (
+    <AnimatePresence>
+      {isOpen && course && (
+        <CourseOutlineModalInner
+          key={course.id}
+          course={course}
+          initialStep={initialStep}
+          showAdvancedWorkflowDetails={showAdvancedWorkflowDetails}
+          onOpenSettings={onOpenSettings}
+          onClose={onClose}
+          onCourseUpdated={onCourseUpdated}
+          onOpenLesson={onOpenLesson}
+          onOpenAgentModal={onOpenAgentModal}
+        />
+      )}
+    </AnimatePresence>
+  );
+};
+
+interface CourseOutlineModalInnerProps extends Omit<CourseOutlineModalProps, 'isOpen' | 'course'> {
+  course: Course;
+}
+
+const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
+  course,
+  initialStep = 'outline',
+  showAdvancedWorkflowDetails = false,
+  onOpenSettings,
+  onClose,
+  onCourseUpdated,
+  onOpenLesson,
+  onOpenAgentModal,
+}) => {
+  const isOpen = true;
   const [activeStep, setActiveStep] = useState<OutlineWorkbenchStep>(initialStep);
 
   // Step 1: Outline editing states
   const [draftSlots, setDraftSlots] = useState<DailyPlanSlot[]>([]);
   const [draftStartDate, setDraftStartDate] = useState<string>('');
+  const [draftDurationDays, setDraftDurationDays] = useState<number>(course.durationDays || 1);
+  const [isReallocatingSchedule, setIsReallocatingSchedule] = useState(false);
   const [isSavingOutline, setIsSavingOutline] = useState(false);
   const [isRegeneratingOutline, setIsRegeneratingOutline] = useState(false);
   const [chatSyllabusPrompt, setChatSyllabusPrompt] = useState<string>('');
@@ -90,9 +145,32 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
 
   // Step 3: Per-section quick material & generation states
   const [generatingDayIndex, setGeneratingDayIndex] = useState<number | null>(null);
+  const [generatingDayProgress, setGeneratingDayProgress] =
+    useState<GenerationProgressEvent | null>(null);
   const [isGeneratingBatch, setIsGeneratingBatch] = useState(false);
   const [deletingLessonDay, setDeletingLessonDay] = useState<number | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [selectedStep3ChatDay, setSelectedStep3ChatDay] = useState<number>(() => {
+    const firstPending = course.dailyPlan.find((s) => !s.lesson);
+    return firstPending ? firstPending.dayIndex : course.dailyPlan[0]?.dayIndex || 1;
+  });
+  const [workbenchMode, setWorkbenchMode] = useState<'chat' | 'agent' | 'api'>(
+    course.generationMode || 'api'
+  );
+  const [isSwitchingMode, setIsSwitchingMode] = useState(false);
+  const [step3StageTab, setStep3StageTab] = useState<'stage1' | 'stage2' | 'patch'>('stage1');
+  const [step3RawImportText, setStep3RawImportText] = useState<string>('');
+  const [step3Stage2Text, setStep3Stage2Text] = useState<string>('');
+  const [step3PatchText, setStep3PatchText] = useState<string>('');
+  const [step3PreviewLesson, setStep3PreviewLesson] = useState<DailyLessonContent | null>(null);
+  const [isSavingStep3Import, setIsSavingStep3Import] = useState<boolean>(false);
+  const [step3ImportNotice, setStep3ImportNotice] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
+  const [showStep3IssueDetails, setShowStep3IssueDetails] = useState<boolean>(false);
+  const step3TextareaRef = React.useRef<HTMLTextAreaElement | null>(null);
+  const step3Stage2TextareaRef = React.useRef<HTMLTextAreaElement | null>(null);
 
   // Step 4: Local File Manager & Backup states (via Python Backend)
   const [diskFiles, setDiskFiles] = useState<CourseDiskFile[]>([]);
@@ -152,7 +230,9 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
       }))
     );
     setDraftStartDate(course.startDate);
+    setDraftDurationDays(Math.max(1, course.durationDays || 1));
     const mode = course.generationMode || 'api';
+    setWorkbenchMode(mode);
     setSplitModeTab(mode === 'agent' ? 'agent' : 'chat');
     setSyllabusWorkbenchTab(mode === 'agent' ? 'agent' : 'chat');
     setShowSyllabusImportBox((mode === 'chat' || mode === 'agent') && !course.outlineConfirmed);
@@ -204,40 +284,12 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
     );
   }, [course?.englishConfig, draftSlots.length, course?.durationDays, dailyWordCountInput]);
 
-  if (!isOpen || !course) return null;
-
   const triggerCopyFeedback = (key: string, text: string) => {
     navigator.clipboard?.writeText(text).catch(() => {});
     setCopiedKey(key);
     setTimeout(() => {
       setCopiedKey((prev) => (prev === key ? null : prev));
     }, 2000);
-  };
-
-  const handleSwitchWorkbenchMode = async (nextMode: CourseGenerationMode) => {
-    if (nextMode === 'agent') {
-      setSplitModeTab('agent');
-      setSyllabusWorkbenchTab('agent');
-    } else if (nextMode === 'chat') {
-      setSplitModeTab('chat');
-      setSyllabusWorkbenchTab('chat');
-    }
-    if ((nextMode === 'chat' || nextMode === 'agent') && !course.outlineConfirmed) {
-      setShowSyllabusImportBox(true);
-    }
-    try {
-      const res = await fetch(`/api/courses/${course.id}/mode`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ generationMode: nextMode }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        onCourseUpdated(data.course);
-      }
-    } catch {
-      // ignore
-    }
   };
 
   const handleInlineAgentSync = async () => {
@@ -321,7 +373,9 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
       next[idx] = {
         ...next[idx],
         regionId: regionId || undefined,
+        regionIds: regionId ? [regionId] : undefined,
         pdfSegment: matched || undefined,
+        pdfSegments: matched ? [matched] : undefined,
       };
       return next;
     });
@@ -366,6 +420,28 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
     });
   };
 
+  const pasteClipboardText = async (
+    onText: (text: string) => void,
+    label: string
+  ) => {
+    setErrorMessage(null);
+    setStatusMessage(null);
+    try {
+      if (!navigator.clipboard?.readText) {
+        throw new Error('no-clipboard');
+      }
+      const clipText = (await navigator.clipboard.readText()).trim();
+      if (!clipText) {
+        setErrorMessage('剪贴板当前为空，请先复制外部 AI 输出的 JSON。');
+        return;
+      }
+      onText(clipText);
+      setStatusMessage(`已从剪贴板填入${label}，请核对或点击导入按钮。`);
+    } catch {
+      setErrorMessage(`未能直接读取剪贴板，请在${label}输入框按 Ctrl+V 粘贴。`);
+    }
+  };
+
   const handleSaveOutline = async (confirmOutline: boolean) => {
     setIsSavingOutline(true);
     setErrorMessage(null);
@@ -376,7 +452,8 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           startDate: draftStartDate,
-          dailyPlan: draftSlots,
+          durationDays: Math.max(1, Number(draftDurationDays) || 1),
+          dailyPlan: effectiveSlots,
           confirmOutline,
         }),
       });
@@ -385,6 +462,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
 
       onCourseUpdated(data.course);
       setDraftSlots(data.course.dailyPlan);
+      setDraftDurationDays(data.course.durationDays || draftDurationDays);
       if (Array.isArray(data.course.pdfSplitPlan)) {
         setDraftSplitPlan(data.course.pdfSplitPlan);
       }
@@ -398,6 +476,54 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
       setErrorMessage(err?.message || '保存课程目录失败');
     } finally {
       setIsSavingOutline(false);
+    }
+  };
+
+  const handleReallocateSchedule = async () => {
+    if (draftSlots.length === 0) return;
+    setIsReallocatingSchedule(true);
+    setErrorMessage(null);
+    setStatusMessage(null);
+    try {
+      const sectionMinutes: Record<string, number> = {};
+      for (const s of draftSlots) {
+        const secId = ensureStableSectionId(s.dayIndex, s.id);
+        const mins = getEvaluatedSectionMinutes(s);
+        if (mins !== undefined) {
+          sectionMinutes[secId] = mins;
+        }
+      }
+      const res = await fetch(`/api/courses/${course.id}/schedule/reallocate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          durationDays: Math.max(1, Number(draftDurationDays) || 1),
+          startDate: draftStartDate || course.startDate,
+          sectionMinutes,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '按预计学时分配学习天数失败');
+      onCourseUpdated(data.course);
+      setDraftSlots(data.course.dailyPlan);
+      setDraftDurationDays(data.course.durationDays || draftDurationDays);
+      setDraftStartDate(data.course.startDate || draftStartDate);
+      const assessedCount = data.course.dailyPlan.filter(
+        (s: DailyPlanSlot) => getEvaluatedSectionMinutes(s) !== undefined
+      ).length;
+      const totalMins = data.course.dailyPlan.reduce(
+        (sum: number, s: DailyPlanSlot) => sum + (getEvaluatedSectionMinutes(s) || 0),
+        0
+      );
+      setStatusMessage(
+        assessedCount > 0
+          ? `已按已评估学时（${assessedCount}/${data.course.dailyPlan.length} 节，共 ${totalMins} 分钟）将 ${data.course.dailyPlan.length} 个独立小节分配至 ${data.course.durationDays} 天；所有课件保持完好，无需重新生成。`
+          : `已将 ${data.course.dailyPlan.length} 个独立小节分配至 ${data.course.durationDays} 天（当前小节尚未评估学时，写完课件后可再次按学时均衡重排）。`
+      );
+    } catch (err: any) {
+      setErrorMessage(err?.message || '按预计学时分配学习天数失败');
+    } finally {
+      setIsReallocatingSchedule(false);
     }
   };
 
@@ -442,6 +568,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
       if (!res.ok) throw new Error(data.error || '导入目录 JSON 失败');
       onCourseUpdated(data.course);
       setDraftSlots(data.course.dailyPlan);
+      setDraftDurationDays(data.course.durationDays || draftDurationDays);
       setRawSyllabusImport('');
       setShowSyllabusImportBox(false);
       setActiveStep('lessons');
@@ -752,7 +879,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
       onCourseUpdated(data.course);
       setDraftSlots(data.course.dailyPlan);
       setStatusMessage(
-        '已按每日目标词数重新随机分配尚未开始学习的词汇（已生成课件的小节保持不变，结果已稳定保存）。'
+        '已按每节目标词数重新随机分配尚未开始学习的词汇（已生成课件的小节保持不变，结果已稳定保存）。'
       );
     } catch (err: any) {
       setErrorMessage(err?.message || '重新分配词汇失败');
@@ -761,40 +888,837 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
     }
   };
 
-  // --- Step 3 Handlers: Quick Material Access & Per-Section Generation ---
-  const handleCopySectionLessonPrompt = async (dayIndex: number) => {
-    try {
-      const res = await fetch(`/api/courses/${course.id}/days/${dayIndex}/chat-prompt`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.lessonPrompt) {
-          triggerCopyFeedback(`prompt-${dayIndex}`, data.lessonPrompt);
-        }
-      }
-    } catch {
-      // ignore
-    }
-  };
+  const effectiveSlots = useMemo(
+    () =>
+      draftSplitPlan.length > 0
+        ? bindAndEnsureAllPdfRegionsCovered(draftSlots, draftSplitPlan)
+        : draftSlots,
+    [draftSlots, draftSplitPlan]
+  );
 
-  const handleGenerateSingleSectionApi = async (dayIndex: number) => {
-    setGeneratingDayIndex(dayIndex);
+  const pdfCoverageStats = useMemo(() => {
+    const totalRegions = draftSplitPlan.length;
+    if (totalRegions === 0) {
+      return { totalRegions: 0, coveredCount: 0, uncoveredIds: [] as string[] };
+    }
+    const coveredSet = new Set<string>();
+    for (const slot of effectiveSlots) {
+      for (const seg of resolveSlotPdfSegments(slot, draftSplitPlan)) {
+        coveredSet.add(seg.sectionId);
+      }
+    }
+    const uncoveredIds = draftSplitPlan
+      .filter((item) => !coveredSet.has(item.sectionId))
+      .map((item) => item.sectionId);
+    return {
+      totalRegions,
+      coveredCount: totalRegions - uncoveredIds.length,
+      uncoveredIds,
+    };
+  }, [effectiveSlots, draftSplitPlan]);
+
+  // --- Step 3 Handlers: Quick Material Access & Per-Section Generation ---
+  const selectedStep3Slot = useMemo(
+    () =>
+      effectiveSlots.find((s) => s.dayIndex === selectedStep3ChatDay) ||
+      effectiveSlots.find((s) => !s.lesson) ||
+      effectiveSlots[0] ||
+      null,
+    [effectiveSlots, selectedStep3ChatDay]
+  );
+
+  useEffect(() => {
+    if (!selectedStep3Slot) return;
+    if (selectedStep3Slot.dayIndex !== selectedStep3ChatDay) {
+      setSelectedStep3ChatDay(selectedStep3Slot.dayIndex);
+    }
+  }, [selectedStep3Slot, selectedStep3ChatDay]);
+
+  const handleSwitchWorkbenchMode = async (nextMode: 'chat' | 'agent' | 'api') => {
+    if (nextMode === workbenchMode || isSwitchingMode) return;
+    setIsSwitchingMode(true);
     setErrorMessage(null);
     setStatusMessage(null);
     try {
-      const res = await fetch(`/api/courses/${course.id}/days/${dayIndex}/generate`, {
-        method: 'POST',
+      const res = await fetch(`/api/courses/${course.id}/mode`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: nextMode }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || `生成第 ${dayIndex} 节课件失败`);
+      if (!res.ok) {
+        throw new Error(data.error || '切换生成模式失败');
+      }
+      setWorkbenchMode(nextMode);
+      setSplitModeTab(nextMode === 'agent' ? 'agent' : 'chat');
+      setSyllabusWorkbenchTab(nextMode === 'agent' ? 'agent' : 'chat');
+      onCourseUpdated(data.course);
+      const modeLabel =
+        nextMode === 'agent'
+          ? 'Agent 本地自主工作模式'
+          : nextMode === 'chat'
+          ? 'Chat 外部 AI 网页对话模式'
+          : 'API 直接生成模式';
+      setStatusMessage(`已切换到「${modeLabel}」（保留当前课程大纲、草稿与已生成课件）。`);
+    } catch (err: any) {
+      setErrorMessage(err?.message || '切换生成模式失败');
+    } finally {
+      setIsSwitchingMode(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!selectedStep3Slot) return;
+    if (selectedStep3Slot.lesson) {
+      setStep3StageTab('patch');
+    } else if (selectedStep3Slot.stage1Draft) {
+      const pending = extractPendingDiagramSpecs(selectedStep3Slot.stage1Draft);
+      setStep3StageTab(pending.length > 0 ? 'stage2' : 'stage1');
+    } else {
+      setStep3StageTab('stage1');
+    }
+    setShowStep3IssueDetails(false);
+  }, [selectedStep3Slot?.dayIndex]);
+
+  const step3Stage1BaseLesson = useMemo(
+    () => selectedStep3Slot?.stage1Draft || selectedStep3Slot?.lesson || null,
+    [selectedStep3Slot?.stage1Draft, selectedStep3Slot?.lesson]
+  );
+
+  const pendingStep3Specs = useMemo(
+    () => (step3Stage1BaseLesson ? extractPendingDiagramSpecs(step3Stage1BaseLesson) : []),
+    [step3Stage1BaseLesson]
+  );
+
+  const step3ImportAudit = useMemo(() => {
+    const trimmed = step3RawImportText.trim();
+    if (!trimmed || !selectedStep3Slot) return null;
+    const assets = course.customAssets || {};
+    if (step3StageTab === 'stage1') {
+      const rawAudit = auditRawCoursewareInput(trimmed, selectedStep3Slot, assets, {
+        stage: 'stage1',
+      });
+      return rawAudit
+        ? {
+            ...rawAudit,
+            appliedSummary: undefined,
+            appliedMode: undefined,
+          }
+        : null;
+    }
+    if (selectedStep3Slot.lesson) {
+      try {
+        const patched = applyCoursewareRepairPatch(
+          selectedStep3Slot.lesson,
+          trimmed,
+          selectedStep3Slot,
+          assets
+        );
+        const report = auditCoursewareRendering(patched.mergedLesson, assets);
+        return {
+          report,
+          parsedLesson: patched.mergedLesson,
+          appliedSummary:
+            patched.appliedMode === 'full_replace' ? undefined : patched.appliedSummary,
+          appliedMode: patched.appliedMode,
+        };
+      } catch {
+        // Fallback to raw input audit
+      }
+    }
+    const rawAudit = auditRawCoursewareInput(trimmed, selectedStep3Slot, assets);
+    return rawAudit
+      ? {
+          ...rawAudit,
+          appliedSummary: undefined,
+          appliedMode: undefined,
+        }
+      : null;
+  }, [step3RawImportText, selectedStep3Slot, course.customAssets, step3StageTab]);
+
+  const step3Stage2MergePreview = useMemo(() => {
+    const trimmed = step3Stage2Text.trim();
+    if (!trimmed || !selectedStep3Slot) return null;
+    if (!step3Stage1BaseLesson) {
+      return {
+        mergedLesson: null as DailyLessonContent | null,
+        report: null as ReturnType<typeof auditCoursewareRendering> | null,
+        matchedCount: 0,
+        addedCount: 0,
+        pendingRemaining: [] as ReturnType<typeof extractPendingDiagramSpecs>,
+        error: '当前小节尚未完成阶段一（教学内容与图示规格），请先导入或生成阶段一成果。',
+      };
+    }
+    try {
+      const assets = course.customAssets || {};
+      const merged = mergeStage2DiagramsIntoStage1(step3Stage1BaseLesson, trimmed, assets);
+      const report = auditCoursewareRendering(merged.mergedLesson, assets);
+      return {
+        ...merged,
+        report,
+        error: null as string | null,
+      };
+    } catch (err: any) {
+      return {
+        mergedLesson: null as DailyLessonContent | null,
+        report: null as ReturnType<typeof auditCoursewareRendering> | null,
+        matchedCount: 0,
+        addedCount: 0,
+        pendingRemaining: [] as ReturnType<typeof extractPendingDiagramSpecs>,
+        error: err?.message || '阶段二 SVG JSON 解析失败，请检查输出格式。',
+      };
+    }
+  }, [step3Stage2Text, selectedStep3Slot, step3Stage1BaseLesson, course.customAssets]);
+
+  const handleCopySectionStagePrompt = async (
+    dayIndex: number,
+    target: 'stage1' | 'stage2' | 'agent_full' | 'agent_stage1' | 'agent_stage2' | 'legacy',
+    asMdFile = false
+  ) => {
+    setSelectedStep3ChatDay(dayIndex);
+    setErrorMessage(null);
+    const feedbackKey = `${target}${asMdFile ? '-md' : ''}-${dayIndex}`;
+    try {
+      if (target === 'agent_full') {
+        const res = await fetch(`/api/courses/${course.id}/agent-prompt`);
+        if (!res.ok) throw new Error('获取 Agent 总指令失败');
+        const data = await res.json();
+        if (asMdFile) {
+          await handleCopyCourseFile('AGENT_TASK_PROMPT.md', feedbackKey);
+        } else if (data?.prompt) {
+          triggerCopyFeedback(feedbackKey, data.prompt);
+        }
+        return;
+      }
+
+      const res = await fetch(`/api/courses/${course.id}/days/${dayIndex}/chat-prompt`);
+      if (!res.ok) {
+        throw new Error('获取本节提示词失败');
+      }
+      const data = await res.json();
+      if (target === 'stage1') {
+        if (asMdFile) {
+          if (!data?.stage1PromptMdRelPath) throw new Error('未能生成阶段一 .md 提示词文件');
+          await handleCopyCourseFile(data.stage1PromptMdRelPath, feedbackKey);
+        } else if (data?.stage1Prompt) {
+          triggerCopyFeedback(feedbackKey, data.stage1Prompt);
+        }
+      } else if (target === 'stage2') {
+        if (!data?.stage2Prompt) {
+          throw new Error('当前阶段一没有待生成的 SVG 图示规格，可直接保存阶段一为完整课件。');
+        }
+        if (asMdFile) {
+          if (!data?.stage2PromptMdRelPath) throw new Error('未能生成阶段二 .md 提示词文件');
+          await handleCopyCourseFile(data.stage2PromptMdRelPath, feedbackKey);
+        } else {
+          triggerCopyFeedback(feedbackKey, data.stage2Prompt);
+        }
+      } else if (target === 'agent_stage1') {
+        if (data?.agentStage1Prompt) {
+          triggerCopyFeedback(feedbackKey, data.agentStage1Prompt);
+        }
+      } else if (target === 'agent_stage2') {
+        if (!data?.agentStage2Prompt) {
+          throw new Error('请先让 Agent 完成阶段一并同步后，再复制本节阶段二 SVG 生成指令。');
+        }
+        triggerCopyFeedback(feedbackKey, data.agentStage2Prompt);
+      } else {
+        if (asMdFile) {
+          if (!data?.promptMdRelPath) throw new Error('未能生成 .md 提示词文件');
+          await handleCopyCourseFile(data.promptMdRelPath, feedbackKey);
+        } else if (data?.lessonPrompt) {
+          triggerCopyFeedback(feedbackKey, data.lessonPrompt);
+        }
+      }
+    } catch (err: any) {
+      setErrorMessage(err?.message || '复制提示词失败');
+    }
+  };
+
+  const handleCopySectionLessonPrompt = async (dayIndex: number) => {
+    await handleCopySectionStagePrompt(dayIndex, 'legacy', false);
+  };
+
+  const handleCopySectionPromptMd = async (dayIndex: number) => {
+    await handleCopySectionStagePrompt(dayIndex, 'legacy', true);
+  };
+
+  const handleApplyStep3DraftPatch = (overridePatchText?: string) => {
+    if (!selectedStep3Slot) return;
+    const patchRaw = (overridePatchText ?? step3PatchText).trim();
+    if (!patchRaw) {
+      setStep3ImportNotice({
+        ok: false,
+        message: '请先在下方增量补丁框中粘贴 AI 返回的补丁 JSON 或 <svg>...</svg>。',
+      });
+      return;
+    }
+    const baseLesson =
+      step3ImportAudit?.parsedLesson ||
+      (step3StageTab === 'stage1' ? selectedStep3Slot.stage1Draft : undefined) ||
+      selectedStep3Slot.lesson;
+    if (!baseLesson) {
+      setStep3ImportNotice({
+        ok: false,
+        message: '当前没有可合并补丁的课件草稿或已保存课件，请先粘贴完整课件内容。',
+      });
+      return;
+    }
+    try {
+      const assets = course.customAssets || {};
+      const patched = applyCoursewareRepairPatch(
+        baseLesson,
+        patchRaw,
+        selectedStep3Slot,
+        assets
+      );
+      setStep3RawImportText(JSON.stringify(patched.mergedLesson, null, 2));
+      setStep3PatchText('');
+      setStep3ImportNotice({
+        ok: true,
+        message: `✅ 已将增量补丁合并到当前待保存课件（${patched.appliedSummary}），请检查自检结果后预览或保存。`,
+      });
+    } catch (err: any) {
+      setStep3ImportNotice({
+        ok: false,
+        message: err?.message || '增量补丁解析失败，请确认粘贴的是合法补丁 JSON 或 <svg> 代码。',
+      });
+    }
+  };
+
+  const handleStep3PastePatchFromClipboard = async () => {
+    setStep3ImportNotice(null);
+    try {
+      if (!navigator.clipboard?.readText) {
+        throw new Error('no-clipboard-api');
+      }
+      const clipText = (await navigator.clipboard.readText()).trim();
+      if (!clipText) {
+        setStep3ImportNotice({
+          ok: false,
+          message: '剪贴板为空，请先复制 AI 返回的增量补丁后再试。',
+        });
+        return;
+      }
+      setStep3PatchText(clipText);
+      handleApplyStep3DraftPatch(clipText);
+    } catch {
+      setStep3ImportNotice({
+        ok: false,
+        message: '浏览器未授予读取剪贴板权限，请在下方增量补丁框内按 Ctrl+V 粘贴后点击合并。',
+      });
+    }
+  };
+
+  const handlePreviewStep3Import = () => {
+    if (!selectedStep3Slot) return;
+    const trimmed = step3RawImportText.trim();
+    if (!trimmed) {
+      setStep3ImportNotice({
+        ok: false,
+        message: '请先粘贴课件内容后再预览。',
+      });
+      return;
+    }
+    try {
+      const assets = course.customAssets || {};
+      const parsed =
+        step3ImportAudit?.parsedLesson ||
+        parseImportedLessonContent(trimmed, selectedStep3Slot, 'chat', assets, {
+          stageMode: step3StageTab === 'stage1' ? 'stage1' : 'auto',
+        }).lesson;
+      setStep3PreviewLesson(parsed);
+    } catch (err: any) {
+      setStep3ImportNotice({
+        ok: false,
+        message: err?.message || '解析课件失败，无法预览，请检查 JSON / Markdown 格式。',
+      });
+    }
+  };
+
+  const handlePreviewStep3Stage2Merged = () => {
+    if (step3Stage2MergePreview?.mergedLesson) {
+      setStep3PreviewLesson(step3Stage2MergePreview.mergedLesson);
+      return;
+    }
+    if (step3Stage1BaseLesson && !step3Stage2Text.trim()) {
+      setStep3PreviewLesson(step3Stage1BaseLesson);
+      return;
+    }
+    setStep3ImportNotice({
+      ok: false,
+      message: step3Stage2MergePreview?.error || '请先粘贴阶段二 SVG JSON 再预览合并结果。',
+    });
+  };
+
+  const handleStep3ImportJsonFile = async (
+    e: React.ChangeEvent<HTMLInputElement>,
+    target: 'stage1_or_patch' | 'stage2' = 'stage1_or_patch'
+  ) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setStep3ImportNotice(null);
+    try {
+      const text = (await file.text()).trim();
+      if (!text) {
+        setStep3ImportNotice({
+          ok: false,
+          message: `所选文件 ${file.name} 内容为空。`,
+        });
+        return;
+      }
+      if (target === 'stage2') {
+        setStep3Stage2Text(text);
+        setStep3ImportNotice({
+          ok: true,
+          message: `已导入阶段二 SVG 文件 ${file.name}（${text.length.toLocaleString()} 字符），请核对下方自动组装与自检结果。`,
+        });
+      } else {
+        setStep3RawImportText(text);
+        setStep3ImportNotice({
+          ok: true,
+          message: `已导入文件 ${file.name}（${text.length.toLocaleString()} 字符），请确认下方自检结果后点击预览或保存。`,
+        });
+      }
+    } catch (err: any) {
+      setStep3ImportNotice({
+        ok: false,
+        message: err?.message || `读取文件 ${file.name} 失败。`,
+      });
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const handleSaveStep3Stage1 = async (options?: {
+    overrideText?: string;
+    finalizeDirect?: boolean;
+  }) => {
+    if (!selectedStep3Slot) return;
+    const rawText = (options?.overrideText ?? step3RawImportText).trim();
+    if (!rawText) {
+      setStep3ImportNotice({
+        ok: false,
+        message: '请先在阶段一输入框粘贴第 ' + selectedStep3Slot.dayIndex + ' 讲的阶段一 JSON。',
+      });
+      return;
+    }
+
+    setIsSavingStep3Import(true);
+    setStep3ImportNotice(null);
+    setErrorMessage(null);
+    try {
+      const assets = course.customAssets || {};
+      const check = auditRawCoursewareInput(rawText, selectedStep3Slot, assets, {
+        stage: 'stage1',
+      });
+      if (
+        check &&
+        !check.parsedLesson &&
+        check.report.issues[0]?.category === 'json_syntax_error'
+      ) {
+        throw new Error(check.report.issues[0].detail);
+      }
+      const parsed =
+        check?.parsedLesson ||
+        parseImportedLessonContent(rawText, selectedStep3Slot, 'chat', assets, {
+          stageMode: 'stage1',
+        }).lesson;
+      const pendingSpecs = extractPendingDiagramSpecs(parsed);
+      const shouldFinalize = options?.finalizeDirect && pendingSpecs.length === 0;
+      const importStage: 'stage1' | 'complete' = shouldFinalize ? 'complete' : 'stage1';
+
+      const res = await fetch(
+        `/api/courses/${course.id}/days/${selectedStep3Slot.dayIndex}/import`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            rawContent: JSON.stringify(parsed, null, 2),
+            lessonData: parsed,
+            sourceMode: 'chat',
+            importStage,
+          }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || '保存阶段一成果失败');
+      }
+
+      onCourseUpdated(data.course);
+      setDraftSlots(data.course.dailyPlan || []);
+      loadDiskFiles(course.id);
+
+      const savedDay = selectedStep3Slot.dayIndex;
+      const savedSecId = ensureStableSectionId(savedDay, selectedStep3Slot.id);
+      setStep3RawImportText('');
+      setStep3PreviewLesson(null);
+      setShowStep3IssueDetails(false);
+
+      if (shouldFinalize) {
+        setStep3ImportNotice({
+          ok: true,
+          message: `✅ 第 ${savedDay} 讲无待绘 SVG 规格，已直接保存为完整课件（lessons/${savedSecId}.json）。`,
+        });
+        setStatusMessage(`第 ${savedDay} 讲课件已保存至 lessons/${savedSecId}.json。`);
+      } else {
+        setStep3StageTab('stage2');
+        setStep3ImportNotice({
+          ok: true,
+          message:
+            pendingSpecs.length > 0
+              ? `✅ 已保存第 ${savedDay} 讲阶段一成果（lessons/${savedSecId}.stage1.json），提取到 ${pendingSpecs.length} 个待生成图示规格。已切换至阶段二（无需再上传 PDF）。`
+              : `✅ 已保存第 ${savedDay} 讲阶段一草稿（lessons/${savedSecId}.stage1.json）。`,
+        });
+        setStatusMessage(`第 ${savedDay} 讲阶段一成果已保存。`);
+      }
+    } catch (err: any) {
+      setStep3ImportNotice({
+        ok: false,
+        message: err?.message || '阶段一 JSON 解析或保存失败，请检查格式。',
+      });
+    } finally {
+      setIsSavingStep3Import(false);
+    }
+  };
+
+  const handleSaveStep3Stage2Merge = async (options?: {
+    overrideText?: string;
+    openAfterSave?: boolean;
+    advanceToNext?: boolean;
+  }) => {
+    if (!selectedStep3Slot) return;
+    if (!step3Stage1BaseLesson) {
+      setStep3ImportNotice({
+        ok: false,
+        message: '当前小节尚未保存阶段一成果，请先完成阶段一。',
+      });
+      return;
+    }
+    const rawStage2 = (options?.overrideText ?? step3Stage2Text).trim();
+    if (!rawStage2) {
+      setStep3ImportNotice({
+        ok: false,
+        message: '请先在阶段二输入框粘贴 AI 返回的 SVG 图示 JSON。',
+      });
+      return;
+    }
+
+    setIsSavingStep3Import(true);
+    setStep3ImportNotice(null);
+    setErrorMessage(null);
+    try {
+      const assets = course.customAssets || {};
+      const merged = mergeStage2DiagramsIntoStage1(step3Stage1BaseLesson, rawStage2, assets);
+
+      const res = await fetch(
+        `/api/courses/${course.id}/days/${selectedStep3Slot.dayIndex}/import`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            rawContent: rawStage2,
+            lessonData: merged.mergedLesson,
+            sourceMode: 'chat',
+            importStage: 'stage2_merge',
+          }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || '合并并保存阶段二 SVG 失败');
+      }
+
+      onCourseUpdated(data.course);
+      const updatedSlots: DailyPlanSlot[] = data.course.dailyPlan || [];
+      setDraftSlots(updatedSlots);
+      loadDiskFiles(course.id);
+
+      const savedDay = selectedStep3Slot.dayIndex;
+      const savedSecId = ensureStableSectionId(savedDay, selectedStep3Slot.id);
+      setStep3Stage2Text('');
+      setStep3PreviewLesson(null);
+      setShowStep3IssueDetails(false);
+
+      if (options?.openAfterSave) {
+        onClose();
+        onOpenLesson(course.id, savedDay);
+        return;
+      }
+
+      const mergeSummary = `组装 ${merged.matchedCount + merged.addedCount} 张 SVG${
+        merged.pendingRemaining.length > 0
+          ? `（仍缺 ${merged.pendingRemaining.length} 张）`
+          : '（全部图示已齐备）'
+      }`;
+
+      if (options?.advanceToNext !== false) {
+        const nextPending =
+          updatedSlots.find((s) => s.dayIndex > savedDay && !s.lesson) ||
+          updatedSlots.find((s) => !s.lesson);
+        if (nextPending && nextPending.dayIndex !== savedDay) {
+          setSelectedStep3ChatDay(nextPending.dayIndex);
+          setStep3ImportNotice({
+            ok: true,
+            message: `✅ 已完成第 ${savedDay} 讲两阶段组装保存（${mergeSummary} ➔ lessons/${savedSecId}.json），已切换到下一待生成第 ${nextPending.dayIndex} 讲。`,
+          });
+          setStatusMessage(`第 ${savedDay} 讲已两阶段组装保存并推进至第 ${nextPending.dayIndex} 讲。`);
+          return;
+        }
+      }
+
+      setStep3ImportNotice({
+        ok: true,
+        message: `✅ 已完成第 ${savedDay} 讲两阶段组装保存（${mergeSummary} ➔ lessons/${savedSecId}.json）。`,
+      });
+      setStatusMessage(`第 ${savedDay} 讲最终课件已保存至 lessons/${savedSecId}.json。`);
+    } catch (err: any) {
+      setStep3ImportNotice({
+        ok: false,
+        message:
+          (err?.message || '阶段二合并或保存失败') + '（阶段一已保存成果未被清除，可单独重试阶段二）',
+      });
+    } finally {
+      setIsSavingStep3Import(false);
+    }
+  };
+
+  const handleSaveStep3ChatImport = async (options?: {
+    overrideText?: string;
+    openAfterSave?: boolean;
+    advanceToNext?: boolean;
+  }) => {
+    if (!selectedStep3Slot) return;
+    const rawText = (options?.overrideText ?? step3RawImportText).trim();
+    if (!rawText) {
+      setStep3ImportNotice({
+        ok: false,
+        message: '请先在下方粘贴外部 AI 生成的本节课件 JSON / Markdown（或增量修复补丁）。',
+      });
+      return;
+    }
+
+    setIsSavingStep3Import(true);
+    setStep3ImportNotice(null);
+    setErrorMessage(null);
+    try {
+      const assets = course.customAssets || {};
+      let lessonToSave: DailyLessonContent;
+      let summaryNote = '';
+
+      if (selectedStep3Slot.lesson) {
+        const patched = applyCoursewareRepairPatch(
+          selectedStep3Slot.lesson,
+          rawText,
+          selectedStep3Slot,
+          assets
+        );
+        lessonToSave = patched.mergedLesson;
+        summaryNote = patched.appliedSummary;
+      } else {
+        const check = auditRawCoursewareInput(rawText, selectedStep3Slot, assets);
+        if (
+          check &&
+          !check.parsedLesson &&
+          check.report.issues[0]?.category === 'json_syntax_error'
+        ) {
+          throw new Error(check.report.issues[0].detail);
+        }
+        const parsed =
+          check?.parsedLesson ||
+          parseImportedLessonContent(rawText, selectedStep3Slot, 'chat', assets).lesson;
+        lessonToSave = parsed;
+      }
+
+      const res = await fetch(
+        `/api/courses/${course.id}/days/${selectedStep3Slot.dayIndex}/import`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            rawContent: JSON.stringify(lessonToSave, null, 2),
+            lessonData: lessonToSave,
+            sourceMode: 'chat',
+            importStage: 'complete',
+          }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || '导入保存本节课件失败');
+      }
+
+      onCourseUpdated(data.course);
+      const updatedSlots: DailyPlanSlot[] = (data.course.dailyPlan || []).map((s: DailyPlanSlot) =>
+        s.dayIndex === selectedStep3Slot.dayIndex && lessonToSave.estimatedMinutes
+          ? { ...s, estimatedMinutes: lessonToSave.estimatedMinutes }
+          : s
+      );
+      setDraftSlots(updatedSlots);
+      loadDiskFiles(course.id);
+
+      const savedDay = selectedStep3Slot.dayIndex;
+      const savedSecId = ensureStableSectionId(savedDay, selectedStep3Slot.id);
+      setStep3RawImportText('');
+      setStep3PatchText('');
+      setStep3PreviewLesson(null);
+      setShowStep3IssueDetails(false);
+
+      if (options?.openAfterSave) {
+        onClose();
+        onOpenLesson(course.id, savedDay);
+        return;
+      }
+
+      if (options?.advanceToNext !== false) {
+        const nextPending =
+          updatedSlots.find((s) => s.dayIndex > savedDay && !s.lesson) ||
+          updatedSlots.find((s) => !s.lesson);
+        if (nextPending && nextPending.dayIndex !== savedDay) {
+          setSelectedStep3ChatDay(nextPending.dayIndex);
+          setStep3ImportNotice({
+            ok: true,
+            message: `✅ 已保存第 ${savedDay} 讲（lessons/${savedSecId}.json）${summaryNote ? ` [${summaryNote}]` : ''}，已自动切换到待生成的第 ${nextPending.dayIndex} 讲（${ensureStableSectionId(nextPending.dayIndex, nextPending.id)}）。`,
+          });
+          setStatusMessage(
+            `第 ${savedDay} 讲课件已保存，已自动切换到第 ${nextPending.dayIndex} 讲。`
+          );
+          return;
+        }
+      }
+
+      setStep3ImportNotice({
+        ok: true,
+        message: `✅ 已保存第 ${savedDay} 讲（lessons/${savedSecId}.json）${summaryNote ? ` · ${summaryNote}` : ''}。`,
+      });
+      setStatusMessage(`第 ${savedDay} 讲课件已保存至 lessons/${savedSecId}.json。`);
+    } catch (err: any) {
+      setStep3ImportNotice({
+        ok: false,
+        message: err?.message || '解析或保存课件失败，请检查粘贴内容格式。',
+      });
+    } finally {
+      setIsSavingStep3Import(false);
+    }
+  };
+
+  const handleStep3PasteFromClipboard = async (
+    autoSaveIfClean: boolean,
+    target: 'stage1_or_patch' | 'stage2' = 'stage1_or_patch'
+  ) => {
+    setStep3ImportNotice(null);
+    try {
+      if (!navigator.clipboard?.readText) {
+        throw new Error('no-clipboard-api');
+      }
+      const clipText = (await navigator.clipboard.readText()).trim();
+      if (!clipText) {
+        setStep3ImportNotice({
+          ok: false,
+          message: '剪贴板当前为空，请先在外部 AI 页面复制生成结果后再点击粘贴。',
+        });
+        if (target === 'stage2') step3Stage2TextareaRef.current?.focus();
+        else step3TextareaRef.current?.focus();
+        return;
+      }
+      if (target === 'stage2') {
+        setStep3Stage2Text(clipText);
+        if (autoSaveIfClean && selectedStep3Slot) {
+          await handleSaveStep3Stage2Merge({
+            overrideText: clipText,
+            advanceToNext: true,
+          });
+        } else {
+          setStep3ImportNotice({
+            ok: true,
+            message: `已从剪贴板读取阶段二 SVG 输出（${clipText.length.toLocaleString()} 字符），请核对下方自动组装自检结果。`,
+          });
+        }
+        return;
+      }
+
+      setStep3RawImportText(clipText);
+      if (autoSaveIfClean && selectedStep3Slot) {
+        if (step3StageTab === 'stage1') {
+          await handleSaveStep3Stage1({ overrideText: clipText, finalizeDirect: true });
+        } else {
+          await handleSaveStep3ChatImport({
+            overrideText: clipText,
+            advanceToNext: true,
+          });
+        }
+      } else {
+        setStep3ImportNotice({
+          ok: true,
+          message: `已从剪贴板读取 ${clipText.length.toLocaleString()} 字符，请确认下方自检结果后点击保存。`,
+        });
+      }
+    } catch {
+      setStep3ImportNotice({
+        ok: false,
+        message: '浏览器未授予直接读取剪贴板权限，请直接在下方输入框按 Ctrl+V / Cmd+V 粘贴。',
+      });
+      if (target === 'stage2') step3Stage2TextareaRef.current?.focus();
+      else step3TextareaRef.current?.focus();
+    }
+  };
+
+  const handleGenerateSingleSectionApi = async (
+    dayIndex: number,
+    stage: 'all' | 'stage1' | 'stage2' = 'all'
+  ) => {
+    setGeneratingDayIndex(dayIndex);
+    setGeneratingDayProgress({
+      type: 'progress',
+      stage: 'connecting',
+      step: 1,
+      percent: 4,
+      message:
+        stage === 'stage1'
+          ? `正在流式生成第 ${dayIndex} 讲阶段一（正文与图示规格）...`
+          : stage === 'stage2'
+          ? `正在流式执行第 ${dayIndex} 讲阶段二（SVG 图示生成与组装）...`
+          : `正在准备第 ${dayIndex} 讲两阶段资料与流式连接...`,
+    });
+    setErrorMessage(null);
+    setStatusMessage(null);
+    try {
+      const data = await generateLessonWithProgressStream(
+        course.id,
+        dayIndex,
+        (ev) => setGeneratingDayProgress(ev),
+        stage
+      );
       onCourseUpdated(data.course);
       setDraftSlots(data.course.dailyPlan);
+      loadDiskFiles(course.id);
+      const secId = `sec-${String(dayIndex).padStart(2, '0')}`;
       setStatusMessage(
-        `第 ${dayIndex} 讲课件已生成并保存到本地 ${course.courseDirPath}/lessons/sec-${String(dayIndex).padStart(2, '0')}.json`
+        stage === 'stage1'
+          ? `第 ${dayIndex} 讲阶段一已保存至 ${course.courseDirPath}/lessons/${secId}.stage1.json（可继续仅生成阶段二 SVG）`
+          : `第 ${dayIndex} 讲课件已生成并保存到本地 ${course.courseDirPath}/lessons/${secId}.json`
       );
     } catch (err: any) {
-      setErrorMessage(err?.message || `生成第 ${dayIndex} 节课件失败，可重试或切换 Chat/Agent 模式`);
+      // Stage 2 failures still persist Stage 1 on the backend; refresh course snapshot so Stage 1 stays visible!
+      try {
+        const refreshRes = await fetch(`/api/courses/${course.id}`);
+        if (refreshRes.ok) {
+          const fresh = await refreshRes.json();
+          if (fresh?.course) {
+            onCourseUpdated(fresh.course);
+            setDraftSlots(fresh.course.dailyPlan || []);
+          }
+        }
+      } catch {
+        // ignore refresh failure
+      }
+      setErrorMessage(
+        err?.message || `生成第 ${dayIndex} 节课件失败（若阶段一已保存，可单独重跑阶段二或切换 Chat/Agent 模式）`
+      );
     } finally {
       setGeneratingDayIndex(null);
+      setGeneratingDayProgress(null);
     }
   };
 
@@ -811,24 +1735,59 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
     try {
       for (const s of pendingSlots) {
         setGeneratingDayIndex(s.dayIndex);
-        const res = await fetch(`/api/courses/${course.id}/days/${s.dayIndex}/generate`, {
-          method: 'POST',
+        setGeneratingDayProgress({
+          type: 'progress',
+          stage: 'connecting',
+          step: 1,
+          percent: 4,
+          message: `[步骤 1/2] 正在准备第 ${s.dayIndex} 讲阶段一请求...`,
         });
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || `生成第 ${s.dayIndex} 节课件失败`);
+
+        let needsStage2 = true;
+        if (!s.stage1Draft) {
+          const s1Data = await generateLessonWithProgressStream(
+            course.id,
+            s.dayIndex,
+            (ev) =>
+              setGeneratingDayProgress({
+                ...ev,
+                percent: Math.max(1, Math.min(54, Math.round((ev.percent || 0) * 0.54))),
+                message: `[步骤 1/2] ${ev.message}`,
+              }),
+            'stage1'
+          );
+          onCourseUpdated(s1Data.course);
+          setDraftSlots(s1Data.course.dailyPlan);
+          needsStage2 = (s1Data.pendingDiagramsCount ?? 0) > 0;
+        } else {
+          needsStage2 = extractPendingDiagramSpecs(s.stage1Draft).length > 0;
         }
-        onCourseUpdated(data.course);
-        setDraftSlots(data.course.dailyPlan);
+
+        if (needsStage2) {
+          const s2Data = await generateLessonWithProgressStream(
+            course.id,
+            s.dayIndex,
+            (ev) =>
+              setGeneratingDayProgress({
+                ...ev,
+                percent: Math.max(56, Math.min(99, 56 + Math.round((ev.percent || 0) * 0.43))),
+                message: `[步骤 2/2] ${ev.message}`,
+              }),
+            'stage2'
+          );
+          onCourseUpdated(s2Data.course);
+          setDraftSlots(s2Data.course.dailyPlan);
+        }
         completed++;
       }
-      setStatusMessage(`已按目录顺序完成全部 ${completed} 节课件生成。`);
+      setStatusMessage(`已按单节单步请求顺序完成全部 ${completed} 节课件生成。`);
     } catch (err: any) {
       setErrorMessage(
         `${err?.message || '批量生成中断'}（已完成 ${completed}/${pendingSlots.length} 节，可继续从断点生成）`
       );
     } finally {
       setGeneratingDayIndex(null);
+      setGeneratingDayProgress(null);
       setIsGeneratingBatch(false);
     }
   };
@@ -964,73 +1923,108 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
   const slicedRegionCount = draftSplitPlan.filter((p) => p.status === 'sliced').length;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4 overflow-y-auto"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="outline-workbench-title"
-    >
-      <div className="w-full max-w-5xl bg-black border border-neutral-800 rounded-md p-6 my-6 max-h-[92vh] overflow-y-auto space-y-5">
-        {/* Top Header */}
-        <div className="flex items-start justify-between gap-4 border-b border-neutral-800 pb-4">
-          <div className="space-y-1 flex-1 min-w-0">
-            <div className="flex flex-wrap items-center gap-2 text-xs font-mono text-neutral-400">
-              <span className="text-white font-sans font-semibold text-base" id="outline-workbench-title">
-                《{course.name}》 — {showAdvancedWorkflowDetails ? '区域划分、大纲规划与课件生成工作台' : '课程生成工作台'}
-              </span>
-              <span aria-hidden="true">·</span>
-              <span>
-                {course.outlineConfirmed ? '大纲状态：已确认' : '大纲状态：待第 2 步生成确认'}
-              </span>
-              {showAdvancedWorkflowDetails && (
-                <>
+        <motion.div
+          key="outline-workbench-backdrop"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-sm p-4 overflow-y-auto"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="outline-workbench-title"
+        >
+          <motion.div
+            key="outline-workbench-panel"
+            initial={{ opacity: 0, scale: 0.96 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.97 }}
+            transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+            className="glow-border w-full max-w-5xl bg-black border border-neutral-800 rounded-md p-6 my-6 max-h-[92vh] overflow-y-auto space-y-5 shadow-2xl"
+          >
+            {/* Top Header */}
+            <div className="flex items-start justify-between gap-4 border-b border-neutral-800 pb-4">
+              <div className="space-y-1 flex-1 min-w-0">
+                <div className="flex flex-wrap items-center gap-2 text-xs font-mono text-neutral-400">
+                  <span className="font-display text-white font-semibold text-base" id="outline-workbench-title">
+                    《{course.name}》 — {showAdvancedWorkflowDetails ? '区域划分、大纲规划与课件生成工作台' : '课程生成工作台'}
+                  </span>
                   <span aria-hidden="true">·</span>
-                  <span>本地路径：{courseRelDir}/</span>
-                </>
-              )}
+                  <span>
+                    {course.outlineConfirmed ? '大纲状态：已确认' : '大纲状态：待第 2 步生成确认'}
+                  </span>
+                  {showAdvancedWorkflowDetails && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span>本地路径：{courseRelDir}/</span>
+                    </>
+                  )}
+                </div>
+                {showAdvancedWorkflowDetails && (
+                  <p className="text-xs text-neutral-500 font-mono">
+                    目录结构：{courseRelDir}/ &#123; course.json, outline.json, sources/, segments/, lessons/, assets/ &#125;
+                  </p>
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <div
+                  data-testid="workbench-mode-switch"
+                  className="inline-flex items-center rounded border border-neutral-800 bg-neutral-950 p-0.5 text-[11px] font-mono"
+                  title="无需退出工作台直接切换生成模式，保留当前课程大纲、草稿与已生成课件"
+                >
+                  {(
+                    [
+                      { id: 'chat', label: 'Chat 对话模式' },
+                      { id: 'agent', label: 'Agent 模式' },
+                      { id: 'api', label: 'API 模式' },
+                    ] as const
+                  ).map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      data-testid={`workbench-mode-${item.id}`}
+                      disabled={isSwitchingMode}
+                      onClick={() => handleSwitchWorkbenchMode(item.id)}
+                      className={`px-2.5 py-1 rounded transition-colors ${
+                        workbenchMode === item.id
+                          ? 'bg-white text-black font-semibold'
+                          : 'text-neutral-400 hover:text-white'
+                      } disabled:opacity-60`}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+
+                {workbenchMode === 'agent' && onOpenAgentModal && (
+                  <button
+                    type="button"
+                    onClick={() => onOpenAgentModal(course)}
+                    className="px-2.5 py-1.5 text-[11px] font-mono border border-neutral-700 hover:border-neutral-500 text-neutral-300 hover:text-white rounded transition-colors"
+                    title="打开独立 Agent 终端指引窗口（可选）"
+                  >
+                    Agent 独立指引窗
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={onClose}
+                  aria-label="关闭课程目录与切分工作台"
+                  className="p-1.5 text-neutral-400 hover:text-white transition-colors shrink-0"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
             </div>
-            {showAdvancedWorkflowDetails && (
-              <p className="text-xs text-neutral-500 font-mono">
-                目录结构：{courseRelDir}/ &#123; course.json, outline.json, sources/, segments/, lessons/, assets/ &#125;
-              </p>
-            )}
-          </div>
-
-          <div className="flex items-center gap-2.5 shrink-0">
-            <label className="sr-only" htmlFor="workbench-mode-select">
-              工作台生成方式
-            </label>
-            <select
-              id="workbench-mode-select"
-              value={course.generationMode || 'api'}
-              onChange={(e) =>
-                handleSwitchWorkbenchMode(e.target.value as CourseGenerationMode)
-              }
-              className="bg-black border border-neutral-800 hover:border-neutral-600 rounded px-2.5 py-1 text-xs text-neutral-200 focus:outline-none"
-              title="切换当前课程的生成方式（API / Agent / Chat）"
-            >
-              <option value="api">模式：API 自动生成</option>
-              <option value="agent">模式：Agent 课件模式</option>
-              <option value="chat">模式：Chat 课件模式</option>
-            </select>
-
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label="关闭课程目录与切分工作台"
-              className="p-1.5 text-neutral-400 hover:text-white transition-colors shrink-0"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
 
         {/* 4-Tab Navigation Bar (Strict Workflow Order 1 -> 2 -> 3 + 4. File Manager & Backup) */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
           <button
             type="button"
             onClick={() => setActiveStep('split_vocab')}
-            className={`p-3 rounded border text-left transition-colors ${
+            className={`glow-border p-3 rounded border text-left transition-colors ${
               activeStep === 'split_vocab'
                 ? 'bg-neutral-900 border-white text-white'
                 : 'bg-black border-neutral-800 text-neutral-400 hover:border-neutral-700'
@@ -1043,7 +2037,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
             </div>
             <div className="text-[11px] text-neutral-500 mt-0.5">
               {course.category === 'english' && !hasPdfMaterials
-                ? `每日 ${dailyWordCountInput} 词 · 周期内不重复随机抽取`
+                ? `每节 ${dailyWordCountInput} 词 · 周期内不重复随机抽取`
                 : `已规划 ${draftSplitPlan.length} 区域 · 已切割 ${slicedRegionCount} PDF`}
             </div>
           </button>
@@ -1051,7 +2045,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
           <button
             type="button"
             onClick={() => setActiveStep('outline')}
-            className={`p-3 rounded border text-left transition-colors ${
+            className={`glow-border p-3 rounded border text-left transition-colors ${
               activeStep === 'outline'
                 ? 'bg-neutral-900 border-white text-white'
                 : 'bg-black border-neutral-800 text-neutral-400 hover:border-neutral-700'
@@ -1068,7 +2062,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
           <button
             type="button"
             onClick={() => setActiveStep('lessons')}
-            className={`p-3 rounded border text-left transition-colors ${
+            className={`glow-border p-3 rounded border text-left transition-colors ${
               activeStep === 'lessons'
                 ? 'bg-neutral-900 border-white text-white'
                 : 'bg-black border-neutral-800 text-neutral-400 hover:border-neutral-700'
@@ -1088,7 +2082,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
               setActiveStep('files');
               loadDiskFiles(course.id);
             }}
-            className={`p-3 rounded border text-left transition-colors ${
+            className={`glow-border p-3 rounded border text-left transition-colors ${
               activeStep === 'files'
                 ? 'bg-neutral-900 border-white text-white'
                 : 'bg-black border-neutral-800 text-neutral-400 hover:border-neutral-700'
@@ -1124,8 +2118,12 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                 </div>
                 <div className="text-neutral-500">
                   {hasPdfMaterials
-                    ? `第 1 步已配置 ${draftSplitPlan.length} 个区域（其中 ${slicedRegionCount} 个已无损切割）。课程大纲与课件内容严格分离，修改目录不会删除任何已生成课件。`
-                    : '课程大纲与课件内容严格分离：修改目录、调整日期或重命名小节不会删除任何已生成课件。'}
+                    ? `第 1 步已配置 ${draftSplitPlan.length} 个区域（其中 ${slicedRegionCount} 个已无损切割${
+                        draftSlots.length > 0 && pdfCoverageStats.totalRegions > 0
+                          ? `，当前大纲已覆盖 ${pdfCoverageStats.coveredCount}/${pdfCoverageStats.totalRegions} 个区域`
+                          : ''
+                      }）。本步仅规划完整知识结构与小节划分，不受学习天数限制。`
+                    : '本步仅规划完整知识大纲，不受学习天数限制；修改目录或重命名小节不会删除任何已生成课件。'}
                 </div>
               </div>
 
@@ -1165,10 +2163,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                   <div className="inline-flex rounded border border-neutral-800 bg-black p-0.5">
                     <button
                       type="button"
-                      onClick={() => {
-                        setSyllabusWorkbenchTab('chat');
-                        handleSwitchWorkbenchMode('chat');
-                      }}
+                      onClick={() => setSyllabusWorkbenchTab('chat')}
                       className={`px-2.5 py-1 rounded transition-colors ${
                         syllabusWorkbenchTab === 'chat'
                           ? 'bg-neutral-800 text-white font-medium'
@@ -1179,10 +2174,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                     </button>
                     <button
                       type="button"
-                      onClick={() => {
-                        setSyllabusWorkbenchTab('agent');
-                        handleSwitchWorkbenchMode('agent');
-                      }}
+                      onClick={() => setSyllabusWorkbenchTab('agent')}
                       className={`px-2.5 py-1 rounded transition-colors ${
                         syllabusWorkbenchTab === 'agent'
                           ? 'bg-neutral-800 text-white font-medium'
@@ -1278,10 +2270,19 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                       rows={4}
                       value={rawSyllabusImport}
                       onChange={(e) => setRawSyllabusImport(e.target.value)}
-                      placeholder="在此粘贴外部 AI 输出的完整大纲 JSON（包含 days 数组与 regionId 绑定）..."
+                      placeholder='在此粘贴外部 AI 输出的完整大纲 JSON（推荐使用 "sections": [...] 并关联 "regionId" / "regionIds"，亦兼容旧版 "days" 格式）...'
                       className="w-full bg-black border border-neutral-800 rounded p-2.5 font-mono text-neutral-200"
                     />
-                    <div className="flex justify-end gap-2">
+                    <div className="flex flex-wrap justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          pasteClipboardText(setRawSyllabusImport, '大纲 JSON')
+                        }
+                        className="px-3 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors"
+                      >
+                        一键粘贴剪贴板 JSON
+                      </button>
                       <button
                         type="button"
                         onClick={handleImportChatSyllabus}
@@ -1297,17 +2298,38 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
             )}
 
             {/* Outline Preview / Editor List */}
-            {!showAdvancedWorkflowDetails ? (
+            {draftSlots.length === 0 ? (
+              <div className="border border-dashed border-neutral-800 rounded p-6 text-center space-y-3 text-xs bg-neutral-950/30">
+                <p className="text-neutral-300 font-medium">
+                  当前尚未生成课程大纲（0 节）。大纲小节数量由第 1 步切分区域与知识边界决定，不受学习天数限制。
+                </p>
+                <p className="text-neutral-500">
+                  请点击上方「API 生成/重新生成大纲」或使用「Chat / Agent 大纲生成与同步」生成并导入大纲，也可手动新增小节：
+                </p>
+                <button
+                  type="button"
+                  onClick={handleAddSectionToOutline}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>手动新增第 1 节</span>
+                </button>
+              </div>
+            ) : !showAdvancedWorkflowDetails ? (
               <div className="space-y-2 max-h-[48vh] overflow-y-auto pr-1">
-                {draftSlots.map((slot) => {
+                {effectiveSlots.map((slot) => {
                   const secId = ensureStableSectionId(slot.dayIndex, slot.id);
+                  const boundSegs = resolveSlotPdfSegments(slot, draftSplitPlan);
                   return (
                     <div
                       key={secId}
                       className="border border-neutral-800 rounded p-3 bg-neutral-950/40 space-y-1 text-xs"
                     >
                       <div className="flex flex-wrap items-center justify-between gap-2 font-mono">
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-neutral-300 text-[11px]">
+                            {secId}
+                          </span>
                           <span className="text-white font-sans font-semibold">
                             第 {slot.dayIndex} 讲 ·{' '}
                             <span
@@ -1316,11 +2338,24 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                               }}
                             />
                           </span>
+                          {boundSegs.length > 0 ? (
+                            boundSegs.map((seg) => (
+                              <span
+                                key={seg.sectionId}
+                                className="px-1.5 py-0.5 rounded border border-neutral-800 bg-black text-neutral-300 text-[11px]"
+                              >
+                                区域 {seg.sectionId} (p.{seg.physicalStartPage}–{seg.physicalEndPage})
+                              </span>
+                            ))
+                          ) : slot.regionId ? (
+                            <span className="px-1.5 py-0.5 rounded border border-neutral-800 bg-black text-neutral-400 text-[11px]">
+                              区域 {slot.regionId}
+                            </span>
+                          ) : null}
                           {slot.lesson && (
                             <span className="text-emerald-400">· 已有课件（受保护）</span>
                           )}
                         </div>
-                        <span className="text-neutral-500">{slot.date}</span>
                       </div>
                       <p
                         className="text-neutral-400 leading-relaxed"
@@ -1357,28 +2392,39 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                             {secId}
                           </span>
                           <span className="text-neutral-400">第 {slot.dayIndex} 讲</span>
-                          <input
-                            type="date"
-                            value={slot.date}
-                            onChange={(e) => handleUpdateSlotField(idx, 'date', e.target.value)}
-                            aria-label={`第 ${slot.dayIndex} 讲日期`}
-                            className="bg-black border border-neutral-800 rounded px-2 py-0.5 text-xs font-mono text-neutral-200"
-                          />
                           {draftSplitPlan.length > 0 && (
-                            <select
-                              aria-label={`${secId} 绑定第 1 步 PDF 区域`}
-                              value={slot.regionId || ''}
-                              onChange={(e) => handleSelectSlotRegion(idx, e.target.value)}
-                              className="bg-black border border-neutral-800 rounded px-2 py-0.5 text-xs font-mono text-neutral-200"
-                            >
-                              <option value="">（未绑定切分区域 / 使用全局资料）</option>
-                              {draftSplitPlan.map((r) => (
-                                <option key={r.sectionId} value={r.sectionId}>
-                                  区域 {r.sectionId} · {r.sectionTitle} (物理 p.{r.physicalStartPage}–{r.physicalEndPage}
-                                  {r.status === 'sliced' ? ' · 已切割' : ''})
-                                </option>
-                              ))}
-                            </select>
+                            <>
+                              <select
+                                aria-label={`${secId} 绑定第 1 步 PDF 区域`}
+                                value={slot.regionId || ''}
+                                onChange={(e) => handleSelectSlotRegion(idx, e.target.value)}
+                                className="bg-black border border-neutral-800 rounded px-2 py-0.5 text-xs font-mono text-neutral-200"
+                              >
+                                <option value="">（未绑定切分区域 / 使用全局资料）</option>
+                                {draftSplitPlan.map((r) => (
+                                  <option key={r.sectionId} value={r.sectionId}>
+                                    区域 {r.sectionId} · {r.sectionTitle} (物理 p.{r.physicalStartPage}–{r.physicalEndPage}
+                                    {r.status === 'sliced' ? ' · 已切割' : ''})
+                                  </option>
+                                ))}
+                              </select>
+                              {(() => {
+                                const effectiveSlot = effectiveSlots[idx] || slot;
+                                const allSegs = resolveSlotPdfSegments(effectiveSlot, draftSplitPlan);
+                                const primaryId = slot.regionId || allSegs[0]?.sectionId;
+                                return allSegs
+                                  .filter((seg) => seg.sectionId !== primaryId)
+                                  .map((seg) => (
+                                    <span
+                                      key={seg.sectionId}
+                                      className="px-1.5 py-0.5 rounded border border-sky-800/60 bg-sky-950/30 text-sky-300 text-[11px]"
+                                      title="该合并区域将随本讲一并关联"
+                                    >
+                                      + {seg.sectionId} (p.{seg.physicalStartPage}–{seg.physicalEndPage})
+                                    </span>
+                                  ));
+                              })()}
+                            </>
                           )}
                           {slot.lesson && (
                             <span className="text-emerald-400">· 已有课件（受保护）</span>
@@ -1485,7 +2531,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                 </button>
               ) : (
                 <div className="text-xs text-neutral-500">
-                  已简化大纲预览；如需手动增删小节或修改日期/目标，
+                  已简化大纲预览；如需手动增删小节或修改目标，
                   {onOpenSettings ? (
                     <button
                       type="button"
@@ -1505,8 +2551,8 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                   <button
                     type="button"
                     onClick={() => handleSaveOutline(false)}
-                    disabled={isSavingOutline}
-                    className="px-3.5 py-2 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors"
+                    disabled={isSavingOutline || draftSlots.length === 0}
+                    className="px-3.5 py-2 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors disabled:opacity-50"
                   >
                     仅保存目录草稿
                   </button>
@@ -1514,8 +2560,8 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                 <button
                   type="button"
                   onClick={() => handleSaveOutline(true)}
-                  disabled={isSavingOutline}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors"
+                  disabled={isSavingOutline || draftSlots.length === 0}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors disabled:opacity-50"
                 >
                   <Check className="w-3.5 h-3.5" />
                   <span>
@@ -1536,7 +2582,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                 <div className="flex flex-wrap items-center justify-between gap-3 border-b border-neutral-900 pb-3">
                   <div>
                     <h3 className="text-sm font-semibold text-white">
-                      英语课程每日词汇随机分配（本地差集与去重，不依赖 LLM）
+                      英语课程每节词汇随机分配（本地差集与去重，不依赖 LLM）
                     </h3>
                     <p className="text-xs text-neutral-500 mt-0.5">
                       词库差集：{course.englishConfig.targetBankName} ({course.englishConfig.totalTargetCount}) −{' '}
@@ -1546,7 +2592,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-xs text-neutral-400">每日目标单词数：</span>
+                    <span className="text-xs text-neutral-400">每节目标单词数：</span>
                     {[15, 20, 30, 50].map((preset) => (
                       <button
                         key={preset}
@@ -1569,7 +2615,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                       onChange={(e) =>
                         setDailyWordCountInput(Math.max(1, Math.min(200, Number(e.target.value) || 20)))
                       }
-                      aria-label="调整每日目标单词数"
+                      aria-label="调整每节目标单词数"
                       className="w-16 bg-black border border-neutral-800 rounded px-2 py-1 text-xs font-mono text-white"
                     />
                     <button
@@ -1610,7 +2656,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                       >
                         <div className="flex items-center justify-between font-mono">
                           <span className="text-white font-sans font-medium">
-                            {slot.id} · 第 {slot.dayIndex} 天 ({slot.date})
+                            {slot.id} · 第 {slot.dayIndex} 节
                           </span>
                           <span className="text-neutral-400">
                             {words.length} 词 {slot.lesson ? '· 已锁定(已学)' : '· 稳定保存'}
@@ -1619,7 +2665,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                         <p className="text-neutral-400 font-mono truncate">
                           {words.length > 0
                             ? words.map((w) => w.word).join(', ')
-                            : '（词库容量已分配完毕，当日无剩余未分配词）'}
+                            : '（词库容量已分配完毕，本节无剩余未分配词）'}
                         </p>
                       </div>
                     );
@@ -1701,7 +2747,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                 <div className="flex flex-wrap items-center justify-between gap-3 bg-black border border-neutral-800 rounded p-3 text-xs">
                   <div className="space-y-0.5">
                     <div className="text-neutral-200 font-medium">
-                      可选手动偏移量修正（默认 0，不通过 OCR 自动猜算；物理页码 = 教材印刷页码 + 偏移量）
+                      可选手动偏移量修正（默认 0；物理页码 = 教材印刷页码 + 偏移量）
                     </div>
                     <div className="text-neutral-500">
                       若需要按书本目录印刷页码批量换算为 PDF 物理页码再手动填写（例如前言占 12 页则填 +12）；否则直接让 AI 依据随附 PDF 原文件物理页划分即可。
@@ -1832,7 +2878,16 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                       placeholder='在此粘贴包含 "regions": [...] (或 "segments": [...]) 的 JSON 划分方案...'
                       className="w-full bg-neutral-950 border border-neutral-800 rounded p-2.5 font-mono text-neutral-200"
                     />
-                    <div className="flex justify-end">
+                    <div className="flex flex-wrap justify-end gap-2">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          pasteClipboardText(setRawSplitImport, 'PDF 划分 JSON')
+                        }
+                        className="px-3 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors"
+                      >
+                        一键粘贴剪贴板 JSON
+                      </button>
                       <button
                         type="button"
                         onClick={handleImportChatSplitPlan}
@@ -2196,7 +3251,23 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                   第 3 步：按大纲顺序逐节由 LLM 生成课件（lessons/sec-XX.json）
                 </div>
                 <div className="text-neutral-500">
-                  每节自动关联第 1 步切分出的区域 PDF 与第 2 步大纲目标；进入任一小节后支持“保存并连续进入下一讲”。
+                  每节自动关联第 1 步切分出的区域 PDF 与第 2 步大纲目标，并在写完课件时评估预计学习时长；进入任一小节后支持“保存并连续进入下一讲”。
+                  {draftSlots.length > 0 && (() => {
+                    const assessedCount = draftSlots.filter(
+                      (s) => getEvaluatedSectionMinutes(s) !== undefined
+                    ).length;
+                    const totalMins = draftSlots.reduce(
+                      (sum, s) => sum + (getEvaluatedSectionMinutes(s) || 0),
+                      0
+                    );
+                    return (
+                      <span>
+                        {assessedCount > 0
+                          ? ` · 已评估学时 ${assessedCount}/${draftSlots.length} 节（共 ${totalMins} 分钟）· 排程 ${draftDurationDays} 天`
+                          : ` · 学时将在逐节生成课件时评估（当前目标 ${draftDurationDays} 天）`}
+                      </span>
+                    );
+                  })()}
                 </div>
               </div>
 
@@ -2214,7 +3285,7 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                   <RefreshCw className={`w-3.5 h-3.5 ${isGeneratingBatch ? 'animate-spin' : ''}`} />
                   <span>
                     {isGeneratingBatch
-                      ? `API 正在按序生成第 ${generatingDayIndex} 节...`
+                      ? `API 正在生成第 ${generatingDayIndex} 节 (${generatingDayProgress?.percent ?? 0}%)`
                       : 'API 按序生成全部未完成小节'}
                   </span>
                 </button>
@@ -2252,60 +3323,1431 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
               </div>
             </div>
 
-            <div className="space-y-2.5 max-h-[54vh] overflow-y-auto pr-1">
-              {draftSlots.map((slot) => {
+            {/* Deterministic Study Load & Day Reallocation Bar (Step 3) */}
+            {draftSlots.length > 0 && (() => {
+              const assessedCount = draftSlots.filter(
+                (s) => getEvaluatedSectionMinutes(s) !== undefined
+              ).length;
+              const totalMinutes = draftSlots.reduce(
+                (sum, s) => sum + (getEvaluatedSectionMinutes(s) || 0),
+                0
+              );
+              const safeDays = Math.max(1, Number(draftDurationDays) || 1);
+              const targetPerDay = assessedCount > 0 ? Math.round(totalMinutes / safeDays) : null;
+              return (
+                <div className="flex flex-wrap items-center justify-between gap-3 bg-black border border-neutral-800 rounded p-3 text-xs">
+                  <div className="space-y-0.5">
+                    <div className="text-neutral-200 font-medium">
+                      {assessedCount > 0
+                        ? `学时负荷与确定性排期：已评估 ${assessedCount}/${draftSlots.length} 节 · 累计 ${totalMinutes} 分钟 · 目标每日基准约 ${targetPerDay} 分钟`
+                        : `学时负荷与确定性排期：共 ${draftSlots.length} 个独立小节 · 尚未写完课件评估学时（生成后将按实际学时均衡排程）`}
+                    </div>
+                    <div className="text-neutral-500">
+                      写完具体课件时评估各小节耗时，再由本地算法按总学时连续分配到目标天数；随时修改天数并重排，已生成课件零重做。
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label className="inline-flex items-center gap-1.5 text-neutral-400">
+                      <span>开课</span>
+                      <input
+                        type="date"
+                        value={draftStartDate}
+                        onChange={(e) => setDraftStartDate(e.target.value)}
+                        className="bg-neutral-950 border border-neutral-800 rounded px-2 py-1 font-mono text-neutral-200"
+                      />
+                    </label>
+                    <label className="inline-flex items-center gap-1.5 text-neutral-400">
+                      <span>天数</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={180}
+                        value={draftDurationDays}
+                        onChange={(e) =>
+                          setDraftDurationDays(Math.max(1, Number(e.target.value) || 1))
+                        }
+                        aria-label="目标学习天数"
+                        className="w-16 bg-neutral-950 border border-neutral-800 rounded px-2 py-1 font-mono text-white text-center"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      onClick={handleReallocateSchedule}
+                      disabled={isReallocatingSchedule}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-sky-700/80 bg-sky-950/40 hover:bg-sky-900/50 text-sky-200 font-medium rounded transition-colors disabled:opacity-50"
+                    >
+                      <RefreshCw
+                        className={`w-3.5 h-3.5 ${isReallocatingSchedule ? 'animate-spin' : ''}`}
+                      />
+                      <span>
+                        {isReallocatingSchedule ? '正在按学时分配...' : '按学时重排学习天数'}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {generatingDayIndex !== null && generatingDayProgress && (
+              <div className="border border-sky-800/70 bg-sky-950/20 rounded p-3 space-y-2 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-sky-100 font-medium">
+                    第 {generatingDayIndex} 讲实时流式生成：{generatingDayProgress.message}
+                  </span>
+                  <span className="font-mono text-sky-200">
+                    {generatingDayProgress.percent}%
+                    {typeof generatingDayProgress.charsReceived === 'number'
+                      ? ` · ${generatingDayProgress.charsReceived.toLocaleString()} 字符`
+                      : ''}
+                  </span>
+                </div>
+                <div className="w-full h-1.5 bg-neutral-900 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-sky-400 transition-all duration-200"
+                    style={{ width: `${Math.max(2, Math.min(100, generatingDayProgress.percent))}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* ==================== STEP 3 WORKBENCH: TWO-STAGE CHAT / AGENT / API ==================== */}
+            {selectedStep3Slot && (() => {
+              const secId = ensureStableSectionId(selectedStep3Slot.dayIndex, selectedStep3Slot.id);
+              const boundSegs = resolveSlotPdfSegments(selectedStep3Slot, draftSplitPlan);
+              const slicedSegs = boundSegs.filter(
+                (item) =>
+                  item.status === 'sliced' ||
+                  Boolean(item.segmentRelPath || item.segmentFileName)
+              );
+              const hasStage1 = Boolean(selectedStep3Slot.stage1Draft || selectedStep3Slot.lesson);
+              const hasFinalLesson = Boolean(selectedStep3Slot.lesson);
+              const modeBadgeLabel =
+                workbenchMode === 'agent'
+                  ? 'Agent 工作台'
+                  : workbenchMode === 'api'
+                  ? 'API 工作台'
+                  : 'Chat 模式工作台';
+
+              return (
+              <div
+                data-testid="step3-chat-workbench"
+                className="border border-neutral-800 bg-neutral-950/90 rounded-lg p-4 space-y-3.5 text-xs"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-neutral-900 pb-3">
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="px-2 py-0.5 bg-white text-black font-mono font-semibold rounded text-[11px]">
+                        {modeBadgeLabel}
+                      </span>
+                      <span className="font-semibold text-white text-sm">
+                        当前目标小节：{secId}（第 {selectedStep3Slot.dayIndex} 讲）
+                      </span>
+                      {boundSegs.map((seg) => (
+                        <span
+                          key={seg.sectionId}
+                          className="font-mono text-[11px] px-2 py-0.5 rounded border border-neutral-800 bg-black text-neutral-300"
+                        >
+                          {seg.segmentFileName || `${seg.sectionId}.pdf`} (p.{seg.physicalStartPage}–{seg.physicalEndPage})
+                        </span>
+                      ))}
+                      {pdfCoverageStats.totalRegions > 0 && (
+                        <span
+                          data-testid="step3-region-coverage"
+                          className={`font-mono text-[11px] px-2 py-0.5 rounded border ${
+                            pdfCoverageStats.uncoveredIds.length === 0
+                              ? 'border-sky-800/70 bg-sky-950/30 text-sky-300'
+                              : 'border-amber-800/70 bg-amber-950/40 text-amber-300'
+                          }`}
+                        >
+                          PDF 区域覆盖 {pdfCoverageStats.coveredCount}/{pdfCoverageStats.totalRegions}
+                          {pdfCoverageStats.uncoveredIds.length > 0
+                            ? `（未绑定: ${pdfCoverageStats.uncoveredIds.join(', ')}）`
+                            : ' · 100%'}
+                        </span>
+                      )}
+                      <span
+                        data-testid="step3-slot-stage-status"
+                        className={`font-mono text-[11px] px-2 py-0.5 rounded border ${
+                          hasFinalLesson
+                            ? 'border-emerald-800/70 bg-emerald-950/40 text-emerald-300'
+                            : hasStage1
+                            ? 'border-sky-800/70 bg-sky-950/40 text-sky-300'
+                            : 'border-amber-800/70 bg-amber-950/30 text-amber-300'
+                        }`}
+                      >
+                        {hasFinalLesson
+                          ? '已完成终稿（支持局部补丁或重跑任意阶段）'
+                          : hasStage1
+                          ? `阶段一已存${pendingStep3Specs.length > 0 ? ` · ${pendingStep3Specs.length} 张图示待生成` : ' · 待最终保存'}`
+                          : '待生成阶段一内容'}
+                      </span>
+                    </div>
+                    <p className="text-neutral-400">
+                      两阶段流水线：阶段一专注教学正文、推导与图示规格 ➔ 阶段二仅按图示规格生成 SVG 并自动组装（无需重复上传 PDF）；任一阶段失败可单独重试且不丢失另一阶段成果。
+                    </p>
+                  </div>
+
+                  {/* 快速切换小节选择器 */}
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {effectiveSlots.map((s) => {
+                      const sId = ensureStableSectionId(s.dayIndex, s.id);
+                      const isSelected = s.dayIndex === selectedStep3Slot.dayIndex;
+                      const segs = resolveSlotPdfSegments(s, draftSplitPlan);
+                      const regionBadge = segs
+                        .map((seg) => seg.sectionId.replace(/^region-/i, 'R'))
+                        .join('+');
+                      return (
+                        <button
+                          key={sId}
+                          type="button"
+                          data-testid={`step3-chat-tab-${s.dayIndex}`}
+                          title={
+                            segs.length > 0
+                              ? `${sId} · ${s.title}（绑定 ${segs.map((seg) => seg.segmentFileName || `${seg.sectionId}.pdf`).join(' + ')}）`
+                              : `${sId} · ${s.title}`
+                          }
+                          onClick={() => {
+                            setSelectedStep3ChatDay(s.dayIndex);
+                            setStep3ImportNotice(null);
+                          }}
+                          className={`px-2 py-1 rounded font-mono text-[11px] border transition-colors inline-flex items-center gap-1 ${
+                            isSelected
+                              ? 'bg-white text-black border-white font-semibold'
+                              : s.lesson
+                              ? 'bg-emerald-950/30 text-emerald-300 border-emerald-800/60 hover:border-emerald-500'
+                              : s.stage1Draft
+                              ? 'bg-sky-950/30 text-sky-300 border-sky-800/60 hover:border-sky-500'
+                              : 'bg-black text-neutral-300 border-neutral-800 hover:border-neutral-600'
+                          }`}
+                        >
+                          <span>{sId}</span>
+                          {regionBadge && (
+                            <span className="text-[10px] opacity-75">[{regionBadge}]</span>
+                          )}
+                          <span>{s.lesson ? '✓' : s.stage1Draft ? '①' : '·'}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Agent 模式本地两阶段执行栏 */}
+                {workbenchMode === 'agent' && (
+                  <div
+                    data-testid="step3-agent-panel"
+                    className="border border-sky-900/60 bg-sky-950/15 rounded p-3 space-y-2.5"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="space-y-0.5">
+                        <div className="text-sky-200 font-semibold">
+                          Agent 两阶段本地执行指引（{courseRelDir}/lessons/{secId}.stage1.json ➔ {secId}.json）
+                        </div>
+                        <div className="text-[11px] text-neutral-400">
+                          Agent 在本地读取对应分段 PDF 与上下文，先写出 stage1 JSON，再仅根据 stage1 中的图示规格生成 SVG 并合并为最终课件。
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleCopySectionStagePrompt(selectedStep3Slot.dayIndex, 'agent_full', false)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors"
+                        >
+                          {copiedKey === `agent_full-${selectedStep3Slot.dayIndex}` ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                          <span>复制全课程 Agent 总指令</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleCopySectionStagePrompt(selectedStep3Slot.dayIndex, 'agent_stage1', false)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors"
+                        >
+                          {copiedKey === `agent_stage1-${selectedStep3Slot.dayIndex}` ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-600" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                          <span>复制本节 Agent 阶段一指令</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleCopySectionStagePrompt(selectedStep3Slot.dayIndex, 'agent_stage2', false)}
+                          disabled={!hasStage1}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 rounded transition-colors disabled:opacity-45"
+                        >
+                          {copiedKey === `agent_stage2-${selectedStep3Slot.dayIndex}` ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                          <span>复制本节 Agent 阶段二 SVG 指令</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleInlineAgentSync}
+                          disabled={isSyncingAgentInline}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-emerald-700/80 hover:border-emerald-400 bg-emerald-950/30 text-emerald-200 rounded transition-colors disabled:opacity-50"
+                        >
+                          <FolderSync className={`w-3.5 h-3.5 ${isSyncingAgentInline ? 'animate-spin' : ''}`} />
+                          <span>{isSyncingAgentInline ? '扫描同步中...' : '同步磁盘成果'}</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* 两阶段 / 局部补丁标签切换条 */}
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="inline-flex flex-wrap items-center gap-1.5 bg-black border border-neutral-800 rounded p-1">
+                    <button
+                      type="button"
+                      data-testid="step3-stage-tab-stage1"
+                      onClick={() => setStep3StageTab('stage1')}
+                      className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                        step3StageTab === 'stage1'
+                          ? 'bg-white text-black'
+                          : 'text-neutral-300 hover:text-white'
+                      }`}
+                    >
+                      ① 阶段一：内容与图示规格{selectedStep3Slot.stage1Draft ? ' ✓' : ''}
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="step3-stage-tab-stage2"
+                      onClick={() => setStep3StageTab('stage2')}
+                      className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                        step3StageTab === 'stage2'
+                          ? 'bg-white text-black'
+                          : hasStage1
+                          ? 'text-sky-300 hover:text-white'
+                          : 'text-neutral-500 hover:text-neutral-300'
+                      }`}
+                    >
+                      ② 阶段二：SVG 图示与组装{pendingStep3Specs.length > 0 ? ` (${pendingStep3Specs.length})` : ''}
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="step3-stage-tab-patch"
+                      onClick={() => setStep3StageTab('patch')}
+                      className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+                        step3StageTab === 'patch'
+                          ? 'bg-white text-black'
+                          : 'text-neutral-300 hover:text-white'
+                      }`}
+                    >
+                      局部补丁 / 单次完整导入{hasFinalLesson ? ' ✓' : ''}
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
+                    <button
+                      type="button"
+                      onClick={() => handleGenerateSingleSectionApi(selectedStep3Slot.dayIndex, 'stage1')}
+                      disabled={generatingDayIndex !== null || isGeneratingBatch}
+                      className="px-2.5 py-1 border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded disabled:opacity-50"
+                      title="通过 API 仅重跑或生成阶段一（保留既有终稿直至新内容保存，失败不清空）"
+                    >
+                      API 仅执行阶段一
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleGenerateSingleSectionApi(selectedStep3Slot.dayIndex, 'stage2')}
+                      disabled={!hasStage1 || generatingDayIndex !== null || isGeneratingBatch}
+                      className="px-2.5 py-1 border border-sky-800/80 hover:border-sky-500 text-sky-300 hover:text-white rounded disabled:opacity-45"
+                      title="仅基于阶段一规格通过 API 重跑或生成阶段二 SVG（不重写阶段一正文）"
+                    >
+                      API 仅执行阶段二 SVG
+                    </button>
+                  </div>
+                </div>
+
+                {/* ==================== TAB 1: STAGE 1 (CONTENT & DIAGRAM SPECS) ==================== */}
+                {step3StageTab === 'stage1' && (
+                  <div className="space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2 bg-black border border-neutral-900 rounded p-3">
+                      <div className="space-y-0.5 min-w-0 flex-1">
+                        <div
+                          className="text-neutral-200 font-medium truncate"
+                          dangerouslySetInnerHTML={{
+                            __html: renderInlineMathWithLatex(
+                              `① 复制阶段一提示词与材料：${selectedStep3Slot.title}`
+                            ),
+                          }}
+                        />
+                        <div className="text-[11px] text-neutral-500 truncate">
+                          生成完整教学正文、推导、例题、练习与图示规格（diagramSpecs），不直接生成复杂 SVG
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          data-testid="step3-chat-copy-prompt-btn"
+                          onClick={() =>
+                            handleCopySectionStagePrompt(selectedStep3Slot.dayIndex, 'stage1', false)
+                          }
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors"
+                        >
+                          {copiedKey === `stage1-${selectedStep3Slot.dayIndex}` ? (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-emerald-600" />
+                              <span>已复制阶段一提示词</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3.5 h-3.5" />
+                              <span>复制阶段一提示词</span>
+                            </>
+                          )}
+                        </button>
+
+                        <button
+                          type="button"
+                          data-testid="step3-chat-copy-prompt-md-btn"
+                          onClick={() =>
+                            handleCopySectionStagePrompt(selectedStep3Slot.dayIndex, 'stage1', true)
+                          }
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
+                          title="将阶段一提示词保存为 .md 文件并复制到系统剪贴板"
+                        >
+                          {copiedKey === `stage1-md-${selectedStep3Slot.dayIndex}` ? (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-emerald-400" />
+                              <span>已复制阶段一 .md</span>
+                            </>
+                          ) : (
+                            <>
+                              <FileText className="w-3.5 h-3.5" />
+                              <span>复制阶段一 .md 文件</span>
+                            </>
+                          )}
+                        </button>
+
+                        {slicedSegs.length > 0 ? (
+                          slicedSegs.map((seg) => {
+                            const segId = seg.sectionId || secId;
+                            const fileName = seg.segmentFileName || `${segId}.pdf`;
+                            const copyKey = `copy-seg-workbench-${secId}-${segId}`;
+                            return (
+                              <button
+                                key={segId}
+                                type="button"
+                                onClick={() =>
+                                  handleCopyCourseFile(`segments/${fileName}`, copyKey)
+                                }
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
+                                title={`将切分 PDF (${fileName}，物理第 ${seg.physicalStartPage}~${seg.physicalEndPage} 页) 复制到系统剪贴板`}
+                              >
+                                {copiedKey === copyKey ? (
+                                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                ) : (
+                                  <Copy className="w-3.5 h-3.5" />
+                                )}
+                                <span>
+                                  {copiedKey === copyKey
+                                    ? `已复制 ${slicedSegs.length > 1 ? fileName : '小节 PDF'}`
+                                    : `复制 ${fileName}`}
+                                </span>
+                              </button>
+                            );
+                          })
+                        ) : pdfMetas[0] ? (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleCopyCourseFile(
+                                `sources/${pdfMetas[0].fileName}`,
+                                `copy-src-workbench-${secId}`
+                              )
+                            }
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors"
+                          >
+                            {copiedKey === `copy-src-workbench-${secId}` ? (
+                              <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            ) : (
+                              <Copy className="w-3.5 h-3.5" />
+                            )}
+                            <span>复制原教材 PDF</span>
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <label
+                          htmlFor="step3-chat-paste-textarea"
+                          className="text-neutral-200 font-medium"
+                        >
+                          ② 导入或粘贴第 {selectedStep3Slot.dayIndex} 讲阶段一输出（教学正文与图示规格 JSON）：
+                        </label>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <label className="inline-flex items-center gap-1 px-2.5 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-200 hover:text-white rounded transition-colors cursor-pointer">
+                            <Upload className="w-3.5 h-3.5" />
+                            <span>导入 JSON 文件</span>
+                            <input
+                              type="file"
+                              data-testid="step3-chat-import-json-file-input"
+                              accept=".json,.txt,.md"
+                              onChange={(e) => handleStep3ImportJsonFile(e, 'stage1_or_patch')}
+                              disabled={isSavingStep3Import}
+                              className="hidden"
+                            />
+                          </label>
+                          <button
+                            type="button"
+                            data-testid="step3-chat-clipboard-paste-btn"
+                            onClick={() => handleStep3PasteFromClipboard(false, 'stage1_or_patch')}
+                            disabled={isSavingStep3Import}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 hover:text-white rounded transition-colors"
+                          >
+                            <Copy className="w-3.5 h-3.5" />
+                            <span>从剪贴板一键粘贴</span>
+                          </button>
+                          <button
+                            type="button"
+                            data-testid="step3-chat-clipboard-import-btn"
+                            onClick={() => handleStep3PasteFromClipboard(true, 'stage1_or_patch')}
+                            disabled={isSavingStep3Import}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 bg-sky-400 text-black hover:bg-sky-300 font-medium rounded transition-colors disabled:opacity-50"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                            <span>粘贴并保存阶段一</span>
+                          </button>
+                          {step3RawImportText && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setStep3RawImportText('');
+                                setStep3ImportNotice(null);
+                                step3TextareaRef.current?.focus();
+                              }}
+                              className="px-2 py-1 border border-neutral-800 hover:border-neutral-600 text-neutral-400 hover:text-white rounded"
+                            >
+                              清空
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      <textarea
+                        ref={step3TextareaRef}
+                        id="step3-chat-paste-textarea"
+                        data-testid="step3-chat-paste-textarea"
+                        rows={5}
+                        value={step3RawImportText}
+                        onChange={(e) => {
+                          setStep3RawImportText(e.target.value);
+                          if (step3ImportNotice) setStep3ImportNotice(null);
+                        }}
+                        placeholder={`在此粘贴 AI 返回的第 ${selectedStep3Slot.dayIndex} 讲阶段一 JSON（包含 markdownBody 与 diagrams/topologySpec，暂不含 SVG）；系统会自动抽取图示规格供阶段二使用...`}
+                        className="w-full bg-black border border-neutral-800 rounded p-3 text-xs font-mono text-neutral-100 leading-relaxed focus:outline-none focus:border-neutral-500"
+                      />
+
+                      {step3ImportAudit && (
+                        <div
+                          data-testid="step3-chat-render-audit"
+                          className={`rounded border p-3 space-y-2 ${
+                            step3ImportAudit.report.issues.length > 0
+                              ? 'border-red-900/70 bg-red-950/25 text-neutral-200'
+                              : 'border-emerald-900/60 bg-emerald-950/20 text-emerald-300'
+                          }`}
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 font-medium">
+                              {step3ImportAudit.report.issues.length > 0 ? (
+                                <>
+                                  <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                                  <span className="text-red-200">
+                                    {step3ImportAudit.report.summaryText}
+                                  </span>
+                                </>
+                              ) : (
+                                <>
+                                  <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+                                  <span>
+                                    阶段一校验通过 ·{' '}
+                                    {step3ImportAudit.parsedLesson
+                                      ? `待阶段二绘制 ${extractPendingDiagramSpecs(step3ImportAudit.parsedLesson).length} 张 SVG`
+                                      : step3ImportAudit.report.summaryText}
+                                  </span>
+                                </>
+                              )}
+                            </div>
+
+                            {step3ImportAudit.report.issues.length > 0 && (
+                              <div className="flex flex-wrap items-center gap-2">
+                                <button
+                                  type="button"
+                                  data-testid="step3-chat-copy-repair-btn"
+                                  onClick={() =>
+                                    triggerCopyFeedback(
+                                      'step3-repair-prompt',
+                                      step3ImportAudit.report.repairPrompt
+                                    )
+                                  }
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors"
+                                >
+                                  {copiedKey === 'step3-repair-prompt' ? (
+                                    <>
+                                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                      <span>已复制局部修复提示词</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Copy className="w-3.5 h-3.5" />
+                                      <span>复制局部修复提示词</span>
+                                    </>
+                                  )}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setShowStep3IssueDetails((v) => !v)}
+                                  className="px-2 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-300 rounded"
+                                >
+                                  {showStep3IssueDetails ? '收起错误详情' : '查看错误详情'}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+
+                          {showStep3IssueDetails && step3ImportAudit.report.issues.length > 0 && (
+                            <ul className="space-y-1.5 pt-2 border-t border-red-900/50 text-[11px] text-red-100/90">
+                              {step3ImportAudit.report.issues.map((issue, idx) => (
+                                <li
+                                  key={`${issue.id}-${idx}`}
+                                  className="bg-black/50 border border-red-900/40 rounded px-2.5 py-1.5"
+                                >
+                                  <div className="font-medium text-red-200">
+                                    {issue.categoryLabel}
+                                    {issue.locationLabel ? ` · ${issue.locationLabel}` : ''}
+                                  </div>
+                                  <div className="text-neutral-300 mt-0.5">{issue.detail}</div>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+
+                          {step3ImportAudit.report.issues.length > 0 &&
+                            step3ImportAudit.parsedLesson && (
+                              <div
+                                data-testid="step3-chat-patch-box"
+                                className="pt-2.5 mt-1 border-t border-red-900/50 space-y-2"
+                              >
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <span className="text-[11px] text-neutral-200">
+                                    可在此粘贴阶段一局部补丁并直接合并到当前待保存草稿：
+                                  </span>
+                                  <div className="flex items-center gap-2 shrink-0">
+                                    <button
+                                      type="button"
+                                      data-testid="step3-chat-paste-patch-btn"
+                                      onClick={handleStep3PastePatchFromClipboard}
+                                      className="inline-flex items-center gap-1 px-2 py-1 border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 hover:text-white rounded transition-colors"
+                                    >
+                                      <Copy className="w-3 h-3" />
+                                      <span>粘贴并合并补丁</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      data-testid="step3-chat-apply-patch-btn"
+                                      onClick={() => handleApplyStep3DraftPatch()}
+                                      disabled={!step3PatchText.trim()}
+                                      className="inline-flex items-center gap-1 px-2.5 py-1 bg-sky-400 text-black hover:bg-sky-300 font-medium rounded transition-colors disabled:opacity-50"
+                                    >
+                                      <Check className="w-3 h-3" />
+                                      <span>合并补丁</span>
+                                    </button>
+                                  </div>
+                                </div>
+                                <textarea
+                                  rows={3}
+                                  value={step3PatchText}
+                                  onChange={(e) => setStep3PatchText(e.target.value)}
+                                  placeholder='粘贴局部补丁 JSON（如 {"textReplacements": [...], "diagramsToUpsert": [...]}）...'
+                                  className="w-full bg-black border border-neutral-800 rounded p-2 text-[11px] font-mono text-neutral-100 focus:outline-none focus:border-sky-600"
+                                />
+                              </div>
+                            )}
+                        </div>
+                      )}
+
+                      {step3ImportNotice && (
+                        <div
+                          data-testid="step3-chat-import-notice"
+                          className={`px-3 py-2 rounded border text-xs ${
+                            step3ImportNotice.ok
+                              ? 'border-emerald-800/70 bg-emerald-950/30 text-emerald-200'
+                              : 'border-red-800/70 bg-red-950/30 text-red-200'
+                          }`}
+                        >
+                          {step3ImportNotice.message}
+                        </div>
+                      )}
+
+                      <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+                        <button
+                          type="button"
+                          data-testid="step3-chat-preview-btn"
+                          onClick={handlePreviewStep3Import}
+                          disabled={!step3RawImportText.trim()}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-sky-700/80 hover:border-sky-400 bg-sky-950/30 text-sky-200 hover:text-white rounded transition-colors disabled:opacity-50"
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                          <span>预览阶段一（不保存）</span>
+                        </button>
+                        {step3ImportAudit?.parsedLesson &&
+                          extractPendingDiagramSpecs(step3ImportAudit.parsedLesson).length === 0 && (
+                            <button
+                              type="button"
+                              onClick={() => handleSaveStep3Stage1({ finalizeDirect: true })}
+                              disabled={isSavingStep3Import}
+                              className="px-3 py-1.5 border border-emerald-700/80 hover:border-emerald-400 bg-emerald-950/30 text-emerald-200 hover:text-white rounded transition-colors disabled:opacity-50"
+                            >
+                              无待绘 SVG · 直接保存为最终课件
+                            </button>
+                          )}
+                        <button
+                          type="button"
+                          data-testid="step3-save-stage1-btn"
+                          onClick={() => handleSaveStep3Stage1({ finalizeDirect: false })}
+                          disabled={isSavingStep3Import || !step3RawImportText.trim()}
+                          className="inline-flex items-center gap-1.5 px-4 py-1.5 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors disabled:opacity-50"
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                          <span>
+                            {isSavingStep3Import ? '正在保存阶段一...' : '保存阶段一成果 ➔ 进入图示生成'}
+                          </span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* ==================== TAB 2: STAGE 2 (DIAGRAM SPECS -> SVG -> MERGE) ==================== */}
+                {step3StageTab === 'stage2' && (
+                  <div className="space-y-3" data-testid="step3-stage2-panel">
+                    {!step3Stage1BaseLesson ? (
+                      <div className="border border-dashed border-neutral-800 rounded p-4 text-neutral-400 space-y-2">
+                        <div>当前第 {selectedStep3Slot.dayIndex} 讲尚未保存阶段一成果。</div>
+                        <button
+                          type="button"
+                          onClick={() => setStep3StageTab('stage1')}
+                          className="px-3 py-1.5 bg-white text-black font-medium rounded hover:bg-neutral-200"
+                        >
+                          先前往阶段一生成/导入内容 →
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        {/* 已保存的阶段一图示规格摘要 */}
+                        <div className="bg-black border border-neutral-900 rounded p-3 space-y-2">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="space-y-0.5">
+                              <div className="text-neutral-200 font-medium">
+                                ① 复用阶段一图示规格（无需重新上传教材 PDF · 阶段一成果已安全保存）
+                              </div>
+                              <div className="text-[11px] text-neutral-500">
+                                系统已提取阶段一全部待绘制规格（共 {pendingStep3Specs.length} 张）；阶段二仅输出 SVG JSON 并自动回填。
+                              </div>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2 shrink-0">
+                              <button
+                                type="button"
+                                data-testid="step3-copy-stage2-prompt-btn"
+                                onClick={() =>
+                                  handleCopySectionStagePrompt(
+                                    selectedStep3Slot.dayIndex,
+                                    'stage2',
+                                    false
+                                  )
+                                }
+                                disabled={pendingStep3Specs.length === 0}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors disabled:opacity-45"
+                              >
+                                {copiedKey === `stage2-${selectedStep3Slot.dayIndex}` ? (
+                                  <>
+                                    <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                    <span>已复制阶段二 SVG 提示词</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy className="w-3.5 h-3.5" />
+                                    <span>复制阶段二 SVG 提示词</span>
+                                  </>
+                                )}
+                              </button>
+                              <button
+                                type="button"
+                                data-testid="step3-copy-stage2-prompt-md-btn"
+                                onClick={() =>
+                                  handleCopySectionStagePrompt(
+                                    selectedStep3Slot.dayIndex,
+                                    'stage2',
+                                    true
+                                  )
+                                }
+                                disabled={pendingStep3Specs.length === 0}
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors disabled:opacity-45"
+                              >
+                                <FileText className="w-3.5 h-3.5" />
+                                <span>复制阶段二 .md 文件</span>
+                              </button>
+                            </div>
+                          </div>
+
+                          {pendingStep3Specs.length > 0 ? (
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-2 pt-1">
+                              {pendingStep3Specs.map((spec) => (
+                                <div
+                                  key={spec.id}
+                                  className="border border-neutral-800 bg-neutral-950 rounded px-2.5 py-2 space-y-1"
+                                >
+                                  <div className="flex items-center justify-between gap-2 font-mono text-[11px]">
+                                    <span className="text-sky-300 font-semibold">{spec.id}</span>
+                                    <span className="text-neutral-400 truncate">{spec.title}</span>
+                                  </div>
+                                  <div className="text-[11px] text-neutral-400 line-clamp-2">
+                                    {spec.topologySpec || spec.caption || '待绘制图示'}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="text-[11px] text-emerald-300">
+                              ✓ 当前阶段一中的所有图示均已包含有效 SVG（或本节无需额外图示）。
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="space-y-2">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <label
+                              htmlFor="step3-stage2-textarea"
+                              className="text-neutral-200 font-medium"
+                            >
+                              ② 粘贴或导入阶段二 AI 返回的 SVG JSON（仅含 diagrams 数组）：
+                            </label>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <label className="inline-flex items-center gap-1 px-2.5 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-200 hover:text-white rounded transition-colors cursor-pointer">
+                                <Upload className="w-3.5 h-3.5" />
+                                <span>导入阶段二 JSON</span>
+                                <input
+                                  type="file"
+                                  data-testid="step3-stage2-import-json-input"
+                                  accept=".json,.txt,.md"
+                                  onChange={(e) => handleStep3ImportJsonFile(e, 'stage2')}
+                                  disabled={isSavingStep3Import}
+                                  className="hidden"
+                                />
+                              </label>
+                              <button
+                                type="button"
+                                onClick={() => handleStep3PasteFromClipboard(false, 'stage2')}
+                                disabled={isSavingStep3Import}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 hover:text-white rounded transition-colors"
+                              >
+                                <Copy className="w-3.5 h-3.5" />
+                                <span>从剪贴板粘贴</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleStep3PasteFromClipboard(true, 'stage2')}
+                                disabled={isSavingStep3Import}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 bg-sky-400 text-black hover:bg-sky-300 font-medium rounded transition-colors disabled:opacity-50"
+                              >
+                                <Check className="w-3.5 h-3.5" />
+                                <span>粘贴并组装保存</span>
+                              </button>
+                              {step3Stage2Text && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setStep3Stage2Text('');
+                                    setStep3ImportNotice(null);
+                                  }}
+                                  className="px-2 py-1 border border-neutral-800 hover:border-neutral-600 text-neutral-400 hover:text-white rounded"
+                                >
+                                  清空
+                                </button>
+                              )}
+                            </div>
+                          </div>
+
+                          <textarea
+                            ref={step3Stage2TextareaRef}
+                            id="step3-stage2-textarea"
+                            data-testid="step3-stage2-textarea"
+                            rows={5}
+                            value={step3Stage2Text}
+                            onChange={(e) => {
+                              setStep3Stage2Text(e.target.value);
+                              if (step3ImportNotice) setStep3ImportNotice(null);
+                            }}
+                            placeholder='在此粘贴阶段二返回的 {"diagrams": [{"id": "...", "svgCode": "<svg ...>...</svg>", "caption": "..."}]}...'
+                            className="w-full bg-black border border-neutral-800 rounded p-3 text-xs font-mono text-neutral-100 leading-relaxed focus:outline-none focus:border-neutral-500"
+                          />
+
+                          {step3Stage2MergePreview && (
+                            <div
+                              data-testid="step3-stage2-audit"
+                              className={`rounded border p-3 space-y-2 ${
+                                step3Stage2MergePreview.error ||
+                                (step3Stage2MergePreview.report?.issues.length || 0) > 0
+                                  ? 'border-red-900/70 bg-red-950/25 text-neutral-200'
+                                  : 'border-emerald-900/60 bg-emerald-950/20 text-emerald-300'
+                              }`}
+                            >
+                              {step3Stage2MergePreview.error ? (
+                                <div className="flex items-center gap-2 text-red-200">
+                                  <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                                  <span>{step3Stage2MergePreview.error}</span>
+                                </div>
+                              ) : (
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <div className="flex items-center gap-2 font-medium">
+                                    {(step3Stage2MergePreview.report?.issues.length || 0) > 0 ? (
+                                      <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                                    ) : (
+                                      <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+                                    )}
+                                    <span>
+                                      预合并成功：匹配更新 {step3Stage2MergePreview.matchedCount} 张
+                                      {step3Stage2MergePreview.addedCount > 0
+                                        ? ` + 新增 ${step3Stage2MergePreview.addedCount} 张`
+                                        : ''}
+                                      {step3Stage2MergePreview.pendingRemaining.length > 0
+                                        ? ` · 尚缺图示 ID: ${step3Stage2MergePreview.pendingRemaining
+                                            .map((p) => p.id)
+                                            .join(', ')}`
+                                        : ''}
+                                      {' · '}
+                                      {step3Stage2MergePreview.report?.summaryText}
+                                    </span>
+                                  </div>
+                                  {(step3Stage2MergePreview.report?.issues.length || 0) > 0 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setShowStep3IssueDetails((v) => !v)}
+                                      className="px-2 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-300 rounded"
+                                    >
+                                      {showStep3IssueDetails ? '收起错误详情' : '查看错误详情'}
+                                    </button>
+                                  )}
+                                </div>
+                              )}
+                              {showStep3IssueDetails &&
+                                step3Stage2MergePreview.report &&
+                                step3Stage2MergePreview.report.issues.length > 0 && (
+                                  <ul className="space-y-1 pt-2 border-t border-red-900/50 text-[11px] text-red-100/90">
+                                    {step3Stage2MergePreview.report.issues.map((issue, idx) => (
+                                      <li key={`${issue.id}-${idx}`}>
+                                        <strong>{issue.categoryLabel}：</strong>
+                                        {issue.detail}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                )}
+                            </div>
+                          )}
+
+                          {step3ImportNotice && (
+                            <div
+                              data-testid="step3-chat-import-notice"
+                              className={`px-3 py-2 rounded border text-xs ${
+                                step3ImportNotice.ok
+                                  ? 'border-emerald-800/70 bg-emerald-950/30 text-emerald-200'
+                                  : 'border-red-800/70 bg-red-950/30 text-red-200'
+                              }`}
+                            >
+                              {step3ImportNotice.message}
+                            </div>
+                          )}
+
+                          <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+                            <button
+                              type="button"
+                              data-testid="step3-chat-preview-btn"
+                              onClick={handlePreviewStep3Stage2Merged}
+                              disabled={!step3Stage2MergePreview?.mergedLesson && !step3Stage1BaseLesson}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-sky-700/80 hover:border-sky-400 bg-sky-950/30 text-sky-200 hover:text-white rounded transition-colors disabled:opacity-50"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                              <span>预览组装课件（不保存）</span>
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="step3-chat-save-open-btn"
+                              onClick={() =>
+                                handleSaveStep3Stage2Merge({
+                                  openAfterSave: true,
+                                  advanceToNext: false,
+                                })
+                              }
+                              disabled={isSavingStep3Import || !step3Stage2MergePreview?.mergedLesson}
+                              className="px-3 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 hover:text-white rounded transition-colors disabled:opacity-50"
+                            >
+                              组装保存并立即阅读
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="step3-chat-save-next-btn"
+                              onClick={() =>
+                                handleSaveStep3Stage2Merge({
+                                  openAfterSave: false,
+                                  advanceToNext: true,
+                                })
+                              }
+                              disabled={isSavingStep3Import || !step3Stage2MergePreview?.mergedLesson}
+                              className="inline-flex items-center gap-1.5 px-4 py-1.5 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors disabled:opacity-50"
+                            >
+                              <Check className="w-3.5 h-3.5" />
+                              <span>
+                                {isSavingStep3Import
+                                  ? '正在组装保存...'
+                                  : '组装保存最终课件并切换下一节 →'}
+                              </span>
+                            </button>
+                          </div>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {/* ==================== TAB 3: PATCH & SINGLE-SHOT FULL IMPORT ==================== */}
+                {step3StageTab === 'patch' && (
+                  <div className="space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2 bg-black border border-neutral-900 rounded p-3">
+                      <div className="space-y-0.5 min-w-0 flex-1">
+                        <div className="text-neutral-200 font-medium truncate">
+                          局部补丁修复 / 单次完整导入：{selectedStep3Slot.title}
+                        </div>
+                        <div className="text-[11px] text-neutral-500 truncate">
+                          支持对已有最终课件直接粘贴补丁（textReplacements / diagramsToUpsert / &lt;svg&gt;），或导入完整单节 JSON
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          data-testid="step3-chat-copy-prompt-btn"
+                          onClick={() => handleCopySectionLessonPrompt(selectedStep3Slot.dayIndex)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors"
+                        >
+                          {copiedKey === `legacy-${selectedStep3Slot.dayIndex}` ? (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-emerald-600" />
+                              <span>已复制本节完整提示词</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="w-3.5 h-3.5" />
+                              <span>复制单次完整提示词</span>
+                            </>
+                          )}
+                        </button>
+
+                        <button
+                          type="button"
+                          data-testid="step3-chat-copy-prompt-md-btn"
+                          onClick={() => handleCopySectionPromptMd(selectedStep3Slot.dayIndex)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
+                          title="将本节提示词保存为 .md 文件并复制到系统剪贴板"
+                        >
+                          {copiedKey === `legacy-md-${selectedStep3Slot.dayIndex}` ? (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-emerald-400" />
+                              <span>已复制 .md 提示词</span>
+                            </>
+                          ) : (
+                            <>
+                              <FileText className="w-3.5 h-3.5" />
+                              <span>复制 .md 提示词文件</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <label
+                          htmlFor="step3-chat-paste-textarea"
+                          className="text-neutral-200 font-medium"
+                        >
+                          粘贴第 {selectedStep3Slot.dayIndex} 讲完整课件 JSON 或局部修复补丁：
+                        </label>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <label className="inline-flex items-center gap-1 px-2.5 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-200 hover:text-white rounded transition-colors cursor-pointer">
+                            <Upload className="w-3.5 h-3.5" />
+                            <span>导入 JSON 文件</span>
+                            <input
+                              type="file"
+                              data-testid="step3-chat-import-json-file-input"
+                              accept=".json,.txt,.md"
+                              onChange={(e) => handleStep3ImportJsonFile(e, 'stage1_or_patch')}
+                              disabled={isSavingStep3Import}
+                              className="hidden"
+                            />
+                          </label>
+                          <button
+                            type="button"
+                            data-testid="step3-chat-clipboard-paste-btn"
+                            onClick={() => handleStep3PasteFromClipboard(false, 'stage1_or_patch')}
+                            disabled={isSavingStep3Import}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 hover:text-white rounded transition-colors"
+                          >
+                            <Copy className="w-3.5 h-3.5" />
+                            <span>从剪贴板一键粘贴</span>
+                          </button>
+                          <button
+                            type="button"
+                            data-testid="step3-chat-clipboard-import-btn"
+                            onClick={() => handleStep3PasteFromClipboard(true, 'stage1_or_patch')}
+                            disabled={isSavingStep3Import}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 bg-sky-400 text-black hover:bg-sky-300 font-medium rounded transition-colors disabled:opacity-50"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                            <span>从剪贴板粘贴并立即保存</span>
+                          </button>
+                          {step3RawImportText && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setStep3RawImportText('');
+                                setStep3ImportNotice(null);
+                                step3TextareaRef.current?.focus();
+                              }}
+                              className="px-2 py-1 border border-neutral-800 hover:border-neutral-600 text-neutral-400 hover:text-white rounded"
+                            >
+                              清空
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      <textarea
+                        ref={step3TextareaRef}
+                        id="step3-chat-paste-textarea"
+                        data-testid="step3-chat-paste-textarea"
+                        rows={5}
+                        value={step3RawImportText}
+                        onChange={(e) => {
+                          setStep3RawImportText(e.target.value);
+                          if (step3ImportNotice) setStep3ImportNotice(null);
+                        }}
+                        placeholder={
+                          selectedStep3Slot.lesson
+                            ? '当前小节已有课件：可在此粘贴增量修复补丁（{"textReplacements": [...], "diagramsToUpsert": [...]} 或单独 <svg>...</svg>）局部合并，或粘贴完整课件覆盖更新...'
+                            : '在此按 Ctrl+V / Cmd+V 直接粘贴外部 AI 输出的第 ' +
+                              selectedStep3Slot.dayIndex +
+                              ' 讲完整课件 JSON 代码块（或 Markdown）...'
+                        }
+                        className="w-full bg-black border border-neutral-800 rounded p-3 text-xs font-mono text-neutral-100 leading-relaxed focus:outline-none focus:border-neutral-500"
+                      />
+
+                      {step3ImportAudit && (
+                        <div
+                          data-testid="step3-chat-render-audit"
+                          className={`rounded border p-3 space-y-2 ${
+                            step3ImportAudit.report.issues.length > 0
+                              ? 'border-red-900/70 bg-red-950/25 text-neutral-200'
+                              : 'border-emerald-900/60 bg-emerald-950/20 text-emerald-300'
+                          }`}
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 font-medium">
+                              {step3ImportAudit.report.issues.length > 0 ? (
+                                <>
+                                  <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
+                                  <span className="text-red-200">
+                                    {step3ImportAudit.appliedSummary
+                                      ? `${step3ImportAudit.appliedSummary} · `
+                                      : ''}
+                                    {step3ImportAudit.report.summaryText}
+                                  </span>
+                                </>
+                              ) : (
+                                <>
+                                  <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+                                  <span>
+                                    {step3ImportAudit.appliedSummary
+                                      ? `${step3ImportAudit.appliedSummary} · `
+                                      : ''}
+                                    {step3ImportAudit.report.summaryText}
+                                  </span>
+                                </>
+                              )}
+                            </div>
+
+                            {step3ImportAudit.report.issues.length > 0 && (
+                              <div className="flex flex-wrap items-center gap-2">
+                                <button
+                                  type="button"
+                                  data-testid="step3-chat-copy-repair-btn"
+                                  onClick={() => {
+                                    triggerCopyFeedback(
+                                      'step3-repair-prompt',
+                                      step3ImportAudit.report.repairPrompt
+                                    );
+                                  }}
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors"
+                                >
+                                  {copiedKey === 'step3-repair-prompt' ? (
+                                    <>
+                                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                                      <span>已复制增量补丁提示词</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Copy className="w-3.5 h-3.5" />
+                                      <span>复制增量补丁提示词（不重生成全文）</span>
+                                    </>
+                                  )}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setShowStep3IssueDetails((v) => !v)}
+                                  className="px-2 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-300 rounded"
+                                >
+                                  {showStep3IssueDetails ? '收起错误详情' : '查看错误详情'}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+
+                          {showStep3IssueDetails && step3ImportAudit.report.issues.length > 0 && (
+                            <ul className="space-y-1.5 pt-2 border-t border-red-900/50 text-[11px] text-red-100/90">
+                              {step3ImportAudit.report.issues.map((issue, idx) => (
+                                <li
+                                  key={`${issue.id}-${idx}`}
+                                  className="bg-black/50 border border-red-900/40 rounded px-2.5 py-1.5"
+                                >
+                                  <div className="font-medium text-red-200">
+                                    {issue.categoryLabel}
+                                    {issue.locationLabel ? ` · ${issue.locationLabel}` : ''}
+                                  </div>
+                                  <div className="text-neutral-300 mt-0.5">{issue.detail}</div>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+
+                          {step3ImportAudit.report.issues.length > 0 &&
+                            step3ImportAudit.parsedLesson && (
+                              <div
+                                data-testid="step3-chat-patch-box"
+                                className="pt-2.5 mt-1 border-t border-red-900/50 space-y-2"
+                              >
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <span className="text-[11px] text-neutral-200">
+                                    无需保存错误草稿，也无需把补丁接在原 JSON 后面；复制上方「增量补丁提示词」给 AI 后，在此粘贴补丁并合并到当前待保存课件：
+                                  </span>
+                                  <div className="flex items-center gap-2 shrink-0">
+                                    <button
+                                      type="button"
+                                      data-testid="step3-chat-paste-patch-btn"
+                                      onClick={handleStep3PastePatchFromClipboard}
+                                      className="inline-flex items-center gap-1 px-2 py-1 border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 hover:text-white rounded transition-colors"
+                                    >
+                                      <Copy className="w-3 h-3" />
+                                      <span>从剪贴板粘贴并合并补丁</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      data-testid="step3-chat-apply-patch-btn"
+                                      onClick={() => handleApplyStep3DraftPatch()}
+                                      disabled={!step3PatchText.trim()}
+                                      className="inline-flex items-center gap-1 px-2.5 py-1 bg-sky-400 text-black hover:bg-sky-300 font-medium rounded transition-colors disabled:opacity-50"
+                                    >
+                                      <Check className="w-3 h-3" />
+                                      <span>合并补丁到当前课件</span>
+                                    </button>
+                                  </div>
+                                </div>
+                                <textarea
+                                  rows={3}
+                                  value={step3PatchText}
+                                  onChange={(e) => setStep3PatchText(e.target.value)}
+                                  placeholder='在此粘贴 AI 返回的增量修复补丁（如 {"textReplacements": [...], "diagramsToUpsert": [...]} 或 <svg>...</svg>），合并后将自动更新上方待保存课件并重新自检...'
+                                  className="w-full bg-black border border-neutral-800 rounded p-2 text-[11px] font-mono text-neutral-100 focus:outline-none focus:border-sky-600"
+                                />
+                              </div>
+                            )}
+                        </div>
+                      )}
+
+                      {step3ImportNotice && (
+                        <div
+                          data-testid="step3-chat-import-notice"
+                          className={`px-3 py-2 rounded border text-xs ${
+                            step3ImportNotice.ok
+                              ? 'border-emerald-800/70 bg-emerald-950/30 text-emerald-200'
+                              : 'border-red-800/70 bg-red-950/30 text-red-200'
+                          }`}
+                        >
+                          {step3ImportNotice.message}
+                        </div>
+                      )}
+
+                      <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+                        <button
+                          type="button"
+                          data-testid="step3-chat-preview-btn"
+                          onClick={handlePreviewStep3Import}
+                          disabled={!step3RawImportText.trim()}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-sky-700/80 hover:border-sky-400 bg-sky-950/30 text-sky-200 hover:text-white rounded transition-colors disabled:opacity-50"
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                          <span>预览课件（不保存）</span>
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="step3-chat-save-open-btn"
+                          onClick={() =>
+                            handleSaveStep3ChatImport({
+                              openAfterSave: true,
+                              advanceToNext: false,
+                            })
+                          }
+                          disabled={isSavingStep3Import || !step3RawImportText.trim()}
+                          className="px-3 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 hover:text-white rounded transition-colors disabled:opacity-50"
+                        >
+                          保存并立即阅读本讲
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="step3-chat-save-next-btn"
+                          onClick={() =>
+                            handleSaveStep3ChatImport({
+                              openAfterSave: false,
+                              advanceToNext: true,
+                            })
+                          }
+                          disabled={isSavingStep3Import || !step3RawImportText.trim()}
+                          className="inline-flex items-center gap-1.5 px-4 py-1.5 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors disabled:opacity-50"
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                          <span>
+                            {isSavingStep3Import
+                              ? '正在保存课件...'
+                              : selectedStep3Slot.lesson
+                              ? '保存补丁/更新并推进下一节 →'
+                              : '保存本节课件并自动切换下一节 →'}
+                          </span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+              );
+            })()}
+
+            {draftSlots.length === 0 ? (
+              <div className="border border-dashed border-neutral-800 rounded p-6 text-center space-y-3 text-xs bg-neutral-950/30">
+                <p className="text-neutral-300 font-medium">
+                  尚未生成课程大纲（0 节），无法逐节制作课件。
+                </p>
+                <p className="text-neutral-500">
+                  请先返回第 2 步生成或导入完整课程大纲 (outline.json)，再回到本步逐节生成课件并评估学时。
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setActiveStep('outline')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs bg-white text-black font-medium rounded hover:bg-neutral-200 transition-colors"
+                >
+                  <span>返回第 2 步：生成课程大纲 →</span>
+                </button>
+              </div>
+            ) : (
+            <div className="space-y-3 max-h-[48vh] overflow-y-auto pr-1">
+              {effectiveSlots.map((slot) => {
                 const secId = ensureStableSectionId(slot.dayIndex, slot.id);
-                const seg =
-                  slot.pdfSegment ||
-                  (slot.regionId
-                    ? draftSplitPlan.find((p) => p.sectionId === slot.regionId)
-                    : undefined) ||
-                  draftSplitPlan.find(
-                    (p) => p.sectionId === secId || p.dayIndex === slot.dayIndex
-                  );
-                const segId = seg?.sectionId || secId;
+                const boundSegs = resolveSlotPdfSegments(slot, draftSplitPlan);
+                const slicedSegs = boundSegs.filter(
+                  (item) =>
+                    item.status === 'sliced' ||
+                    Boolean(item.segmentRelPath || item.segmentFileName)
+                );
                 const hasLesson = Boolean(slot.lesson);
                 const isGenThis = generatingDayIndex === slot.dayIndex;
+                const isSelectedChatSlot = selectedStep3Slot?.dayIndex === slot.dayIndex;
+                const evaluatedMinutes = getEvaluatedSectionMinutes(slot);
 
                 return (
                   <div
                     key={secId}
-                    className="border border-neutral-800 rounded p-3.5 bg-black flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs"
+                    data-testid={`step3-section-card-${slot.dayIndex}`}
+                    className={`border rounded-lg p-4 bg-black flex flex-col gap-3 text-xs transition-colors ${
+                      isSelectedChatSlot
+                        ? 'border-neutral-500 ring-1 ring-white/15'
+                        : 'border-neutral-800 hover:border-neutral-700'
+                    }`}
                   >
-                    <div className="space-y-1 flex-1 min-w-0">
-                      <div className="flex flex-wrap items-center gap-2 font-mono">
-                        <span className="px-2 py-0.5 bg-neutral-900 border border-neutral-700 rounded text-white">
+                    {/* Top Metadata Row (never crushed horizontally) */}
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-2 font-mono min-w-0">
+                        <span className="px-2 py-0.5 bg-neutral-900 border border-neutral-700 rounded text-white font-semibold">
                           {secId}
                         </span>
+                        <span className="text-neutral-300">
+                          第 {slot.dayIndex} 讲 · 排程第 {slot.scheduledDay || slot.dayIndex}/{draftDurationDays} 天
+                        </span>
+                        <span className="text-neutral-500" aria-hidden="true">
+                          ·
+                        </span>
                         <span className="text-neutral-400">
-                          第 {slot.dayIndex} 天 · {slot.date}
+                          {evaluatedMinutes !== undefined
+                            ? `预计 ${evaluatedMinutes} 分钟`
+                            : '待生成课件后评估学时'}
                         </span>
-                        <span
-                          className={
-                            hasLesson ? 'text-emerald-400' : 'text-neutral-500'
-                          }
-                        >
-                          {hasLesson
-                            ? `✅ 已生成 (lessons/${secId}.json)`
-                            : '⏳ 待生成课件'}
+                        <span className="text-neutral-500" aria-hidden="true">
+                          ·
                         </span>
-                        {seg && (
-                          <span className="text-neutral-400">
-                            · 绑定区域: {seg.segmentFileName || `${segId}.pdf`} (物理第{' '}
+                        <span className="text-neutral-500">{slot.date}</span>
+                        {boundSegs.map((seg) => (
+                          <span
+                            key={seg.sectionId}
+                            className="px-2 py-0.5 rounded border border-neutral-800 bg-neutral-950 text-neutral-300 text-[11px]"
+                          >
+                            {seg.segmentFileName || `${seg.sectionId}.pdf`} (物理第{' '}
                             {seg.physicalStartPage}~{seg.physicalEndPage} 页)
                           </span>
-                        )}
+                        ))}
                       </div>
 
+                      <span
+                        className={`font-mono text-[11px] px-2 py-0.5 rounded border shrink-0 ${
+                          hasLesson
+                            ? 'border-emerald-800/70 bg-emerald-950/30 text-emerald-300'
+                            : slot.stage1Draft
+                            ? 'border-sky-800/70 bg-sky-950/30 text-sky-300'
+                            : 'border-neutral-800 bg-neutral-950 text-neutral-400'
+                        }`}
+                      >
+                        {hasLesson
+                          ? `✅ 已生成 (lessons/${secId}.json)`
+                          : slot.stage1Draft
+                          ? `📝 阶段一已存 (${extractPendingDiagramSpecs(slot.stage1Draft).length} 图待生成)`
+                          : '⏳ 待生成课件'}
+                      </span>
+                    </div>
+
+                    {/* Full-Width Title, Objective & Scope */}
+                    <div className="space-y-1 min-w-0">
                       <div
-                        className="text-sm font-semibold text-white truncate"
+                        className="text-sm font-semibold text-white leading-snug"
                         dangerouslySetInnerHTML={{
                           __html: renderInlineMathWithLatex(slot.title),
                         }}
                       />
 
                       <div
-                        className="text-neutral-400 truncate"
+                        className="text-neutral-400 leading-relaxed"
                         dangerouslySetInnerHTML={{
                           __html: renderInlineMathWithLatex(
                             `目标：${slot.objective} · 范围：${
@@ -2317,69 +4759,139 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
 
                       {slot.assignedWords && slot.assignedWords.length > 0 && (
                         <div className="text-neutral-500 font-mono truncate">
-                          今日目标词汇 ({slot.assignedWords.length} 词)：
+                          本节目标词汇 ({slot.assignedWords.length} 词)：
                           {slot.assignedWords.map((w) => w.word).join(', ')}
                         </div>
                       )}
                     </div>
 
-                    {/* Quick Section Material Access & Generation Actions */}
-                    <div className="flex flex-wrap items-center gap-2 shrink-0">
-                      <button
-                        type="button"
-                        onClick={() => handleCopySectionLessonPrompt(slot.dayIndex)}
-                        className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
-                        title="一键复制包含课程目标、先修知识、上下文及本节范围的课件生成提示词"
-                      >
-                        {copiedKey === `prompt-${slot.dayIndex}` ? (
-                          <Check className="w-3.5 h-3.5 text-emerald-400" />
-                        ) : (
-                          <Copy className="w-3.5 h-3.5" />
-                        )}
-                        <span>
-                          {copiedKey === `prompt-${slot.dayIndex}`
-                            ? '已复制提示词'
-                            : '复制本节提示词'}
-                        </span>
-                      </button>
+                    {/* Bottom Action Bar */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-2.5 border-t border-neutral-900">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleCopySectionStagePrompt(slot.dayIndex, 'stage1', false)
+                          }
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
+                          title="复制本节阶段一提示词（教学正文与图示规格）"
+                        >
+                          {copiedKey === `stage1-${slot.dayIndex}` ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                          <span>
+                            {copiedKey === `stage1-${slot.dayIndex}`
+                              ? '已复制阶段一'
+                              : '复制阶段一提示词'}
+                          </span>
+                        </button>
 
-                      {seg?.status === 'sliced' ? (
-                        <>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleCopySectionStagePrompt(slot.dayIndex, 'stage1', true)
+                          }
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
+                          title="将阶段一提示词保存为 .md 文件并复制到系统剪贴板"
+                        >
+                          {copiedKey === `stage1-md-${slot.dayIndex}` ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          ) : (
+                            <FileText className="w-3.5 h-3.5" />
+                          )}
+                          <span>
+                            {copiedKey === `stage1-md-${slot.dayIndex}`
+                              ? '已复制 .md'
+                              : '复制阶段一 .md'}
+                          </span>
+                        </button>
+
+                        {slot.stage1Draft && (
                           <button
                             type="button"
                             onClick={() =>
-                              handleCopyCourseFile(
-                                `segments/${seg.segmentFileName || `${segId}.pdf`}`,
-                                `copy-seg-step3-${secId}`
-                              )
+                              handleCopySectionStagePrompt(slot.dayIndex, 'stage2', false)
                             }
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
-                            title="将本节 PDF 文件复制到系统剪贴板，等效在资源管理器按 Ctrl+C，可直接 Ctrl+V 粘贴"
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-sky-800/80 hover:border-sky-500 bg-sky-950/30 text-sky-200 rounded transition-colors whitespace-nowrap"
+                            title="复制阶段二 SVG 生成提示词（复用阶段一规格，无需上传 PDF）"
                           >
-                            {copiedKey === `copy-seg-step3-${secId}` ? (
+                            {copiedKey === `stage2-${slot.dayIndex}` ? (
                               <Check className="w-3.5 h-3.5 text-emerald-400" />
                             ) : (
                               <Copy className="w-3.5 h-3.5" />
                             )}
                             <span>
-                              {copiedKey === `copy-seg-step3-${secId}`
-                                ? '已复制文件'
-                                : '复制小节 PDF'}
+                              {copiedKey === `stage2-${slot.dayIndex}`
+                                ? '已复制阶段二'
+                                : '复制阶段二 SVG'}
                             </span>
                           </button>
-                          <a
-                            href={`/api/courses/${course.id}/segments/${segId}/pdf?download=1`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-800 hover:border-neutral-600 text-neutral-300 rounded transition-colors whitespace-nowrap"
-                            title="导出或下载该小节对应的切分 PDF 原文件"
-                          >
-                            <ExternalLink className="w-3.5 h-3.5" />
-                            <span>导出小节 PDF</span>
-                          </a>
-                        </>
-                      ) : pdfMetas[0] ? (
-                        <>
+                        )}
+
+                        <button
+                          type="button"
+                          data-testid={`step3-select-paste-${slot.dayIndex}`}
+                          onClick={() => {
+                            setSelectedStep3ChatDay(slot.dayIndex);
+                            setStep3ImportNotice(null);
+                            window.setTimeout(() => {
+                              const el =
+                                step3Stage2TextareaRef.current || step3TextareaRef.current;
+                              el?.scrollIntoView({
+                                behavior: 'smooth',
+                                block: 'center',
+                              });
+                              el?.focus();
+                            }, 30);
+                          }}
+                          className={`inline-flex items-center gap-1 px-2.5 py-1.5 border rounded transition-colors whitespace-nowrap ${
+                            isSelectedChatSlot
+                              ? 'border-sky-500/80 bg-sky-950/40 text-sky-200'
+                              : 'border-neutral-700 hover:border-neutral-500 text-neutral-200'
+                          }`}
+                          title="切换上方工作台到本节并导入或局部修补"
+                        >
+                          <FileText className="w-3.5 h-3.5" />
+                          <span>
+                            {hasLesson
+                              ? '粘贴补丁/更新'
+                              : slot.stage1Draft
+                              ? '继续阶段二 SVG'
+                              : '进入工作台导入'}
+                          </span>
+                        </button>
+
+                        {slicedSegs.length > 0 ? (
+                          slicedSegs.map((seg) => {
+                            const segId = seg.sectionId || secId;
+                            const fileName = seg.segmentFileName || `${segId}.pdf`;
+                            const copyKey = `copy-seg-step3-${secId}-${segId}`;
+                            return (
+                              <button
+                                key={segId}
+                                type="button"
+                                onClick={() =>
+                                  handleCopyCourseFile(`segments/${fileName}`, copyKey)
+                                }
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
+                                title={`将 ${fileName} 复制到系统剪贴板，等效在资源管理器按 Ctrl+C，可直接 Ctrl+V 粘贴`}
+                              >
+                                {copiedKey === copyKey ? (
+                                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                ) : (
+                                  <Copy className="w-3.5 h-3.5" />
+                                )}
+                                <span>
+                                  {copiedKey === copyKey
+                                    ? `已复制 ${slicedSegs.length > 1 ? fileName : '文件'}`
+                                    : `复制 ${slicedSegs.length > 1 ? fileName : '小节 PDF'}`}
+                                </span>
+                              </button>
+                            );
+                          })
+                        ) : pdfMetas[0] ? (
                           <button
                             type="button"
                             onClick={() =>
@@ -2402,74 +4914,86 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
                                 : '复制原 PDF'}
                             </span>
                           </button>
-                          <a
-                            href={`/api/courses/${course.id}/files/download?path=${encodeURIComponent(`sources/${pdfMetas[0].fileName}`)}&download=1`}
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-800 hover:border-neutral-600 text-neutral-300 rounded transition-colors whitespace-nowrap"
-                            title="下载原始教材 PDF 文件"
-                          >
-                            <Download className="w-3.5 h-3.5" />
-                            <span>下载原 PDF</span>
-                          </a>
-                        </>
-                      ) : null}
+                        ) : null}
+                      </div>
 
-                      {(showAdvancedWorkflowDetails || (course.generationMode || 'api') === 'api') && (
+                      <div className="flex flex-wrap items-center gap-2">
                         <button
                           type="button"
-                          onClick={() => handleGenerateSingleSectionApi(slot.dayIndex)}
+                          onClick={() => handleGenerateSingleSectionApi(slot.dayIndex, 'stage1')}
                           disabled={isGenThis || isGeneratingBatch}
-                          className={`inline-flex items-center gap-1 px-3 py-1.5 rounded transition-colors whitespace-nowrap disabled:opacity-50 ${
-                            (course.generationMode || 'api') === 'api'
-                              ? 'bg-white text-black hover:bg-neutral-200 font-medium'
-                              : 'border border-neutral-800 hover:border-neutral-600 text-neutral-300'
-                          }`}
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors whitespace-nowrap disabled:opacity-50"
+                          title="单次请求仅执行阶段一（教学内容与图示规格）"
+                        >
+                          <RefreshCw
+                            className={`w-3.5 h-3.5 ${isGenThis ? 'animate-spin' : ''}`}
+                          />
+                          <span>API 步骤一：生成内容</span>
+                        </button>
+                        {(slot.stage1Draft || slot.lesson) && (
+                          <button
+                            type="button"
+                            onClick={() => handleGenerateSingleSectionApi(slot.dayIndex, 'stage2')}
+                            disabled={isGenThis || isGeneratingBatch}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-sky-800/80 hover:border-sky-500 text-sky-300 hover:text-white rounded transition-colors whitespace-nowrap disabled:opacity-50"
+                            title="单次请求仅基于阶段一规格生成/重跑阶段二 SVG（不清除阶段一）"
+                          >
+                            <RefreshCw
+                              className={`w-3.5 h-3.5 ${isGenThis ? 'animate-spin' : ''}`}
+                            />
+                            <span>API 步骤二：生成 SVG</span>
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleGenerateSingleSectionApi(slot.dayIndex, 'all')}
+                          disabled={isGenThis || isGeneratingBatch}
+                          className="inline-flex items-center gap-1 px-3 py-1.5 border border-neutral-800 hover:border-neutral-600 text-neutral-200 hover:text-white rounded transition-colors whitespace-nowrap disabled:opacity-50"
+                          title="依次发起步骤一和步骤二两个独立请求完成本节课件"
                         >
                           <RefreshCw
                             className={`w-3.5 h-3.5 ${isGenThis ? 'animate-spin' : ''}`}
                           />
                           <span>
                             {isGenThis
-                              ? '生成中...'
+                              ? `生成中 ${generatingDayProgress?.percent ?? 0}%`
                               : hasLesson
-                                ? 'API 重新生成'
-                                : 'API 生成本节'}
+                                ? 'API 分步重生成 (1➔2)'
+                                : 'API 分步生成本节 (1➔2)'}
                           </span>
                         </button>
-                      )}
 
-                      {hasLesson && (
+                        {hasLesson && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteSingleLesson(slot)}
+                            disabled={deletingLessonDay === slot.dayIndex || isGeneratingBatch}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-800 hover:border-red-700 text-neutral-400 hover:text-red-400 rounded transition-colors whitespace-nowrap disabled:opacity-50"
+                            title={`从磁盘删除 lessons/${secId}.json 课件`}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>{deletingLessonDay === slot.dayIndex ? '删除中...' : '删除课件'}</span>
+                          </button>
+                        )}
+
                         <button
                           type="button"
-                          onClick={() => handleDeleteSingleLesson(slot)}
-                          disabled={deletingLessonDay === slot.dayIndex || isGeneratingBatch}
-                          className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-800 hover:border-red-700 text-neutral-400 hover:text-red-400 rounded transition-colors whitespace-nowrap disabled:opacity-50"
-                          title={`从磁盘删除 lessons/${secId}.json 课件`}
+                          onClick={() => {
+                            onClose();
+                            onOpenLesson(course.id, slot.dayIndex);
+                          }}
+                          className="inline-flex items-center gap-1 px-3 py-1.5 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors whitespace-nowrap"
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
-                          <span>{deletingLessonDay === slot.dayIndex ? '删除中...' : '删除课件'}</span>
+                          <BookOpen className="w-3.5 h-3.5" />
+                          <span>{hasLesson ? '阅读课件' : '进入独立工作台'}</span>
                         </button>
-                      )}
-
-                      <button
-                        type="button"
-                        onClick={() => {
-                          onClose();
-                          onOpenLesson(course.id, slot.dayIndex);
-                        }}
-                        className={`inline-flex items-center gap-1 px-3 py-1.5 rounded transition-colors whitespace-nowrap ${
-                          (course.generationMode || 'api') === 'chat'
-                            ? 'bg-white text-black hover:bg-neutral-200 font-medium'
-                            : 'bg-neutral-900 hover:bg-neutral-800 text-white border border-neutral-700'
-                        }`}
-                      >
-                        <BookOpen className="w-3.5 h-3.5" />
-                        <span>{hasLesson ? '阅读课件' : '进入 Chat 生成'}</span>
-                      </button>
+                      </div>
                     </div>
                   </div>
                 );
               })}
             </div>
+            )}
           </div>
         )}
 
@@ -2661,7 +5185,30 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
             关闭工作台
           </button>
         </div>
-      </div>
-    </div>
+          </motion.div>
+
+          <LessonPreviewModal
+            isOpen={Boolean(step3PreviewLesson)}
+            lesson={step3PreviewLesson}
+            sectionId={
+              selectedStep3Slot
+                ? ensureStableSectionId(selectedStep3Slot.dayIndex, selectedStep3Slot.id)
+                : undefined
+            }
+            dayIndex={selectedStep3Slot?.dayIndex}
+            customAssets={course.customAssets || {}}
+            hasAuditIssues={Boolean(step3ImportAudit && step3ImportAudit.report.issues.length > 0)}
+            auditSummaryText={step3ImportAudit?.report.summaryText}
+            isSaving={isSavingStep3Import}
+            onClose={() => setStep3PreviewLesson(null)}
+            onConfirmSave={() => {
+              setStep3PreviewLesson(null);
+              handleSaveStep3ChatImport({
+                openAfterSave: false,
+                advanceToNext: true,
+              });
+            }}
+          />
+        </motion.div>
   );
 };

@@ -3,6 +3,7 @@ export type GenerationStage =
   | 'preparing'
   | 'thinking'
   | 'streaming'
+  | 'diagrams'
   | 'parsing'
   | 'saving'
   | 'done'
@@ -23,6 +24,8 @@ export interface GenerationProgressEvent {
   liveSnippet?: string;
   course?: any;
   lesson?: any;
+  stage1Draft?: any;
+  pendingDiagramsCount?: number;
   error?: string;
 }
 

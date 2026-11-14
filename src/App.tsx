@@ -1,14 +1,15 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AnimatePresence, MotionConfig, motion } from 'motion/react';
 import {
   Archive,
-  BookOpen,
+  ArrowUp,
+  ArrowUpRight,
+  Calendar,
   FolderCog,
   FolderOpen,
   FolderSync,
   ListChecks,
-  MessageSquare,
   Plus,
-  RefreshCw,
   Settings as SettingsIcon,
   Trash2,
   Upload,
@@ -17,25 +18,39 @@ import type {
   AppSettings,
   Course,
   CourseGenerationMode,
+  LastBrowsingState,
   PromptModuleToggles,
+  StudyStats,
 } from './types';
 import type { PromptPresetItem } from './prompts/promptLibrary';
 import {
   buildDateTimeline,
   formatChineseDateLabel,
+  getEvaluatedSectionMinutes,
+  getSlotExerciseSubmission,
   getTodayDateString,
+  resolveSlotPdfSegments,
 } from './utils/learningLogic';
+import {
+  computeBrowsingViewKey,
+  loadBrowsingStateFromLocalStorage,
+  reconcileBrowsingStateWithCourses,
+  saveBrowsingStateToLocalStorage,
+  selectNewestBrowsingState,
+} from './utils/browsingState';
 import { AddCourseModal } from './components/AddCourseModal';
 import { AgentModeModal } from './components/AgentModeModal';
+import { BrandShowcaseModal } from './components/BrandShowcaseModal';
 import {
   CourseOutlineModal,
   type OutlineWorkbenchStep,
 } from './components/CourseOutlineModal';
+import { DailyFocusView } from './components/DailyFocusView';
 import { DeleteCourseModal } from './components/DeleteCourseModal';
 import { LessonView } from './components/LessonView';
 import { SettingsModal } from './components/SettingsModal';
-import { stripAiCitationArtifacts } from './utils/coursewareParser';
-import { renderInlineMathWithLatex } from './utils/markdownMath';
+import { WelcomeModal } from './components/WelcomeModal';
+import { readApiJson } from './utils/fileExtractor';
 
 const DEFAULT_MODULES: PromptModuleToggles = {
   problemIntroduction: true,
@@ -58,7 +73,12 @@ const DEFAULT_SETTINGS: AppSettings = {
   hasCustomApiKey: false,
   hasBuiltinGeminiKey: true,
   defaultLearnerLevel: 'intermediate',
+  defaultLearnerBaseline: 'partial_base',
+  defaultCustomLearnerBaseline: '',
+  defaultLearningDepth: 'master_textbook',
+  defaultCustomLearningDepth: '',
   showAdvancedWorkflowDetails: false,
+  showContentCategoryBadges: false,
   promptModules: DEFAULT_MODULES,
   syllabusSystemPrompt: '',
   courseSystemPrompt: '',
@@ -72,19 +92,57 @@ const MODE_LABELS: Record<CourseGenerationMode, string> = {
   chat: 'Chat 课件模式',
 };
 
+const WELCOME_STORAGE_KEY = 'learn_everything_welcomed_v1';
+const DEFAULT_MODE_STORAGE_KEY = 'learn_everything_default_mode_v1';
+
+const EMPTY_STUDY_STATS: StudyStats = {
+  totalSeconds: 0,
+  secondsByDate: {},
+  secondsByCourse: {},
+};
+
 export default function App() {
   const [courses, setCourses] = useState<Course[]>([]);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [promptPresets, setPromptPresets] = useState<PromptPresetItem[]>([]);
+  const [studyStats, setStudyStats] = useState<StudyStats>(EMPTY_STUDY_STATS);
+  const [liveStudySeconds, setLiveStudySeconds] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
   const [isScanningDisk, setIsScanningDisk] = useState(false);
   const [isRestoringBackup, setIsRestoringBackup] = useState(false);
   const [backupFeedback, setBackupFeedback] = useState<{ ok: boolean; message: string } | null>(null);
 
-  const [selectedCourseFilter, setSelectedCourseFilter] = useState<string>('all');
+  const initialBrowsingRef = useRef<LastBrowsingState | null>(
+    loadBrowsingStateFromLocalStorage()
+  );
+
+  const [selectedCourseFilter, setSelectedCourseFilter] = useState<string>(
+    () => initialBrowsingRef.current?.selectedCourseFilter || 'all'
+  );
+  const [focusedDate, setFocusedDate] = useState<string | null>(
+    () => initialBrowsingRef.current?.focusedDate || null
+  );
+
+  const [preferredMode, setPreferredMode] = useState<CourseGenerationMode>(() => {
+    try {
+      const saved = window.localStorage.getItem(DEFAULT_MODE_STORAGE_KEY);
+      if (saved === 'api' || saved === 'agent' || saved === 'chat') return saved;
+    } catch {
+      // ignore storage unavailability
+    }
+    return 'chat';
+  });
+  const [isWelcomeOpen, setIsWelcomeOpen] = useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem(WELCOME_STORAGE_KEY) !== '1';
+    } catch {
+      return false;
+    }
+  });
 
   const [isAddCourseOpen, setIsAddCourseOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isBrandShowcaseOpen, setIsBrandShowcaseOpen] = useState(false);
   const [agentModalCourseId, setAgentModalCourseId] = useState<string | null>(null);
   const [outlineModalState, setOutlineModalState] = useState<{
     courseId: string;
@@ -95,9 +153,183 @@ export default function App() {
   const [activeLessonRef, setActiveLessonRef] = useState<{
     courseId: string;
     dayIndex: number;
-  } | null>(null);
+  } | null>(() => initialBrowsingRef.current?.activeLessonRef || null);
 
-  const [generatingSlotKey, setGeneratingSlotKey] = useState<string | null>(null);
+  const [lastBrowsingState, setLastBrowsingState] = useState<LastBrowsingState | null>(
+    () => initialBrowsingRef.current
+  );
+  const scrollMapRef = useRef<Record<string, number>>({
+    ...(initialBrowsingRef.current?.scrollMap || {}),
+  });
+  const isRestoringScrollRef = useRef<boolean>(true);
+  const syncBrowsingTimerRef = useRef<number | null>(null);
+  const latestBrowsingPayloadRef = useRef<LastBrowsingState | null>(
+    initialBrowsingRef.current
+  );
+
+  const [viewTransition, setViewTransition] = useState<{
+    direction: 'zoom-in' | 'zoom-out';
+    origin: string;
+  }>({ direction: 'zoom-in', origin: '50% 42%' });
+  const [focusTarget, setFocusTarget] = useState<{
+    kind: 'date' | 'lesson';
+    key: string;
+  } | null>(null);
+  const focusTimerRef = useRef<number | null>(null);
+  const mainHeaderRef = useRef<HTMLElement | null>(null);
+  const todayRowRef = useRef<HTMLDivElement | null>(null);
+  const userScrolledTimelineRef = useRef<boolean>(false);
+  const lastAnchoredKeyRef = useRef<string>('');
+
+  useEffect(() => {
+    return () => {
+      if (focusTimerRef.current !== null) {
+        window.clearTimeout(focusTimerRef.current);
+      }
+    };
+  }, []);
+
+  // Lightweight global cursor proximity glow for .glow-border elements
+  useEffect(() => {
+    let rafId = 0;
+    let lastX = -9999;
+    let lastY = -9999;
+    const RADIUS = 220;
+
+    const updateGlows = () => {
+      rafId = 0;
+      const targets = document.querySelectorAll<HTMLElement>('.glow-border');
+      for (let i = 0; i < targets.length; i++) {
+        const el = targets[i];
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) continue;
+        const dx =
+          lastX < rect.left ? rect.left - lastX : lastX > rect.right ? lastX - rect.right : 0;
+        const dy =
+          lastY < rect.top ? rect.top - lastY : lastY > rect.bottom ? lastY - rect.bottom : 0;
+        const near = dx * dx + dy * dy <= RADIUS * RADIUS;
+        if (near) {
+          el.style.setProperty('--gx', `${(lastX - rect.left).toFixed(1)}px`);
+          el.style.setProperty('--gy', `${(lastY - rect.top).toFixed(1)}px`);
+          el.style.setProperty('--go', '1');
+        } else if (el.style.getPropertyValue('--go') === '1') {
+          el.style.setProperty('--go', '0');
+        }
+      }
+    };
+
+    const handlePointerMove = (e: PointerEvent) => {
+      lastX = e.clientX;
+      lastY = e.clientY;
+      if (!rafId) {
+        rafId = window.requestAnimationFrame(updateGlows);
+      }
+    };
+
+    const handlePointerLeave = () => {
+      lastX = -9999;
+      lastY = -9999;
+      const targets = document.querySelectorAll<HTMLElement>('.glow-border');
+      for (let i = 0; i < targets.length; i++) {
+        if (targets[i].style.getPropertyValue('--go') === '1') {
+          targets[i].style.setProperty('--go', '0');
+        }
+      }
+    };
+
+    window.addEventListener('pointermove', handlePointerMove, { passive: true });
+    document.addEventListener('pointerleave', handlePointerLeave);
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      document.removeEventListener('pointerleave', handlePointerLeave);
+      if (rafId) window.cancelAnimationFrame(rafId);
+    };
+  }, []);
+
+  const captureZoomOrigin = (e?: React.MouseEvent): string => {
+    if (!e?.currentTarget || typeof window === 'undefined' || !window.innerWidth || !window.innerHeight) {
+      return '50% 42%';
+    }
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const xPct = Math.max(15, Math.min(85, ((rect.left + rect.width / 2) / window.innerWidth) * 100));
+    const yPct = Math.max(15, Math.min(85, ((rect.top + rect.height / 2) / window.innerHeight) * 100));
+    return `${xPct.toFixed(1)}% ${yPct.toFixed(1)}%`;
+  };
+
+  const navigateToDailyFocus = (date: string, e?: React.MouseEvent) => {
+    if (focusTarget?.kind === 'date' && focusTarget.key === date) return;
+    if (focusTimerRef.current !== null) {
+      window.clearTimeout(focusTimerRef.current);
+    }
+    const origin = captureZoomOrigin(e);
+    setViewTransition({ direction: 'zoom-in', origin });
+    setFocusTarget({ kind: 'date', key: date });
+    focusTimerRef.current = window.setTimeout(() => {
+      focusTimerRef.current = null;
+      setFocusTarget(null);
+      setFocusedDate(date);
+      setActiveLessonRef(null);
+    }, 110);
+  };
+
+  const navigateToLesson = (
+    courseId: string,
+    dayIndex: number,
+    e?: React.MouseEvent,
+    immediate = false,
+    source: 'timeline' | 'daily' | 'keep' = 'keep'
+  ) => {
+    const lessonKey = `${courseId}-${dayIndex}`;
+    const origin = captureZoomOrigin(e);
+    setViewTransition({ direction: 'zoom-in', origin });
+
+    if (immediate) {
+      if (focusTimerRef.current !== null) {
+        window.clearTimeout(focusTimerRef.current);
+      }
+      setFocusTarget(null);
+      if (source === 'timeline') setFocusedDate(null);
+      setActiveLessonRef({ courseId, dayIndex });
+      return;
+    }
+
+    if (focusTarget?.kind === 'lesson' && focusTarget.key === lessonKey) return;
+    if (focusTimerRef.current !== null) {
+      window.clearTimeout(focusTimerRef.current);
+    }
+    setFocusTarget({ kind: 'lesson', key: lessonKey });
+    focusTimerRef.current = window.setTimeout(() => {
+      focusTimerRef.current = null;
+      setFocusTarget(null);
+      if (source === 'timeline') setFocusedDate(null);
+      setActiveLessonRef({ courseId, dayIndex });
+    }, 110);
+  };
+
+  const navigateBackFromLesson = (e?: React.MouseEvent) => {
+    if (focusTimerRef.current !== null) {
+      window.clearTimeout(focusTimerRef.current);
+    }
+    setFocusTarget(null);
+    setViewTransition({
+      direction: 'zoom-out',
+      origin: e ? captureZoomOrigin(e) : '50% 42%',
+    });
+    setActiveLessonRef(null);
+  };
+
+  const navigateBackToTimeline = (e?: React.MouseEvent) => {
+    if (focusTimerRef.current !== null) {
+      window.clearTimeout(focusTimerRef.current);
+    }
+    setFocusTarget(null);
+    setViewTransition({
+      direction: 'zoom-out',
+      origin: e ? captureZoomOrigin(e) : '50% 42%',
+    });
+    setFocusedDate(null);
+    setActiveLessonRef(null);
+  };
 
   useEffect(() => {
     const fetchInitialState = async () => {
@@ -105,12 +337,39 @@ export default function App() {
         const res = await fetch('/api/state');
         if (res.ok) {
           const data = await res.json();
-          setCourses(Array.isArray(data.courses) ? data.courses : []);
+          const loadedCourses: Course[] = Array.isArray(data.courses) ? data.courses : [];
+          setCourses(loadedCourses);
           if (data.settings) {
             setSettings(data.settings);
           }
           if (Array.isArray(data.promptPresets)) {
             setPromptPresets(data.promptPresets);
+          }
+          if (data.studyStats) {
+            setStudyStats(data.studyStats);
+          }
+
+          // Merge localStorage + server disk browsing state and reconcile against loaded courses
+          const localSaved = loadBrowsingStateFromLocalStorage();
+          const mergedSaved = selectNewestBrowsingState(
+            localSaved,
+            data.lastBrowsingState
+          );
+          const reconciled = reconcileBrowsingStateWithCourses(
+            mergedSaved,
+            loadedCourses
+          );
+          if (reconciled) {
+            scrollMapRef.current = {
+              ...scrollMapRef.current,
+              ...(reconciled.scrollMap || {}),
+            };
+            setSelectedCourseFilter(reconciled.selectedCourseFilter);
+            setFocusedDate(reconciled.focusedDate);
+            setActiveLessonRef(reconciled.activeLessonRef);
+            setLastBrowsingState(reconciled);
+            latestBrowsingPayloadRef.current = reconciled;
+            saveBrowsingStateToLocalStorage(reconciled);
           }
         }
       } catch (err) {
@@ -121,6 +380,20 @@ export default function App() {
     };
     fetchInitialState();
   }, []);
+
+  const handleCloseWelcome = (chosenMode: CourseGenerationMode, openCreateCourse: boolean) => {
+    setPreferredMode(chosenMode);
+    setIsWelcomeOpen(false);
+    try {
+      window.localStorage.setItem(WELCOME_STORAGE_KEY, '1');
+      window.localStorage.setItem(DEFAULT_MODE_STORAGE_KEY, chosenMode);
+    } catch {
+      // ignore storage unavailability
+    }
+    if (openCreateCourse) {
+      setIsAddCourseOpen(true);
+    }
+  };
 
   const filteredCourses = useMemo(() => {
     if (selectedCourseFilter === 'all') return courses;
@@ -202,10 +475,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ fileName: file.name, base64Zip }),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || '导入课程备份失败');
-      }
+      const data = await readApiJson<any>(res);
       if (Array.isArray(data.courses)) {
         setCourses(data.courses);
       }
@@ -266,172 +536,483 @@ export default function App() {
     }
   };
 
-  const handleGenerateSlotOnTimeline = async (
-    e: React.MouseEvent,
-    course: Course,
-    dayIndex: number
-  ) => {
-    e.stopPropagation();
-    const key = `${course.id}-${dayIndex}`;
-    setGeneratingSlotKey(key);
-    try {
-      const res = await fetch(`/api/courses/${course.id}/days/${dayIndex}/generate`, {
-        method: 'POST',
-      });
-      if (res.ok) {
-        const data = await res.json();
-        handleCourseUpdated(data.course);
+  const activeLessonCourse = activeLessonRef
+    ? courses.find((c) => c.id === activeLessonRef.courseId) || null
+    : null;
+  const activeLessonSlot = activeLessonCourse?.dailyPlan.find(
+    (d) => d.dayIndex === activeLessonRef?.dayIndex
+  );
+  const isShowingLesson = Boolean(activeLessonCourse && activeLessonSlot);
+  const isShowingDailyFocus = !isShowingLesson && Boolean(focusedDate);
+  const isTimelineVisible =
+    !isLoading &&
+    !isWelcomeOpen &&
+    !isShowingLesson &&
+    !isShowingDailyFocus &&
+    timeline.length > 0;
+
+  const currentViewKey = useMemo(
+    () =>
+      computeBrowsingViewKey({
+        activeLessonRef: isShowingLesson ? activeLessonRef : null,
+        focusedDate: !isShowingLesson && isShowingDailyFocus ? focusedDate : null,
+        selectedCourseFilter,
+      }),
+    [isShowingLesson, activeLessonRef, isShowingDailyFocus, focusedDate, selectedCourseFilter]
+  );
+
+  const persistBrowsingState = useCallback(
+    (scrollYValue: number, immediateServerSync = false) => {
+      const cleanY = Math.max(0, Math.round(scrollYValue));
+      scrollMapRef.current[currentViewKey] = cleanY;
+      const nextState: LastBrowsingState = {
+        view: isShowingLesson ? 'lesson' : isShowingDailyFocus ? 'daily' : 'timeline',
+        selectedCourseFilter,
+        focusedDate: isShowingLesson || isShowingDailyFocus ? focusedDate : null,
+        activeLessonRef: isShowingLesson ? activeLessonRef : null,
+        scrollY: cleanY,
+        scrollMap: { ...scrollMapRef.current },
+        updatedAt: new Date().toISOString(),
+      };
+      latestBrowsingPayloadRef.current = nextState;
+      setLastBrowsingState(nextState);
+      saveBrowsingStateToLocalStorage(nextState);
+
+      if (syncBrowsingTimerRef.current !== null) {
+        window.clearTimeout(syncBrowsingTimerRef.current);
+        syncBrowsingTimerRef.current = null;
       }
-    } finally {
-      setGeneratingSlotKey(null);
+
+      const sendToServer = () => {
+        const payload = latestBrowsingPayloadRef.current;
+        if (!payload) return;
+        fetch('/api/browsing-state', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          keepalive: true,
+        }).catch(() => {
+          // ignore network errors
+        });
+      };
+
+      if (immediateServerSync) {
+        sendToServer();
+      } else {
+        syncBrowsingTimerRef.current = window.setTimeout(sendToServer, 320);
+      }
+    },
+    [
+      currentViewKey,
+      isShowingLesson,
+      isShowingDailyFocus,
+      selectedCourseFilter,
+      focusedDate,
+      activeLessonRef,
+    ]
+  );
+
+  const scrollToTodayRow = useCallback(
+    (behavior: ScrollBehavior = 'auto', saveAfterScroll = false) => {
+      if (!todayRowRef.current) return;
+      const headerHeight = mainHeaderRef.current?.getBoundingClientRect().height || 66;
+      const targetTop = Math.max(
+        0,
+        todayRowRef.current.getBoundingClientRect().top + window.scrollY - headerHeight - 6
+      );
+      window.scrollTo({ top: targetTop, behavior });
+      if (saveAfterScroll) {
+        window.setTimeout(() => {
+          persistBrowsingState(window.scrollY, true);
+        }, behavior === 'smooth' ? 320 : 40);
+      }
+    },
+    [persistBrowsingState]
+  );
+
+  // Restore scroll position for the active view (or scroll to today on timeline if never visited before)
+  useEffect(() => {
+    if (isLoading || isWelcomeOpen) return;
+
+    isRestoringScrollRef.current = true;
+    const savedY = scrollMapRef.current[currentViewKey];
+    const hasSavedScroll = typeof savedY === 'number' && Number.isFinite(savedY);
+
+    let rafId = 0;
+    let timer1: number | null = null;
+    let timer2: number | null = null;
+    let timer3: number | null = null;
+
+    if (isShowingLesson || isShowingDailyFocus) {
+      const targetY = hasSavedScroll ? Math.max(0, savedY) : 0;
+      persistBrowsingState(targetY, false);
+      window.scrollTo({ top: targetY, behavior: 'auto' });
+      rafId = window.requestAnimationFrame(() => {
+        window.scrollTo({ top: targetY, behavior: 'auto' });
+      });
+      timer1 = window.setTimeout(() => {
+        window.scrollTo({ top: targetY, behavior: 'auto' });
+      }, 110);
+      timer2 = window.setTimeout(() => {
+        window.scrollTo({ top: targetY, behavior: 'auto' });
+      }, 210);
+      timer3 = window.setTimeout(() => {
+        window.scrollTo({ top: targetY, behavior: 'auto' });
+        isRestoringScrollRef.current = false;
+        persistBrowsingState(targetY, false);
+      }, 340);
+    } else if (isTimelineVisible) {
+      const markUserScrolled = () => {
+        userScrolledTimelineRef.current = true;
+      };
+      window.addEventListener('wheel', markUserScrolled, { passive: true });
+      window.addEventListener('touchstart', markUserScrolled, { passive: true });
+
+      if (hasSavedScroll) {
+        userScrolledTimelineRef.current = true;
+        const targetY = Math.max(0, savedY);
+        persistBrowsingState(targetY, false);
+        window.scrollTo({ top: targetY, behavior: 'auto' });
+        rafId = window.requestAnimationFrame(() => {
+          window.scrollTo({ top: targetY, behavior: 'auto' });
+        });
+        timer1 = window.setTimeout(() => {
+          window.scrollTo({ top: targetY, behavior: 'auto' });
+        }, 110);
+        timer2 = window.setTimeout(() => {
+          window.scrollTo({ top: targetY, behavior: 'auto' });
+        }, 210);
+        timer3 = window.setTimeout(() => {
+          window.scrollTo({ top: targetY, behavior: 'auto' });
+          isRestoringScrollRef.current = false;
+          persistBrowsingState(targetY, false);
+        }, 340);
+      } else {
+        const anchorKey = `${todayStr}|${selectedCourseFilter}|${courses.length}|${timeline.length}`;
+        if (lastAnchoredKeyRef.current !== anchorKey) {
+          lastAnchoredKeyRef.current = anchorKey;
+          userScrolledTimelineRef.current = false;
+          rafId = window.requestAnimationFrame(() => {
+            if (!userScrolledTimelineRef.current) {
+              scrollToTodayRow('auto');
+            }
+            timer1 = window.setTimeout(() => {
+              if (!userScrolledTimelineRef.current) {
+                scrollToTodayRow('auto');
+              }
+            }, 140);
+            timer2 = window.setTimeout(() => {
+              if (!userScrolledTimelineRef.current) {
+                scrollToTodayRow('auto');
+              }
+              isRestoringScrollRef.current = false;
+              persistBrowsingState(window.scrollY, false);
+            }, 320);
+          });
+        } else {
+          timer2 = window.setTimeout(() => {
+            isRestoringScrollRef.current = false;
+            persistBrowsingState(window.scrollY, false);
+          }, 180);
+        }
+      }
+
+      return () => {
+        window.removeEventListener('wheel', markUserScrolled);
+        window.removeEventListener('touchstart', markUserScrolled);
+        if (rafId) window.cancelAnimationFrame(rafId);
+        if (timer1 !== null) window.clearTimeout(timer1);
+        if (timer2 !== null) window.clearTimeout(timer2);
+        if (timer3 !== null) window.clearTimeout(timer3);
+      };
+    } else {
+      isRestoringScrollRef.current = false;
     }
+
+    return () => {
+      if (rafId) window.cancelAnimationFrame(rafId);
+      if (timer1 !== null) window.clearTimeout(timer1);
+      if (timer2 !== null) window.clearTimeout(timer2);
+      if (timer3 !== null) window.clearTimeout(timer3);
+    };
+  }, [
+    isLoading,
+    isWelcomeOpen,
+    currentViewKey,
+    isShowingLesson,
+    isShowingDailyFocus,
+    isTimelineVisible,
+    todayStr,
+    selectedCourseFilter,
+    courses.length,
+    timeline.length,
+    scrollToTodayRow,
+    persistBrowsingState,
+  ]);
+
+  // Continuously record user scroll position in the active view
+  useEffect(() => {
+    if (isLoading || isWelcomeOpen) return;
+
+    let scrollRaf = 0;
+    const handleScroll = () => {
+      if (isRestoringScrollRef.current || focusTarget !== null) return;
+      if (scrollRaf) return;
+      scrollRaf = window.requestAnimationFrame(() => {
+        scrollRaf = 0;
+        if (isRestoringScrollRef.current || focusTarget !== null) return;
+        persistBrowsingState(window.scrollY, false);
+      });
+    };
+
+    const handlePageHide = () => {
+      if (!isRestoringScrollRef.current && focusTarget === null) {
+        persistBrowsingState(window.scrollY, true);
+      }
+    };
+
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    window.addEventListener('pagehide', handlePageHide);
+    return () => {
+      window.removeEventListener('scroll', handleScroll);
+      window.removeEventListener('pagehide', handlePageHide);
+      if (scrollRaf) window.cancelAnimationFrame(scrollRaf);
+    };
+  }, [isLoading, isWelcomeOpen, focusTarget, persistBrowsingState]);
+
+  const rootScreenVariants = {
+    initial: (vt: { direction: 'zoom-in' | 'zoom-out' }) =>
+      vt.direction === 'zoom-in'
+        ? { opacity: 0, scale: 0.975 }
+        : { opacity: 0, scale: 1.015 },
+    animate: (vt: { direction: 'zoom-in' | 'zoom-out' }) => ({
+      opacity: 1,
+      scale: 1,
+      transition: {
+        duration: vt.direction === 'zoom-in' ? 0.2 : 0.18,
+        ease: [0.16, 1, 0.3, 1] as const,
+      },
+      transitionEnd: {
+        transform: 'none',
+      },
+    }),
+    exit: (vt: { direction: 'zoom-in' | 'zoom-out' }) =>
+      vt.direction === 'zoom-in'
+        ? {
+            opacity: 0,
+            scale: 1.02,
+            transition: { duration: 0.15, ease: [0.22, 1, 0.36, 1] as const },
+          }
+        : {
+            opacity: 0,
+            scale: 0.98,
+            transition: { duration: 0.14, ease: [0.22, 1, 0.36, 1] as const },
+          },
   };
 
-  if (activeLessonRef) {
-    const activeCourse = courses.find((c) => c.id === activeLessonRef.courseId);
-    const activeSlot = activeCourse?.dailyPlan.find(
-      (d) => d.dayIndex === activeLessonRef.dayIndex
-    );
-    if (activeCourse && activeSlot) {
-      return (
-        <>
-          <LessonView
-            course={activeCourse}
-            slot={activeSlot}
-            onBack={() => setActiveLessonRef(null)}
-            onSelectDayIndex={(dayIndex) =>
-              setActiveLessonRef({ courseId: activeCourse.id, dayIndex })
-            }
-            onCourseUpdated={handleCourseUpdated}
-            onOpenAgentModal={(c) => setAgentModalCourseId(c.id)}
-            onOpenOutlineModal={(c, step) =>
-              setOutlineModalState({
-                courseId: c.id,
-                step: step || 'outline',
-              })
-            }
-          />
-          <AgentModeModal
-            isOpen={Boolean(agentModalCourse)}
-            course={agentModalCourse}
-            onClose={() => setAgentModalCourseId(null)}
-            onCourseUpdated={handleCourseUpdated}
-          />
-          <CourseOutlineModal
-            isOpen={Boolean(outlineModalCourse)}
-            course={outlineModalCourse}
-            initialStep={outlineModalState?.step || 'outline'}
-            showAdvancedWorkflowDetails={Boolean(settings.showAdvancedWorkflowDetails)}
-            onOpenSettings={() => {
-              setOutlineModalState(null);
-              setIsSettingsOpen(true);
-            }}
-            onClose={() => setOutlineModalState(null)}
-            onCourseUpdated={handleCourseUpdated}
-            onOpenLesson={(courseId, dayIndex) => {
-              setOutlineModalState(null);
-              setActiveLessonRef({ courseId, dayIndex });
-            }}
-            onOpenAgentModal={(c) => {
-              setOutlineModalState(null);
-              setAgentModalCourseId(c.id);
-            }}
-          />
-        </>
-      );
-    }
-  }
-
   return (
-    <div className="min-h-screen bg-black text-neutral-100 flex flex-col">
-      <header className="sticky top-0 z-30 bg-black/95 border-b border-neutral-900 px-6 py-4">
-        <div className="max-w-5xl mx-auto flex items-center justify-between gap-8">
-          <a
-            href="#top"
-            onClick={(e) => {
-              e.preventDefault();
-              setSelectedCourseFilter('all');
-            }}
-            className="text-base font-semibold tracking-tight text-white whitespace-nowrap shrink-0"
-          >
-            Learn_everything
-          </a>
-
-          <nav
-            aria-label="课程筛选"
-            className="hidden md:flex items-center gap-5 text-xs text-neutral-400 overflow-x-auto"
-          >
-            <button
-              type="button"
-              onClick={() => setSelectedCourseFilter('all')}
-              className={`transition-colors whitespace-nowrap shrink-0 ${
-                selectedCourseFilter === 'all'
-                  ? 'text-white underline underline-offset-4'
-                  : 'hover:text-neutral-200'
-              }`}
+    <MotionConfig reducedMotion="user">
+      <div className="min-h-screen bg-black text-neutral-100 flex flex-col overflow-x-clip">
+        {!isWelcomeOpen && (
+          <AnimatePresence mode="wait" custom={viewTransition}>
+          {isShowingLesson && activeLessonCourse && activeLessonSlot ? (
+            <motion.div
+              key={`lesson-view-${activeLessonCourse.id}`}
+              custom={viewTransition}
+              variants={rootScreenVariants}
+              initial="initial"
+              animate="animate"
+              exit="exit"
+              style={{ transformOrigin: viewTransition.origin }}
+              className="flex-1 flex flex-col"
             >
-              全部日期安排 ({courses.length})
-            </button>
-            {courses.map((c) => (
-              <button
-                key={c.id}
-                type="button"
-                onClick={() => setSelectedCourseFilter(c.id)}
-                className={`transition-colors whitespace-nowrap shrink-0 truncate max-w-[160px] ${
-                  selectedCourseFilter === c.id
-                    ? 'text-white underline underline-offset-4'
-                    : 'hover:text-neutral-200'
-                }`}
-              >
-                {c.name}
-              </button>
-            ))}
-          </nav>
-
-          <div className="flex items-center gap-2.5 shrink-0">
-            <label
-              title="从导出的 .zip 课程备份恢复到本地 courses/ 文件夹"
-              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors whitespace-nowrap cursor-pointer"
-            >
-              <Upload className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">
-                {isRestoringBackup ? '恢复中...' : '导入备份 (.zip)'}
-              </span>
-              <input
-                type="file"
-                accept=".zip,application/zip"
-                disabled={isRestoringBackup}
-                onChange={handleRestoreBackupZip}
-                className="sr-only"
+              <LessonView
+                course={activeLessonCourse}
+                slot={activeLessonSlot}
+                backLabel={focusedDate ? '返回当日详细页' : '返回时间轴'}
+                onBack={navigateBackFromLesson}
+                onSelectDayIndex={(dayIndex) =>
+                  setActiveLessonRef({ courseId: activeLessonCourse.id, dayIndex })
+                }
+                onCourseUpdated={handleCourseUpdated}
+                showContentCategoryBadges={Boolean(settings.showContentCategoryBadges)}
+                onOpenAgentModal={(c) => setAgentModalCourseId(c.id)}
+                onOpenOutlineModal={(c, step) =>
+                  setOutlineModalState({
+                    courseId: c.id,
+                    step: step || 'outline',
+                  })
+                }
+                onLiveStudySecondsChange={setLiveStudySeconds}
+                onStudyStatsUpdated={setStudyStats}
               />
-            </label>
-
-            <button
-              type="button"
-              onClick={handleScanDiskCourses}
-              disabled={isScanningDisk}
-              title="从本地 courses/ 文件夹扫描或恢复课程"
-              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors whitespace-nowrap disabled:opacity-50"
+            </motion.div>
+          ) : isShowingDailyFocus && focusedDate ? (
+            <motion.div
+              key="daily-focus-view"
+              custom={viewTransition}
+              variants={rootScreenVariants}
+              initial="initial"
+              animate="animate"
+              exit="exit"
+              style={{ transformOrigin: viewTransition.origin }}
+              className="flex-1 flex flex-col"
             >
-              <FolderOpen className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">
-                {isScanningDisk ? '扫描中...' : '同步本地文件夹'}
-              </span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setIsAddCourseOpen(true)}
-              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors whitespace-nowrap shrink-0"
+              <DailyFocusView
+                date={focusedDate}
+                courses={filteredCourses}
+                studyStats={studyStats}
+                onChangeDate={(nextDate) => setFocusedDate(nextDate)}
+                onBack={navigateBackToTimeline}
+                onOpenLesson={(courseId, dayIndex, e) =>
+                  navigateToLesson(courseId, dayIndex, e, true, 'daily')
+                }
+                onOpenOutlineModal={(courseId, step) =>
+                  setOutlineModalState({ courseId, step })
+                }
+                onOpenAddCourse={() => setIsAddCourseOpen(true)}
+              />
+            </motion.div>
+          ) : (
+            <motion.div
+              key="main-timeline-view"
+              custom={viewTransition}
+              variants={rootScreenVariants}
+              initial="initial"
+              animate="animate"
+              exit="exit"
+              style={{ transformOrigin: viewTransition.origin }}
+              className="flex-1 flex flex-col"
             >
-              <Plus className="w-3.5 h-3.5" />
-              <span>添加课程</span>
-            </button>
-          </div>
-        </div>
-      </header>
+            <motion.header
+              ref={mainHeaderRef}
+              animate={
+                focusTarget
+                  ? { opacity: 0.28, scale: 0.995 }
+                  : { opacity: 1, scale: 1 }
+              }
+              transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
+              className="sticky top-0 z-30 bg-black/95 backdrop-blur-sm border-b border-neutral-900 px-6 py-4"
+            >
+              <div className="max-w-5xl mx-auto flex items-center justify-between gap-6">
+                <button
+                  type="button"
+                  onClick={() => setIsBrandShowcaseOpen(true)}
+                  title="查看 Learn_everything 品牌与致谢"
+                  className="inline-flex items-center gap-2 font-display text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0 hover:text-sky-300 transition-colors cursor-pointer group"
+                >
+                  <svg
+                    viewBox="0 0 28 28"
+                    className="w-5 h-5 shrink-0 text-sky-400 group-hover:scale-110 transition-transform"
+                    aria-hidden="true"
+                  >
+                    <circle
+                      cx="14"
+                      cy="14"
+                      r="11.5"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.4"
+                      strokeDasharray="4 2.5"
+                      opacity="0.7"
+                    />
+                    <polygon
+                      points="14,6 20.5,14 14,22 7.5,14"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.6"
+                    />
+                    <circle cx="14" cy="14" r="2.2" fill="currentColor" />
+                  </svg>
+                  <span>Learn_everything</span>
+                </button>
 
-      <main className="flex-1 max-w-5xl w-full mx-auto px-6 py-8 pb-24">
+                <nav
+                  aria-label="课程筛选"
+                  className="hidden md:flex items-center gap-5 text-xs text-neutral-400 overflow-x-auto"
+                >
+                  <button
+                    type="button"
+                    onClick={() => setSelectedCourseFilter('all')}
+                    className={`transition-colors whitespace-nowrap shrink-0 ${
+                      selectedCourseFilter === 'all'
+                        ? 'text-white underline underline-offset-4'
+                        : 'hover:text-neutral-200'
+                    }`}
+                  >
+                    全部日期安排 ({courses.length})
+                  </button>
+                  {courses.map((c) => (
+                    <button
+                      key={c.id}
+                      type="button"
+                      onClick={() => setSelectedCourseFilter(c.id)}
+                      className={`transition-colors whitespace-nowrap shrink-0 truncate max-w-[160px] ${
+                        selectedCourseFilter === c.id
+                          ? 'text-white underline underline-offset-4'
+                          : 'hover:text-neutral-200'
+                      }`}
+                    >
+                      {c.name}
+                    </button>
+                  ))}
+                </nav>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    data-testid="scroll-to-today-btn"
+                    onClick={() => scrollToTodayRow('smooth', true)}
+                    title="定位到今日课程（第一行）"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs border border-neutral-800 hover:border-sky-400/60 text-neutral-300 hover:text-white rounded transition-colors whitespace-nowrap"
+                  >
+                    <Calendar className="w-3.5 h-3.5 text-sky-400" />
+                    <span className="hidden sm:inline">回到今天</span>
+                  </button>
+
+                  <label
+                    title="从导出的 .zip 课程备份恢复到本地 courses/ 文件夹"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors whitespace-nowrap cursor-pointer"
+                  >
+                    <Upload className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">
+                      {isRestoringBackup ? '恢复中...' : '导入备份 (.zip)'}
+                    </span>
+                    <input
+                      type="file"
+                      accept=".zip,application/zip"
+                      disabled={isRestoringBackup}
+                      onChange={handleRestoreBackupZip}
+                      className="sr-only"
+                    />
+                  </label>
+
+                  <button
+                    type="button"
+                    onClick={handleScanDiskCourses}
+                    disabled={isScanningDisk}
+                    title="从本地 courses/ 文件夹扫描或恢复课程"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors whitespace-nowrap disabled:opacity-50"
+                  >
+                    <FolderOpen className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">
+                      {isScanningDisk ? '扫描中...' : '同步本地文件夹'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setIsAddCourseOpen(true)}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors whitespace-nowrap shrink-0"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>添加课程</span>
+                  </button>
+                </div>
+              </div>
+            </motion.header>
+
+            <main className="flex-1 max-w-5xl w-full mx-auto px-6 py-8 pb-24">
         {backupFeedback && (
           <div
             className={`mb-6 flex items-center justify-between gap-3 text-xs rounded px-4 py-2.5 border ${
@@ -451,7 +1032,13 @@ export default function App() {
           </div>
         )}
         {courses.length > 0 && (
-          <section
+          <motion.section
+            animate={
+              focusTarget
+                ? { opacity: 0.28, scale: 0.995 }
+                : { opacity: 1, scale: 1 }
+            }
+            transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
             aria-label="已添加课程列表"
             className="mb-8 pb-6 border-b border-neutral-900 space-y-3"
           >
@@ -471,21 +1058,54 @@ export default function App() {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              {courses.map((course) => {
+              {courses.map((course, cIdx) => {
                 const generatedCount = course.dailyPlan.filter((d) => Boolean(d.lesson)).length;
-                const segmentedCount = course.dailyPlan.filter((d) => Boolean(d.pdfSegment)).length;
+                const totalSections = course.dailyPlan.length;
+                const splitRegions = course.pdfSplitPlan || [];
+                const totalRegions = splitRegions.length;
+                const slicedRegionsCount = splitRegions.filter(
+                  (r) => r.status === 'sliced' || Boolean(r.segmentRelPath || r.segmentFileName)
+                ).length;
+                const coveredRegionSet = new Set<string>();
+                for (const d of course.dailyPlan) {
+                  for (const seg of resolveSlotPdfSegments(d, splitRegions)) {
+                    coveredRegionSet.add(seg.sectionId);
+                  }
+                }
+                const boundSectionsCount = course.dailyPlan.filter(
+                  (d) =>
+                    resolveSlotPdfSegments(d, splitRegions).length > 0 || Boolean(d.pdfSegment)
+                ).length;
                 const hasPdf = course.materials?.some(
                   (m) => m.isPdf || m.fileName.toLowerCase().endsWith('.pdf')
                 );
+                const pdfStatusText = hasPdf
+                  ? totalRegions > 0
+                    ? ` · 已切分 ${slicedRegionsCount}/${totalRegions} 个 PDF 区域${
+                        totalSections > 0
+                          ? `（已覆盖 ${coveredRegionSet.size}/${totalRegions} 个 · ${boundSectionsCount}/${totalSections} 讲）`
+                          : ''
+                      }`
+                    : totalSections > 0
+                      ? ` · 已关联 ${boundSectionsCount}/${totalSections} 讲 PDF`
+                      : ' · 待切分 PDF 区域'
+                  : '';
                 const mode: CourseGenerationMode = course.generationMode || 'api';
 
                 return (
-                  <div
+                  <motion.div
                     key={course.id}
-                    className={`border rounded p-3.5 flex flex-col justify-between gap-3 transition-colors ${
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{
+                      delay: Math.min(cIdx * 0.02, 0.1),
+                      duration: 0.18,
+                      ease: [0.16, 1, 0.3, 1],
+                    }}
+                    className={`glow-border border rounded p-3.5 flex flex-col justify-between gap-3 transition-colors ${
                       selectedCourseFilter === course.id
                         ? 'border-neutral-600 bg-neutral-950'
-                        : 'border-neutral-900 bg-black hover:border-neutral-800'
+                        : 'border-neutral-900 bg-black hover:border-neutral-700'
                     }`}
                   >
                     <div className="flex items-start justify-between gap-3">
@@ -505,7 +1125,9 @@ export default function App() {
                           <span>{course.durationDays} 天计划</span>
                           <span aria-hidden="true">·</span>
                           <span>
-                            已生成 {generatedCount}/{course.durationDays} 讲
+                            {totalSections > 0
+                              ? `已生成 ${generatedCount}/${totalSections} 讲`
+                              : '待生成大纲'}
                           </span>
                           <span aria-hidden="true">·</span>
                           <span
@@ -521,11 +1143,11 @@ export default function App() {
                         </p>
                         <p className="text-xs text-neutral-600 font-mono truncate">
                           存储目录：{course.courseDirPath || `courses/${course.folderName}/`}
-                          {hasPdf && ` · 已切分 ${segmentedCount}/${course.durationDays} 节 PDF`}
+                          {pdfStatusText}
                         </p>
                         {course.englishConfig && (
                           <p className="text-xs text-neutral-500 font-mono truncate">
-                            词库：{course.englishConfig.targetBankName} ({course.englishConfig.totalTargetCount}) − 排除 ({course.englishConfig.excludedCount}) = 待学 {course.englishConfig.effectiveWords.length} 词 · 每日 {course.englishConfig.dailyWordCount || 20} 词
+                            词库：{course.englishConfig.targetBankName} ({course.englishConfig.totalTargetCount}) − 排除 ({course.englishConfig.excludedCount}) = 待学 {course.englishConfig.effectiveWords.length} 词 · 每节 {course.englishConfig.dailyWordCount || 20} 词
                           </p>
                         )}
                       </div>
@@ -619,53 +1241,127 @@ export default function App() {
                         )}
                       </div>
                     </div>
-                  </div>
+                  </motion.div>
                 );
               })}
             </div>
-          </section>
+          </motion.section>
         )}
 
-        <section aria-label="每日学习时间轴" className="relative">
+        <section aria-label="每日学习时间轴" className="relative pb-[68vh]">
           {isLoading ? (
             <div className="py-12 text-xs text-neutral-500 font-mono">
               正在读取本地学习数据...
             </div>
           ) : (
             <div className="divide-y divide-neutral-900/80">
-              {timeline.map((entry) => {
+              {timeline.map((entry, idx) => {
                 const { monthDay, weekday, year } = formatChineseDateLabel(entry.date);
+                const isDateFocused =
+                  focusTarget?.kind === 'date' && focusTarget.key === entry.date;
+                const rowContainsFocusedLesson =
+                  focusTarget?.kind === 'lesson' &&
+                  entry.items.some(
+                    ({ course, slot }) =>
+                      `${course.id}-${slot.dayIndex}` === focusTarget.key
+                  );
+                const isRowBlurred = Boolean(
+                  focusTarget && !isDateFocused && !rowContainsFocusedLesson
+                );
+                const totalSections = entry.items.length;
+                const readySections = entry.items.filter(({ slot }) =>
+                  Boolean(slot.lesson)
+                ).length;
+                const completedSections = entry.items.filter(({ course, slot }) =>
+                  Boolean(getSlotExerciseSubmission(course, slot))
+                ).length;
+                const completionPercent =
+                  totalSections > 0
+                    ? Math.round((completedSections / totalSections) * 100)
+                    : 0;
+                const evaluatedDayMinutes = entry.items.reduce(
+                  (sum, { slot }) => sum + (getEvaluatedSectionMinutes(slot) || 0),
+                  0
+                );
+                const unassessedCount = entry.items.filter(
+                  ({ slot }) => getEvaluatedSectionMinutes(slot) === undefined
+                ).length;
 
                 return (
-                  <div
+                  <motion.div
                     key={entry.date}
-                    className="grid grid-cols-1 md:grid-cols-[180px_1fr] gap-4 md:gap-8 py-5"
+                    ref={entry.isToday ? todayRowRef : undefined}
+                    data-today-row={entry.isToday ? 'true' : undefined}
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={
+                      isRowBlurred
+                        ? { opacity: 0.25, y: 0, scale: 0.99 }
+                        : isDateFocused
+                          ? { opacity: 1, y: 0, scale: 1.01 }
+                          : { opacity: 1, y: 0, scale: 1 }
+                    }
+                    transition={{
+                      delay: focusTarget ? 0 : Math.min(idx * 0.015, 0.12),
+                      duration: 0.16,
+                      ease: [0.16, 1, 0.3, 1],
+                    }}
+                    className={`grid grid-cols-1 md:grid-cols-[190px_1fr] gap-3 md:gap-6 py-4 items-stretch ${
+                      entry.isToday
+                        ? 'scroll-mt-20 border-l-2 border-l-sky-400/80 pl-3 -ml-3'
+                        : ''
+                    }`}
                   >
-                    <div className="flex md:flex-col items-baseline justify-between md:justify-start gap-2">
+                    <motion.button
+                      type="button"
+                      animate={
+                        focusTarget?.kind === 'lesson' && rowContainsFocusedLesson
+                          ? { opacity: 0.25 }
+                          : { opacity: 1 }
+                      }
+                      transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
+                      onClick={(e) => navigateToDailyFocus(entry.date, e)}
+                      title={`点击进入 ${entry.date} 当日详细页`}
+                      className={`glow-border group text-left flex md:flex-col items-center md:items-start justify-between md:justify-center gap-1.5 rounded-lg px-3.5 py-3 border transition-all duration-150 cursor-pointer md:h-full ${
+                        isDateFocused
+                          ? 'border-sky-400/75 bg-sky-950/25 shadow-[0_0_24px_-12px_rgba(56,189,248,0.45)]'
+                          : entry.isToday
+                            ? 'border-sky-500/50 bg-sky-950/15 hover:border-sky-400/75 hover:bg-sky-950/25 shadow-[0_0_20px_-12px_rgba(56,189,248,0.35)]'
+                            : 'border-neutral-900 bg-neutral-950/45 hover:border-neutral-700 hover:bg-neutral-900/60'
+                      }`}
+                    >
                       <div className="flex items-baseline gap-2">
                         <span
-                          className={`text-sm font-mono font-semibold ${
-                            entry.isToday ? 'text-white' : 'text-neutral-300'
+                          className={`font-display text-lg font-bold tracking-tight transition-colors group-hover:text-sky-300 ${
+                            entry.isToday ? 'text-white' : 'text-neutral-100'
                           }`}
                         >
                           {monthDay}
                         </span>
-                        <span className="text-xs text-neutral-500">{weekday}</span>
+                        <span className="text-xs text-neutral-400">{weekday}</span>
                         {entry.isToday && (
-                          <span className="text-xs font-mono text-neutral-300 underline underline-offset-4">
+                          <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-sky-500/15 border border-sky-500/40 text-sky-300">
                             今日
                           </span>
                         )}
                       </div>
-                      <span className="text-xs text-neutral-600">
-                        {entry.date} ({year})
-                      </span>
-                    </div>
+                      <div className="flex items-center gap-1.5 text-xs text-neutral-500 group-hover:text-neutral-300 transition-colors">
+                        <span className="font-mono">
+                          {entry.date} ({year})
+                        </span>
+                        <ArrowUpRight className="w-3.5 h-3.5 opacity-55 group-hover:opacity-100 text-sky-400 transition-opacity" />
+                      </div>
+                      {entry.isToday && (idx > 0 || courses.length > 0) && (
+                        <span className="hidden md:inline-flex items-center gap-1 text-[11px] font-mono text-neutral-600 pt-0.5">
+                          <ArrowUp className="w-3 h-3" />
+                          <span>向上滚动查看先前课程</span>
+                        </span>
+                      )}
+                    </motion.button>
 
-                    <div className="space-y-3">
-                      {entry.items.length === 0 ? (
+                    <div className="flex">
+                      {totalSections === 0 ? (
                         entry.isToday && courses.length === 0 ? (
-                          <div className="border border-neutral-900 rounded p-5 bg-neutral-950/30 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                          <div className="w-full border border-neutral-900 rounded-lg p-5 bg-neutral-950/30 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                             <div className="space-y-1">
                               <p className="text-sm text-neutral-200">
                                 暂无课程安排
@@ -684,247 +1380,213 @@ export default function App() {
                             </button>
                           </div>
                         ) : (
-                          <div className="text-xs text-neutral-700 py-1 select-none">
+                          <div className="flex items-center text-xs text-neutral-700 py-1 select-none">
                             当日无课程安排
                           </div>
                         )
                       ) : (
-                        entry.items.map(({ course, slot }) => {
-                          const hasLesson = Boolean(slot.lesson);
-                          const isGeneratingThis =
-                            generatingSlotKey === `${course.id}-${slot.dayIndex}`;
-                          const submission = course.exerciseSubmissions?.[slot.date];
-                          const mode: CourseGenerationMode = course.generationMode || 'api';
-
-                          return (
-                            <div
-                              key={`${course.id}-${slot.id || slot.dayIndex}`}
-                              className="border border-neutral-800 hover:border-neutral-600 rounded p-4 bg-black transition-colors flex flex-col sm:flex-row sm:items-center justify-between gap-4"
-                            >
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setActiveLessonRef({
-                                    courseId: course.id,
-                                    dayIndex: slot.dayIndex,
-                                  })
-                                }
-                                className="text-left space-y-1.5 flex-1 min-w-0"
-                              >
-                                <div className="flex flex-wrap items-center gap-2 text-xs text-neutral-400 font-mono">
-                                  <span className="text-neutral-200 font-sans font-medium">
-                                    {course.name}
-                                  </span>
-                                  <span aria-hidden="true">·</span>
-                                  <span>{slot.id}</span>
-                                  <span aria-hidden="true">·</span>
-                                  <span>
-                                    第 {slot.dayIndex}/{course.durationDays} 天
-                                  </span>
-                                  <span aria-hidden="true">·</span>
-                                  <span>{MODE_LABELS[mode]}</span>
-                                  <span aria-hidden="true">·</span>
-                                  <span
-                                    className={
-                                      hasLesson ? 'text-neutral-200' : 'text-neutral-500'
-                                    }
-                                  >
-                                    {hasLesson ? '课件已就绪' : '待生成/导入课件'}
-                                  </span>
-                                  {slot.pdfSegment && (
-                                    <>
-                                      <span aria-hidden="true">·</span>
-                                      <span className="text-neutral-300">
-                                        PDF p.{slot.pdfSegment.physicalStartPage}–{slot.pdfSegment.physicalEndPage}
-                                      </span>
-                                    </>
-                                  )}
-                                  {course.category === 'english' && slot.assignedWords && (
-                                    <>
-                                      <span aria-hidden="true">·</span>
-                                      <span className="text-neutral-300">
-                                        今日 {slot.assignedWords.length} 词
-                                      </span>
-                                    </>
-                                  )}
-                                  {submission && (
-                                    <>
-                                      <span aria-hidden="true">·</span>
-                                      <span className="text-neutral-300">
-                                        练习得分 {submission.score}/{submission.total}
-                                      </span>
-                                    </>
-                                  )}
-                                </div>
-
-                                <div
-                                  className="text-sm font-semibold text-white"
-                                  dangerouslySetInnerHTML={{
-                                    __html: renderInlineMathWithLatex(slot.title),
-                                  }}
-                                />
-
-                                <p
-                                  className="text-xs text-neutral-400 line-clamp-2"
-                                  dangerouslySetInnerHTML={{
-                                    __html: renderInlineMathWithLatex(slot.objective),
-                                  }}
-                                />
-
-                                {slot.prerequisites && slot.prerequisites.length > 0 && (
-                                  <div className="text-xs text-neutral-500">
-                                    先修：
-                                    <span
-                                      dangerouslySetInnerHTML={{
-                                        __html: renderInlineMathWithLatex(
-                                          slot.prerequisites.join(' / ')
-                                        ),
-                                      }}
-                                    />
-                                  </div>
-                                )}
-
-                                {slot.keyTopics && slot.keyTopics.length > 0 && (
-                                  <div className="text-xs text-neutral-500 pt-0.5">
-                                    知识点：
-                                    <span
-                                      dangerouslySetInnerHTML={{
-                                        __html: renderInlineMathWithLatex(
-                                          slot.keyTopics.join(' / ')
-                                        ),
-                                      }}
-                                    />
-                                  </div>
-                                )}
-                              </button>
-
-                              <div className="flex items-center gap-2 shrink-0 self-start sm:self-center">
-                                <button
-                                  type="button"
-                                  onClick={(e) =>
-                                    handleGenerateSlotOnTimeline(
-                                      e,
-                                      course,
-                                      slot.dayIndex
-                                    )
-                                  }
-                                  disabled={isGeneratingThis}
-                                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors whitespace-nowrap disabled:opacity-50"
-                                >
-                                  <RefreshCw
-                                    className={`w-3 h-3 ${
-                                      isGeneratingThis ? 'animate-spin' : ''
-                                    }`}
-                                  />
-                                  <span>
-                                    {isGeneratingThis
-                                      ? 'API 生成中...'
-                                      : hasLesson
-                                        ? 'API 重新生成'
-                                        : 'API 生成课件'}
-                                  </span>
-                                </button>
-
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setActiveLessonRef({
-                                      courseId: course.id,
-                                      dayIndex: slot.dayIndex,
-                                    })
-                                  }
-                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-neutral-900 hover:bg-neutral-800 text-white border border-neutral-700 rounded transition-colors whitespace-nowrap"
-                                >
-                                  {hasLesson ? (
-                                    <>
-                                      <BookOpen className="w-3.5 h-3.5" />
-                                      <span>进入学习</span>
-                                    </>
-                                  ) : (
-                                    <>
-                                      <MessageSquare className="w-3.5 h-3.5" />
-                                      <span>Chat / Agent 生成</span>
-                                    </>
-                                  )}
-                                </button>
+                        <button
+                          type="button"
+                          onClick={(e) => navigateToDailyFocus(entry.date, e)}
+                          title={`点击进入 ${entry.date} 当日详细页`}
+                          className={`glow-border group w-full h-full text-left rounded-lg border px-4 py-3.5 transition-all duration-150 cursor-pointer flex flex-col justify-between gap-3 ${
+                            isDateFocused
+                              ? 'border-sky-400/75 bg-sky-950/20 shadow-[0_0_24px_-12px_rgba(56,189,248,0.4)]'
+                              : entry.isToday
+                                ? 'border-sky-500/45 bg-neutral-950/85 hover:border-sky-400/75 hover:bg-sky-950/15 shadow-[0_0_20px_-14px_rgba(56,189,248,0.35)]'
+                                : 'border-neutral-800/90 bg-neutral-950/65 hover:border-neutral-600 hover:bg-neutral-900/65'
+                          }`}
+                        >
+                          <div className="grid grid-cols-3 gap-3 sm:gap-6 items-start">
+                            <div className="min-w-0 space-y-1">
+                              <div className="text-[11px] text-neutral-500">
+                                当日课程
+                              </div>
+                              <div className="text-sm sm:text-base font-semibold text-neutral-100 font-mono tabular-nums">
+                                {totalSections} 节
+                              </div>
+                              <div className="text-[11px] font-mono text-neutral-500 tabular-nums">
+                                课件就绪 {readySections}/{totalSections}
                               </div>
                             </div>
-                          );
-                        })
+
+                            <div className="min-w-0 space-y-1">
+                              <div className="text-[11px] text-neutral-500">
+                                预计时长
+                              </div>
+                              <div className="text-sm sm:text-base font-semibold text-neutral-100 font-mono tabular-nums">
+                                {evaluatedDayMinutes > 0
+                                  ? `${evaluatedDayMinutes} 分钟`
+                                  : '待评估'}
+                              </div>
+                              <div className="text-[11px] font-mono text-neutral-500 truncate">
+                                {unassessedCount > 0
+                                  ? evaluatedDayMinutes > 0
+                                    ? `另有 ${unassessedCount} 节待评估`
+                                    : `${unassessedCount} 节待评估学时`
+                                  : '已全部评估'}
+                              </div>
+                            </div>
+
+                            <div className="min-w-0 space-y-1">
+                              <div className="text-[11px] text-neutral-500">
+                                已完成小节
+                              </div>
+                              <div className="flex items-baseline gap-1.5 font-mono tabular-nums">
+                                <span
+                                  className={`text-sm sm:text-base font-semibold ${
+                                    completedSections === totalSections
+                                      ? 'text-emerald-400'
+                                      : completedSections > 0
+                                        ? 'text-sky-300'
+                                        : 'text-neutral-100'
+                                  }`}
+                                >
+                                  {completedSections}/{totalSections}
+                                </span>
+                                <span className="text-[11px] text-neutral-400">
+                                  {completionPercent}%
+                                </span>
+                              </div>
+                              <div className="inline-flex items-center gap-1 text-[11px] font-mono text-neutral-500 group-hover:text-sky-300 transition-colors">
+                                <span>详情</span>
+                                <ArrowUpRight className="w-3 h-3 opacity-70 group-hover:opacity-100 transition-opacity" />
+                              </div>
+                            </div>
+                          </div>
+
+                          <div
+                            className="h-1 w-full rounded-full bg-neutral-900 overflow-hidden"
+                            role="progressbar"
+                            aria-valuenow={completionPercent}
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                            aria-label={`${entry.date} 实际学习完成进度 ${completionPercent}%`}
+                          >
+                            <div
+                              className={`h-full rounded-full transition-all duration-300 ${
+                                completedSections === totalSections
+                                  ? 'bg-emerald-400'
+                                  : completedSections > 0
+                                    ? 'bg-sky-400'
+                                    : 'bg-transparent'
+                              }`}
+                              style={{ width: `${completionPercent}%` }}
+                            />
+                          </div>
+                        </button>
                       )}
                     </div>
-                  </div>
+                  </motion.div>
                 );
               })}
             </div>
           )}
         </section>
       </main>
+            </motion.div>
+          )}
+        </AnimatePresence>
+        )}
 
-      <div className="fixed bottom-6 right-6 z-40">
-        <button
-          type="button"
-          onClick={() => setIsSettingsOpen(true)}
-          aria-label="设置"
-          className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-medium bg-black hover:bg-neutral-900 text-neutral-200 hover:text-white border border-neutral-700 rounded shadow-lg transition-colors whitespace-nowrap"
-        >
-          <SettingsIcon className="w-3.5 h-3.5" />
-          <span>设置</span>
-        </button>
+        {/* Corner Settings Button (Bottom-Right, includes Learning Statistics) */}
+        {!isWelcomeOpen && (
+          <motion.div
+            animate={
+              focusTarget
+                ? { opacity: 0.25 }
+                : { opacity: 1 }
+            }
+            transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
+            className={`fixed ${isShowingLesson ? 'bottom-20 right-6' : 'bottom-6 right-6'} z-40`}
+          >
+            <button
+              type="button"
+              data-testid="open-settings-btn"
+              onClick={() => setIsSettingsOpen(true)}
+              aria-label="设置与学习统计"
+              className="glow-border inline-flex items-center gap-2 px-4 py-2 text-xs font-medium bg-black/95 hover:bg-neutral-900 text-neutral-200 hover:text-white border border-neutral-800 hover:border-neutral-600 rounded shadow-lg transition-colors whitespace-nowrap"
+            >
+              <SettingsIcon className="w-3.5 h-3.5" />
+              <span>设置</span>
+            </button>
+          </motion.div>
+        )}
+
+        <WelcomeModal
+          isOpen={isWelcomeOpen}
+          initialMode={preferredMode}
+          onClose={handleCloseWelcome}
+        />
+
+        <AddCourseModal
+          isOpen={isAddCourseOpen}
+          defaultLearnerLevel={settings.defaultLearnerLevel}
+          defaultLearnerBaseline={settings.defaultLearnerBaseline}
+          defaultCustomLearnerBaseline={settings.defaultCustomLearnerBaseline}
+          defaultLearningDepth={settings.defaultLearningDepth}
+          defaultCustomLearningDepth={settings.defaultCustomLearningDepth}
+          defaultGenerationMode={preferredMode}
+          onClose={() => setIsAddCourseOpen(false)}
+          onCourseCreated={handleCourseCreated}
+        />
+
+        <AgentModeModal
+          isOpen={Boolean(agentModalCourse)}
+          course={agentModalCourse}
+          onClose={() => setAgentModalCourseId(null)}
+          onCourseUpdated={handleCourseUpdated}
+        />
+
+        <CourseOutlineModal
+          isOpen={Boolean(outlineModalCourse)}
+          course={outlineModalCourse}
+          initialStep={outlineModalState?.step || 'outline'}
+          showAdvancedWorkflowDetails={Boolean(settings.showAdvancedWorkflowDetails)}
+          onOpenSettings={() => {
+            setOutlineModalState(null);
+            setIsSettingsOpen(true);
+          }}
+          onClose={() => setOutlineModalState(null)}
+          onCourseUpdated={handleCourseUpdated}
+          onOpenLesson={(courseId, dayIndex) => {
+            setOutlineModalState(null);
+            navigateToLesson(courseId, dayIndex, undefined, true);
+          }}
+          onOpenAgentModal={(c) => {
+            setOutlineModalState(null);
+            setAgentModalCourseId(c.id);
+          }}
+        />
+
+        <DeleteCourseModal
+          isOpen={Boolean(deleteTargetCourse)}
+          course={deleteTargetCourse}
+          onClose={() => setDeleteTargetCourseId(null)}
+          onConfirmDelete={handleConfirmDeleteCourse}
+        />
+
+        <SettingsModal
+          isOpen={isSettingsOpen}
+          settings={settings}
+          promptPresets={promptPresets}
+          courses={courses}
+          studyStats={studyStats}
+          liveSessionSeconds={isShowingLesson ? liveStudySeconds : 0}
+          lastBrowsingState={lastBrowsingState}
+          onClose={() => setIsSettingsOpen(false)}
+          onOpenWelcome={() => setIsWelcomeOpen(true)}
+          onSettingsUpdated={(newSettings, newPresets) => {
+            setSettings(newSettings);
+            if (newPresets) setPromptPresets(newPresets);
+          }}
+        />
+
+        <BrandShowcaseModal
+          isOpen={isBrandShowcaseOpen}
+          onClose={() => setIsBrandShowcaseOpen(false)}
+        />
       </div>
-
-      <AddCourseModal
-        isOpen={isAddCourseOpen}
-        defaultLearnerLevel={settings.defaultLearnerLevel}
-        onClose={() => setIsAddCourseOpen(false)}
-        onCourseCreated={handleCourseCreated}
-      />
-
-      <AgentModeModal
-        isOpen={Boolean(agentModalCourse)}
-        course={agentModalCourse}
-        onClose={() => setAgentModalCourseId(null)}
-        onCourseUpdated={handleCourseUpdated}
-      />
-
-      <CourseOutlineModal
-        isOpen={Boolean(outlineModalCourse)}
-        course={outlineModalCourse}
-        initialStep={outlineModalState?.step || 'outline'}
-        showAdvancedWorkflowDetails={Boolean(settings.showAdvancedWorkflowDetails)}
-        onOpenSettings={() => {
-          setOutlineModalState(null);
-          setIsSettingsOpen(true);
-        }}
-        onClose={() => setOutlineModalState(null)}
-        onCourseUpdated={handleCourseUpdated}
-        onOpenLesson={(courseId, dayIndex) => {
-          setOutlineModalState(null);
-          setActiveLessonRef({ courseId, dayIndex });
-        }}
-        onOpenAgentModal={(c) => {
-          setOutlineModalState(null);
-          setAgentModalCourseId(c.id);
-        }}
-      />
-
-      <DeleteCourseModal
-        isOpen={Boolean(deleteTargetCourse)}
-        course={deleteTargetCourse}
-        onClose={() => setDeleteTargetCourseId(null)}
-        onConfirmDelete={handleConfirmDeleteCourse}
-      />
-
-      <SettingsModal
-        isOpen={isSettingsOpen}
-        settings={settings}
-        promptPresets={promptPresets}
-        onClose={() => setIsSettingsOpen(false)}
-        onSettingsUpdated={(newSettings, newPresets) => {
-          setSettings(newSettings);
-          if (newPresets) setPromptPresets(newPresets);
-        }}
-      />
-    </div>
+    </MotionConfig>
   );
 }

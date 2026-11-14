@@ -1,11 +1,9 @@
 import fs from 'fs';
 import path from 'path';
-import zlib from 'zlib';
 import { pathToFileURL } from 'url';
 import type {
   DailyPlanSlot,
   PdfDocumentMeta,
-  PdfPageEntry,
   PdfSplitPlanItem,
   PdfTocEntry,
 } from '../types';
@@ -40,29 +38,24 @@ async function getPdfJs(): Promise<any | null> {
 }
 
 /**
- * Detect garbled CID/glyph-index text emitted by PDFs lacking ToUnicode CMap
- * (e.g. "2.08 k,SsS_R0-50vkO|ep0 VN:Rv_QeOS|epQ\,b@NN:", "6.1 Wg,{u5 281 _QR=500 k (2) NW0cS,R{,N~SN:S").
+ * Filter corrupted/control-character titles in embedded PDF Outlines (bookmarks).
  */
-export function isGarbledPdfText(text: string): boolean {
+export function isCorruptedBookmarkTitle(text: string): boolean {
   const trimmed = (text || '').trim();
   if (!trimmed) return true;
 
-  // Count CJK characters (real Chinese/Japanese/Korean text)
   const cjkMatches = trimmed.match(/[\u4e00-\u9fff]/g) || [];
   const totalNonSpace = trimmed.replace(/\s+/g, '').length;
   if (totalNonSpace === 0) return true;
 
-  // Replacement character / control chars ratio
   const badChars = (trimmed.match(/[\uFFFD\x00-\x08\x0B\x0C\x0E-\x1F]/g) || []).length;
   if (badChars / totalNonSpace > 0.08) return true;
 
-  // If it has substantial CJK characters and low symbol corruption, treat as valid readable text
   const weirdSymbols = (trimmed.match(/[|\\~@{}`^]/g) || []).length;
   if (cjkMatches.length >= 4 && weirdSymbols / totalNonSpace < 0.15) {
     return false;
   }
 
-  // Detect CID-glyph ASCII noise: mixed punctuation + erratic uppercase/lowercase within tokens
   const tokens = trimmed.split(/\s+/).filter(Boolean);
   let gibberishTokenCount = 0;
   let realEnglishWordCount = 0;
@@ -70,16 +63,13 @@ export function isGarbledPdfText(text: string): boolean {
   for (const tok of tokens) {
     const cleanTok = tok.replace(/^[("'[]+|[)"'\],.;:!?]+$/g, '');
     if (!cleanTok) continue;
-    // Normal English word (all letters, reasonable capitalization)
     if (/^(?:[A-Z]?[a-z]{2,}|[A-Z]{2,8})$/.test(cleanTok)) {
       realEnglishWordCount++;
       continue;
     }
-    // Pure number / section number like "6.1.17"
     if (/^\d+(?:\.\d+)*$/.test(cleanTok)) {
       continue;
     }
-    // Token containing weird symbols or internal case flips mixed with punctuation/digits like "k,SsS_R0-50vkO|ep0" or "NW0cS,R{,N~SN:S"
     if (
       /[a-zA-Z0-9][,|\\~@{}_`^][a-zA-Z0-9]/.test(tok) ||
       (/[a-z][A-Z][a-z]/.test(cleanTok) && /[,|\\~@{}()[\]_]/.test(tok)) ||
@@ -93,29 +83,11 @@ export function isGarbledPdfText(text: string): boolean {
     return true;
   }
 
-  // Also reject lines with zero CJK, zero normal 3+ letter words, and strange punctuation mix
   if (cjkMatches.length === 0 && realEnglishWordCount === 0 && weirdSymbols >= 1) {
     return true;
   }
 
-  // Reject ultra-short cryptic fragments with trailing mismatched parens like "6.1.17) V" or "6.1.21) dt V"
-  if (cjkMatches.length === 0 && /^\d+(?:\.\d+)+\)\s*[a-zA-Z]{1,3}(?:\s+[a-zA-Z]{1,3})?$/.test(trimmed)) {
-    return true;
-  }
-
   return false;
-}
-
-/**
- * Filter garbled CID lines out of extracted PDF page text while keeping readable lines intact.
- */
-export function sanitizePdfExtractedText(rawText: string): string {
-  if (!rawText) return '';
-  const lines = rawText
-    .split(/\r?\n/)
-    .map((l) => l.replace(/\s+/g, ' ').trim())
-    .filter((l) => l.length > 0 && !isGarbledPdfText(l));
-  return lines.join('\n').trim();
 }
 
 function buildMinimalPdfBufferFromPages(pageLines: string[]): Buffer {
@@ -165,134 +137,6 @@ function buildMinimalPdfBufferFromPages(pageLines: string[]): Buffer {
   return Buffer.from(pdf, 'latin1');
 }
 
-function decodePdfTextToken(token: string): string {
-  // Handle octal escapes \ddd and standard escapes
-  return token
-    .replace(/\\([0-7]{1,3})/g, (_m, oct) => String.fromCharCode(parseInt(oct, 8)))
-    .replace(/\\n/g, '\n')
-    .replace(/\\r/g, '\r')
-    .replace(/\\t/g, '\t')
-    .replace(/\\\(/g, '(')
-    .replace(/\\\)/g, ')')
-    .replace(/\\\\/g, '\\');
-}
-
-function decodeHexToken(hexStr: string): string {
-  const clean = hexStr.replace(/\s+/g, '');
-  if (clean.length === 0) return '';
-  // Check UTF-16BE BOM (FEFF)
-  if (clean.toUpperCase().startsWith('FEFF')) {
-    let out = '';
-    for (let i = 4; i + 3 < clean.length; i += 4) {
-      const code = parseInt(clean.slice(i, i + 4), 16);
-      if (code === 0xfeff) continue;
-      if (!Number.isNaN(code) && code >= 32) {
-        out += String.fromCharCode(code);
-      }
-    }
-    if (out.trim()) return out;
-  }
-  let ascii = '';
-  for (let i = 0; i + 1 < clean.length; i += 2) {
-    const code = parseInt(clean.slice(i, i + 2), 16);
-    if (!Number.isNaN(code) && code >= 32 && code <= 126) {
-      ascii += String.fromCharCode(code);
-    }
-  }
-  return ascii;
-}
-
-function extractTextFromContentStream(content: string): string[] {
-  const chunks: string[] = [];
-
-  // Literal strings (...) Tj
-  const tjRegex = /\(([^()\\]*(?:\\.[^()\\]*)*)\)\s*Tj/g;
-  let m: RegExpExecArray | null;
-  while ((m = tjRegex.exec(content)) !== null) {
-    const txt = decodePdfTextToken(m[1]).trim();
-    if (txt && !isGarbledPdfText(txt)) chunks.push(txt);
-  }
-
-  // Hex strings <...> Tj
-  const hexTjRegex = /<([0-9A-Fa-f\s]+)>\s*Tj/g;
-  while ((m = hexTjRegex.exec(content)) !== null) {
-    const txt = decodeHexToken(m[1]).trim();
-    if (txt && !isGarbledPdfText(txt)) chunks.push(txt);
-  }
-
-  // Array strings [...] TJ
-  const tjArrayRegex = /\[([\s\S]*?)\]\s*TJ/g;
-  while ((m = tjArrayRegex.exec(content)) !== null) {
-    const inner = m[1];
-    const tokenRegex = /\(([^()\\]*(?:\\.[^()\\]*)*)\)|<([0-9A-Fa-f\s]+)>/g;
-    let pm: RegExpExecArray | null;
-    const lineParts: string[] = [];
-    while ((pm = tokenRegex.exec(inner)) !== null) {
-      if (pm[1] !== undefined) {
-        lineParts.push(decodePdfTextToken(pm[1]));
-      } else if (pm[2] !== undefined) {
-        lineParts.push(decodeHexToken(pm[2]));
-      }
-    }
-    if (lineParts.length > 0) {
-      const joined = lineParts.join('').trim();
-      if (joined && !isGarbledPdfText(joined)) chunks.push(joined);
-    }
-  }
-
-  return chunks;
-}
-
-/**
- * Extract all decompressed stream texts from a raw PDF buffer (fallback when pdfjs-dist is unavailable).
- */
-function extractAllStreamsFromPdfBuffer(buffer: Buffer): string[] {
-  const rawLatin1 = buffer.toString('latin1');
-  const streamTexts: string[] = [];
-  const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
-  let match: RegExpExecArray | null;
-
-  while ((match = streamRegex.exec(rawLatin1)) !== null) {
-    const streamBody = Buffer.from(match[1], 'latin1');
-    let decodedStream = '';
-    try {
-      decodedStream = zlib.inflateSync(streamBody).toString('utf-8');
-    } catch {
-      try {
-        decodedStream = zlib.inflateRawSync(streamBody).toString('utf-8');
-      } catch {
-        decodedStream = match[1];
-      }
-    }
-    const chunks = extractTextFromContentStream(decodedStream);
-    if (chunks.length > 0) {
-      const joined = chunks.join(' ').replace(/\s+/g, ' ').trim();
-      if (!isGarbledPdfText(joined)) {
-        streamTexts.push(joined);
-      }
-    }
-  }
-
-  return streamTexts;
-}
-
-/**
- * Deprecated OCR-based TOC/offset heuristic.
- * We intentionally do NOT infer printed page numbers, TOC structure, or page offsets from OCR/extracted text,
- * because chapter/figure numbers (e.g. "278 第6章...", "图 6.1.1 ... 279") cause false page offsets and bogus bounds.
- * Genuine PDF bookmarks (Outlines) are extracted via `extractBookmarksWithPdfJs`, and extracted text is attached
- * purely as an optional per-physical-page reference alongside the actual PDF file.
- */
-export function detectTocAndOffsetFromPages(_pages: PdfPageEntry[]): {
-  tocEntries: PdfTocEntry[];
-  detectedPageOffset: number;
-} {
-  return {
-    tocEntries: [],
-    detectedPageOffset: 0,
-  };
-}
-
 /**
  * Resolve genuine PDF document bookmarks (Outlines) using pdfjs-dist into physical page TOC entries.
  */
@@ -325,7 +169,7 @@ async function extractBookmarksWithPdfJs(pdfDoc: any, maxPages: number): Promise
       for (const item of items) {
         if (!item) continue;
         const title = String(item.title || '').replace(/\s+/g, ' ').trim();
-        if (title && !isGarbledPdfText(title)) {
+        if (title && !isCorruptedBookmarkTitle(title)) {
           const physicalPage = item.dest ? await resolveDestPage(item.dest) : undefined;
           const prefix = depth > 0 ? '  '.repeat(Math.min(depth, 2)) : '';
           results.push({
@@ -333,7 +177,7 @@ async function extractBookmarksWithPdfJs(pdfDoc: any, maxPages: number): Promise
             physicalPage,
           });
         }
-        if (results.length >= 120) return;
+        if (results.length >= 160) return;
         if (Array.isArray(item.items) && item.items.length > 0 && depth < 2) {
           await walk(item.items, depth + 1);
         }
@@ -341,15 +185,15 @@ async function extractBookmarksWithPdfJs(pdfDoc: any, maxPages: number): Promise
     };
 
     await walk(outline, 0);
-    return results.slice(0, 120);
+    return results.slice(0, 160);
   } catch {
     return [];
   }
 }
 
 /**
- * Analyze a PDF buffer to extract physical page count, PDF bookmarks, per-page Unicode text
- * (with garbled CID filtering), TOC entries, and printed-to-physical page offset.
+ * Inspect a PDF strictly for structural metadata (physical page count & embedded PDF bookmarks).
+ * Does NOT run text extraction — multimodal models inspect PDF files directly.
  */
 export async function analyzePdfBuffer(
   buffer: Buffer,
@@ -359,10 +203,8 @@ export async function analyzePdfBuffer(
   meta: PdfDocumentMeta;
 }> {
   let totalPages = 1;
-  const pages: PdfPageEntry[] = [];
   let bookmarkEntries: PdfTocEntry[] = [];
 
-  // 1. Primary path: pdfjs-dist (supports Unicode ToUnicode CMaps, Adobe-GB1/CNS1 CMaps & Outlines)
   const pdfjs = await getPdfJs();
   let pdfjsSucceeded = false;
 
@@ -370,8 +212,11 @@ export async function analyzePdfBuffer(
     try {
       const cMapDir = path.join(process.cwd(), 'node_modules', 'pdfjs-dist', 'cmaps');
       const stdFontsDir = path.join(process.cwd(), 'node_modules', 'pdfjs-dist', 'standard_fonts');
+      const copyBytes = new Uint8Array(buffer.byteLength);
+      copyBytes.set(buffer);
+
       const loadOpts: Record<string, any> = {
-        data: new Uint8Array(buffer),
+        data: copyBytes,
         verbosity: 0,
         disableFontFace: true,
         isEvalSupported: false,
@@ -388,48 +233,6 @@ export async function analyzePdfBuffer(
       const pdfDoc = await loadingTask.promise;
       totalPages = Math.max(1, Number(pdfDoc.numPages) || 1);
       bookmarkEntries = await extractBookmarksWithPdfJs(pdfDoc, totalPages);
-
-      // Extract text for each page (cap full-scan extraction at 600 pages for speed, sample beyond)
-      const maxExtractPages = Math.min(totalPages, 600);
-      for (let pNum = 1; pNum <= totalPages; pNum++) {
-        let cleanPageText = '';
-        if (pNum <= maxExtractPages) {
-          try {
-            const page = await pdfDoc.getPage(pNum);
-            const textContent = await page.getTextContent();
-            const items = Array.isArray(textContent?.items) ? textContent.items : [];
-            const lines: string[] = [];
-            let currentLine: string[] = [];
-            let lastY: number | null = null;
-
-            for (const item of items) {
-              const str = typeof item?.str === 'string' ? item.str : '';
-              if (!str) continue;
-              const y = Array.isArray(item?.transform) ? Number(item.transform[5]) : null;
-              if (lastY !== null && y !== null && Math.abs(y - lastY) > 4) {
-                if (currentLine.length > 0) {
-                  lines.push(currentLine.join(' '));
-                  currentLine = [];
-                }
-              }
-              currentLine.push(str);
-              if (y !== null) lastY = y;
-            }
-            if (currentLine.length > 0) {
-              lines.push(currentLine.join(' '));
-            }
-            cleanPageText = sanitizePdfExtractedText(lines.join('\n'));
-          } catch {
-            // ignore per-page failure
-          }
-        }
-
-        pages.push({
-          physicalPage: pNum,
-          textPreview: cleanPageText.slice(0, 1200),
-        });
-      }
-
       pdfjsSucceeded = true;
       await pdfDoc.destroy?.();
     } catch {
@@ -437,12 +240,14 @@ export async function analyzePdfBuffer(
     }
   }
 
-  // 2. Fallback path when pdfjs-dist fails or is unavailable
   if (!pdfjsSucceeded) {
     try {
       const pdfLib = await getPdfLib();
       if (pdfLib) {
-        const pdfDoc = await pdfLib.PDFDocument.load(buffer, { ignoreEncryption: true });
+        const pdfDoc = await pdfLib.PDFDocument.load(buffer, {
+          ignoreEncryption: true,
+          updateMetadata: false,
+        });
         totalPages = Math.max(1, pdfDoc.getPageCount());
       } else {
         const rawLatin1 = buffer.toString('latin1');
@@ -454,62 +259,40 @@ export async function analyzePdfBuffer(
       const pageMatches = rawLatin1.match(/\/Type\s*\/Page\b(?!s)/g);
       totalPages = pageMatches ? Math.max(1, pageMatches.length) : 1;
     }
-
-    const streamTexts = extractAllStreamsFromPdfBuffer(buffer);
-    pages.length = 0;
-
-    for (let i = 0; i < totalPages; i++) {
-      const physicalPage = i + 1;
-      let pageText = '';
-      if (streamTexts.length === totalPages) {
-        pageText = streamTexts[i] || '';
-      } else if (streamTexts.length > 0) {
-        const startIdx = Math.floor((i * streamTexts.length) / totalPages);
-        const endIdx = Math.max(startIdx + 1, Math.floor(((i + 1) * streamTexts.length) / totalPages));
-        pageText = streamTexts.slice(startIdx, endIdx).join(' ');
-      }
-      pageText = sanitizePdfExtractedText(pageText);
-
-      pages.push({
-        physicalPage,
-        textPreview: pageText.slice(0, 1200),
-      });
-    }
   }
 
-  // Only keep genuine embedded PDF bookmarks; never synthesize TOC or pageOffset via OCR regexes
   const tocEntries = bookmarkEntries.filter(
     (b) => b.physicalPage === undefined || (b.physicalPage >= 1 && b.physicalPage <= totalPages)
   );
-  const detectedPageOffset = 0;
-
-  const fullText = pages
-    .filter((p) => Boolean(p.textPreview))
-    .map((p) => `[PDF 物理第 ${p.physicalPage} 页] ${p.textPreview}`)
-    .join('\n')
-    .slice(0, 60000);
 
   return {
-    fullText:
-      fullText.trim() ||
-      `[PDF 文档: ${fileName}，共 ${totalPages} 物理页${
-        tocEntries.length > 0
-          ? `，含 ${tocEntries.length} 条 PDF 内嵌书签`
-          : '（未提取到纯文本，将直接随附 PDF 原文件供 AI 识别划分）'
-      }]`,
+    fullText: '',
     meta: {
       fileName,
       totalPages,
-      detectedPageOffset,
+      detectedPageOffset: 0,
       tocEntries,
-      pages,
+      pages: [],
     },
   };
 }
 
 /**
- * Build a clean initial PDF region/split suggestion from clean PDF bookmarks or page ranges.
- * Used as an editable starting scaffold when outline does not exist yet or when slicing by outline.
+ * Analyze a PDF stored on disk without requiring extra JSON/Base64 copies.
+ */
+export async function analyzePdfFile(
+  filePath: string,
+  fileName: string
+): Promise<{
+  fullText: string;
+  meta: PdfDocumentMeta;
+}> {
+  const buf = fs.readFileSync(filePath);
+  return analyzePdfBuffer(buf, fileName);
+}
+
+/**
+ * Build an initial editable PDF region suggestion from embedded PDF bookmarks or page ranges.
  */
 export function buildHeuristicPdfSplitPlan(params: {
   outline: DailyPlanSlot[];
@@ -537,10 +320,9 @@ export function buildHeuristicPdfSplitPlan(params: {
     return existingPlan;
   }
 
-  // If no outline yet, build regions from clean PDF bookmarks (if available)
   if (!outline || outline.length === 0) {
     const cleanBookmarks = (primaryPdf.tocEntries || []).filter(
-      (t) => t.title && !isGarbledPdfText(t.title) && typeof t.physicalPage === 'number'
+      (t) => t.title && !isCorruptedBookmarkTitle(t.title) && typeof t.physicalPage === 'number'
     );
     if (cleanBookmarks.length > 0) {
       const topBookmarks = cleanBookmarks.filter((b) => !b.title.startsWith('  ')).slice(0, 20);
@@ -626,8 +408,7 @@ export function buildHeuristicPdfSplitPlan(params: {
 }
 
 /**
- * Recalculate physical page numbers across a PDF split plan when the user adjusts
- * the printed-to-physical page offset (`physicalPage = printedPage + pageOffset`).
+ * Recalculate physical page numbers across a PDF split plan when adjusting page offset.
  */
 export function applyPageOffsetToSplitPlan(
   splitPlan: PdfSplitPlanItem[],
@@ -733,8 +514,6 @@ export function parseImportedPdfSplitPlan(
         (typeof it.sectionId === 'string' && it.sectionId.startsWith('region-')))
   );
 
-  // When outline does not exist yet (Step 1 region splitting) or items explicitly use region IDs,
-  // preserve every LLM-defined region directly without truncating/forcing onto placeholder slots.
   if (isPlaceholderOutline || usesRegionIds) {
     return rawItems.map((item, idx) => {
       const orderIdx = Number(item?.dayIndex) || idx + 1;
@@ -797,7 +576,6 @@ export function parseImportedPdfSplitPlan(
         status: item?.status === 'sliced' ? 'sliced' : 'planned',
         segmentRelPath: item?.segmentRelPath,
         segmentPageCount: item?.segmentPageCount,
-        extractedSegmentText: item?.extractedSegmentText,
       };
     });
   }
@@ -875,9 +653,8 @@ export function parseImportedPdfSplitPlan(
 
 /**
  * Local PDF Processing Script Engine:
- * Slices the original PDF in `courses/<folder>/sources/` into per-section PDFs in
- * `courses/<folder>/segments/<sectionId>.pdf` using `pdf-lib` (or fallback builder if not yet installed),
- * preserving original pages' text, formulas, vector graphics, and images without re-layout.
+ * Slices the original PDF in `courses/<folder>/sources/` into lossless per-section PDFs in
+ * `courses/<folder>/segments/<sectionId>.pdf` using `pdf-lib`.
  */
 export async function executePdfSplitPlanOnDisk(params: {
   courseDir: string;
@@ -894,15 +671,13 @@ export async function executePdfSplitPlanOnDisk(params: {
 
   const pdfLib = await getPdfLib();
 
-  // Discover available PDF files in sources/
   const sourceFiles = fs.existsSync(sourcesDir)
     ? fs.readdirSync(sourcesDir).filter((f) => f.toLowerCase().endsWith('.pdf'))
     : [];
 
-  // Cache loaded source PDFDocuments and page texts
   const docCache = new Map<
     string,
-    { pdfDoc: any | null; totalPages: number; pagesTextMap: Map<number, string> }
+    { pdfDoc: any | null; totalPages: number }
   >();
 
   const loadSourcePdf = async (requestedName: string) => {
@@ -928,7 +703,6 @@ export async function executePdfSplitPlanOnDisk(params: {
     const pdfDoc = pdfLib
       ? await pdfLib.PDFDocument.load(buf, { ignoreEncryption: true })
       : null;
-    const pagesTextMap = new Map<number, string>();
     let totalPages = pdfDoc ? pdfDoc.getPageCount() : 1;
 
     const metaPath = `${absPath}.pages.json`;
@@ -936,23 +710,15 @@ export async function executePdfSplitPlanOnDisk(params: {
       try {
         const metaObj = JSON.parse(fs.readFileSync(metaPath, 'utf-8')) as PdfDocumentMeta;
         if (metaObj.totalPages) totalPages = Math.max(totalPages, metaObj.totalPages);
-        if (Array.isArray(metaObj.pages)) {
-          for (const p of metaObj.pages) {
-            pagesTextMap.set(p.physicalPage, p.textPreview || '');
-          }
-        }
       } catch {
         // ignore
       }
-    } else {
+    } else if (!pdfDoc) {
       const analyzed = await analyzePdfBuffer(buf, targetFile);
       totalPages = Math.max(totalPages, analyzed.meta.totalPages);
-      for (const p of analyzed.meta.pages) {
-        pagesTextMap.set(p.physicalPage, p.textPreview || '');
-      }
     }
 
-    const entry = { pdfDoc, totalPages, pagesTextMap };
+    const entry = { pdfDoc, totalPages };
     docCache.set(absPath, entry);
     return { fileName: targetFile, ...entry };
   };
@@ -978,11 +744,10 @@ export async function executePdfSplitPlanOnDisk(params: {
         continue;
       }
 
-      const { pdfDoc, totalPages, pagesTextMap, fileName: resolvedSourceName } = loaded;
+      const { pdfDoc, totalPages, fileName: resolvedSourceName } = loaded;
       const startPage = Math.max(1, Math.min(totalPages, Number(item.physicalStartPage) || 1));
       const endPage = Math.max(startPage, Math.min(totalPages, Number(item.physicalEndPage) || startPage));
 
-      // Combine prerequisite / cross-reference pages + main section page range
       const orderedPhysicalPages: number[] = [];
       const seenPages = new Set<number>();
 
@@ -1017,19 +782,9 @@ export async function executePdfSplitPlanOnDisk(params: {
         fs.writeFileSync(absSegmentPdfPath, Buffer.from(pdfBytes));
       } else {
         const fallbackPages = orderedPhysicalPages.map(
-          (pNum) => pagesTextMap.get(pNum) || `Physical Page ${pNum}`
+          (pNum) => `Physical Page ${pNum}`
         );
         fs.writeFileSync(absSegmentPdfPath, buildMinimalPdfBufferFromPages(fallbackPages));
-      }
-
-      // Do not generate or attach OCR .txt dumps; multimodal models read the lossless sliced PDF directly.
-      const legacyTxtPath = path.join(segmentsDir, `${sectionId}.txt`);
-      if (fs.existsSync(legacyTxtPath)) {
-        try {
-          fs.unlinkSync(legacyTxtPath);
-        } catch {
-          // ignore
-        }
       }
 
       updatedPlan.push({
@@ -1066,7 +821,7 @@ export async function executePdfSplitPlanOnDisk(params: {
 }
 
 /**
- * Helper to create a valid multi-page PDF buffer with distinct text per page (for testing & demos).
+ * Helper to create a valid multi-page PDF buffer (for testing & demos).
  */
 export async function createMultiPagePdfBuffer(pageLines: string[]): Promise<Buffer> {
   const pdfLib = await getPdfLib();

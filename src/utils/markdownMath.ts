@@ -40,26 +40,69 @@ export interface VisualAssetRef {
 }
 
 const UNIT_PATTERN =
-  '(?:kΩ|MΩ|mΩ|Ω|μF|uF|nF|pF|mA|μA|uA|mV|kV|kHz|MHz|GHz|Hz|ms|μs|us|dB|mol\\/L|mol|kJ\\/mol|kJ|eV|Pa|kPa|MPa|N·m)';
+  '(?:kΩ|MΩ|GΩ|mΩ|Ω|μF|uF|nF|pF|mF|mA|μA|uA|nA|pA|kA|mV|μV|uV|kV|MV|mW|μW|uW|nW|kW|MW|mH|μH|uH|nH|pH|mC|μC|uC|nC|pC|mS|μS|uS|nS|pS|kHz|MHz|GHz|Hz|ms|μs|us|ns|ps|dBm|dB|mol\\/L|mol|kJ\\/mol|kJ|mJ|eV|Pa|kPa|MPa|N·m)';
+
+const TEXT_MODE_CMD_RE =
+  /\\(?:text|mathrm|mbox|operatorname|mathbf|mathit|mathcal|mathbb|ce|pu)\{(?:[^{}]|\{[^{}]*\})*\}/g;
+
+/**
+ * Fix accidentally subscripted SI units inside text-mode LaTeX commands
+ * (e.g. \text{p_F} -> \text{pF}, \text{n_A} -> \text{nA}).
+ */
+export function repairDamagedUnitsInLatex(tex: string): string {
+  if (!tex) return '';
+  return tex.replace(
+    /(\\(?:text|mathrm|mbox|operatorname)\{)([^{}]*(?:\{[^{}]*\}[^{}]*)*)(\})/g,
+    (_m, open: string, body: string, close: string) => {
+      const fixedBody = body.replace(
+        /\b([fpnumμckMGT])_([AFVSWCJHN])\b/g,
+        '$1$2'
+      );
+      return `${open}${fixedBody}${close}`;
+    }
+  );
+}
 
 /**
  * Expand unambiguous compact STEM variable+subscript tokens written without underscores
  * across Electronics, Physics, Mechanics, Chemistry, and CS
  * (e.g. uP -> u_P, uN -> u_N, iP -> i_P, iN -> i_N, uO -> u_O, uI -> u_I,
- * Rf -> R_f, Ri -> R_i, R1 -> R_1, Auf -> A_{uf}, KCMR -> K_{CMR},
+ * uI1 -> u_{I1}, Rf -> R_f, Ri -> R_i, R1 -> R_1, Auf -> A_{uf}, KCMR -> K_{CMR},
  * VGS -> V_{GS}, VTH -> V_{TH}, rbe -> r_{be}, gm -> g_m, Ek -> E_k, Ep -> E_p, v0 -> v_0)
- * while leaving normal English words and acronyms (KCL, KVL, CMOS, BJT, PDF, CPU, DNA) untouched.
+ * while NEVER corrupting text-mode LaTeX (\text{nA}, \text{pF}), SI units, or normal English acronyms.
  */
 export function expandCompactStemSubscripts(text: string): string {
   if (!text) return '';
-  let out = text;
 
-  // 1. Lowercase signal/electrical/physics symbol + uppercase or numeric subscript:
-  // uP, uN, uO, uI, iP, iN, iF, u1, i1, v0, vx, vy, vz, a0, ax, ay, x0, x1, x2, y0, y1, z0, t0, t1, t2, m1, m2, q1, q2, n1, n2
+  // Protect text-mode LaTeX spans & existing protection placeholders before expanding compact tokens
+  const guarded: string[] = [];
+  const stashText = (raw: string): string => {
+    const idx = guarded.length;
+    guarded.push(raw);
+    return `@@STEMGUARD-${idx}@@`;
+  };
+
+  let out = repairDamagedUnitsInLatex(text)
+    .replace(/@@PROTSPAN-\d+@@/g, (m) => stashText(m))
+    .replace(TEXT_MODE_CMD_RE, (m) => stashText(m));
+
+  // 1. Lowercase signal/electrical/physics symbol + uppercase/numeric subscript (incl. uI1, uI2, uO1):
+  // Skip digit-preceded SI units (e.g. 20 nA, 2pF, 5 uN, 10 uC) and unambiguous standalone SI abbreviations (nA, pA, nF, pF, mL),
+  // while STILL expanding electrical voltages uN, uC, uS, uL, uF when not preceded by a number.
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])([uiqpwevaxyztmqn])([PNIOFMACRLDS]|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
-    (_m, base: string, sub: string) =>
-      sub.length > 1 ? `${base}_{${sub}}` : `${base}_${sub}`
+    /(?<![A-Za-z0-9_\\])([uiqpwevaxyztmqn])([PNIOFMACRLDS][0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    (_m, base: string, sub: string, offset: number, fullStr: string) => {
+      const token = base + sub;
+      const before = fullStr.slice(Math.max(0, offset - 16), offset);
+      const precededByNumber = /\d(?:\.\d+)?\s*$/.test(before);
+      if (precededByNumber && /^(?:[fpnum])(?:A|F|C|S|N|L|M|W|H|V)$/.test(token)) {
+        return token;
+      }
+      if (/^(?:nA|pA|nF|pF|mL)$/.test(token)) {
+        return token;
+      }
+      return sub.length > 1 ? `${base}_{${sub}}` : `${base}_${sub}`;
+    }
   );
 
   // 1b. Small-signal transistor parameters & physics constants: rbe, rce, rds, gm, kB
@@ -72,33 +115,33 @@ export function expandCompactStemSubscripts(text: string): string {
 
   // 2. Resistor R + subscript: Rf, Ri, Ro, Rp, Rn, Rs, Rc, Rl, Rm, R1, R2, Rin, Rout, Rref, Req, RL, RS, RC, RB, RE
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])R(in|out|ref|eq|[fFiIoOnNpPsScCmMlLBE]|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    /(?<![A-Za-z0-9_\\])R(in|out|ref|eq|[fFiIoOnNpPsScCmMlLBE][0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
     (_m, sub: string) => (sub.length > 1 ? `R_{${sub}}` : `R_${sub}`)
   );
 
   // 3. Capacitor C & Inductor L + subscript: Cf, Ci, Cp, Cn, Cs, Cl, Cm, C1, C2, Cin, Cout, Ceq, L1, L2, Lf
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])([CL])(in|out|eq|[fFiInNpPsSlLmM]|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    /(?<![A-Za-z0-9_\\])([CL])(in|out|eq|[fFiInNpPsSlLmM][0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
     (_m, base: string, sub: string) =>
       sub.length > 1 ? `${base}_{${sub}}` : `${base}_${sub}`
   );
 
   // 4. Uppercase Voltage U/V + subscript: Uo, Ui, Uf, Un, Vo, Vi, Vf, Vn, U1, V1, VCC, VEE, VDD, VSS, VGS, VDS, VTH, VBE, VCE, VCB, Uref, Vref, Uom
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])([UV])(in|out|ref|cc|ee|dd|ss|CC|EE|DD|SS|GS|DS|TH|BE|CE|CB|gs|ds|th|be|ce|cb|om|OM|pp|PP|rms|RMS|[PNIOFMACRLDS]|[oifn]|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    /(?<![A-Za-z0-9_\\])([UV])(in|out|ref|cc|ee|dd|ss|CC|EE|DD|SS|GS|DS|TH|BE|CE|CB|gs|ds|th|be|ce|cb|om|OM|pp|PP|rms|RMS|(?:[PNIOFMACRLDS]|[oifn])[0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
     (_m, base: string, sub: string) =>
       sub.length > 1 ? `${base}_{${sub}}` : `${base}_${sub}`
   );
 
   // 5. Uppercase Current I + subscript: Io, IP, IN, IO, II, IF, IB, IC, IE, ID, IS, IG, ICEO, ICBO, IDSS, I0, I1, I2, Iref
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])I(in|out|ref|CEO|CBO|DSS|[PNIOFMACRLDSBCEG]|[o]|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    /(?<![A-Za-z0-9_\\])I(in|out|ref|CEO|CBO|DSS|(?:[PNIOFMACRLDSBCEG]|[o])[0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
     (_m, sub: string) => (sub.length > 1 ? `I_{${sub}}` : `I_${sub}`)
   );
 
-  // 6. Amplifier Gain A, CMRR / Equilibrium K, Frequency f, Energy E, Force F, Temperature/Period T
+  // 6. Amplifier Gain A, CMRR / Equilibrium K, Frequency f, Energy E, Force F
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])A(uf|uo|uu|od|ud|id|cm|[ufvdc]|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    /(?<![A-Za-z0-9_\\])A(uf|uo|uu|od|ud|id|cm|[ufvdc][0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
     (_m, sub: string) => (sub.length > 1 ? `A_{${sub}}` : `A_${sub}`)
   );
   out = out.replace(
@@ -118,22 +161,31 @@ export function expandCompactStemSubscripts(text: string): string {
     (_m, sub: string) => (sub.length > 1 ? `F_{${sub}}` : `F_${sub}`)
   );
 
-  return out;
+  return out.replace(/@@STEMGUARD-(\d+)@@/g, (_m, i) => guarded[Number(i)] || '');
 }
 
 function braceMultiCharScripts(tex: string): string {
   // Turn K_CMR, V_CC, A_uf, R_in, C_12 -> K_{CMR}, V_{CC}, A_{uf}, R_{in}, C_{12} if not already braced,
-  // while NEVER merging trailing chemical elements after a numeric subscript (e.g. CH_3COOH -> CH_3COOH, H_2O -> H_2O)
+  // while NEVER altering underscores inside \text{...}/\mathrm{...} or merging chemical suffixes (CH_3COOH)
   let out = expandCompactStemSubscripts(tex);
+
+  const protectedSpans: string[] = [];
+  out = out.replace(TEXT_MODE_CMD_RE, (m) => {
+    const idx = protectedSpans.length;
+    protectedSpans.push(m);
+    return `@@SCRIPTGUARD-${idx}@@`;
+  });
+
   out = out.replace(/([A-Za-z0-9)\]])_(\d{2,}|[A-Za-z+\-][A-Za-z0-9+\-']+)/g, '$1_{$2}');
   out = out.replace(
     /([A-Za-z0-9)\]])\^(\d{2,}|[0-9]+[+\-]|[A-Za-z+\-][A-Za-z0-9+\-']+)/g,
     '$1^{$2}'
   );
-  return out;
+
+  return out.replace(/@@SCRIPTGUARD-(\d+)@@/g, (_m, i) => protectedSpans[Number(i)] || '');
 }
 
-function normalizeMathUnicodeToLatex(tex: string): string {
+export function normalizeMathUnicodeToLatex(tex: string): string {
   let out = braceMultiCharScripts(tex);
 
   // Convert binary multiplication * (e.g. -(Rf / R1) * uI) into \cdot
@@ -156,6 +208,14 @@ function normalizeMathUnicodeToLatex(tex: string): string {
   );
 
   // Convert explicit number + unit clusters inside math like "100 kΩ" or "5 μF" -> "100\,\text{k}\Omega"
+  // First protect existing \text{...}/\mathrm{...}/\mbox{...} so we never double-wrap "\text{20 nA}"
+  const textProtected: string[] = [];
+  out = out.replace(TEXT_MODE_CMD_RE, (m) => {
+    const idx = textProtected.length;
+    textProtected.push(m);
+    return `@@UNITGUARD-${idx}@@`;
+  });
+
   out = out.replace(
     new RegExp(`(\\d+(?:\\.\\d+)?)\\s*(${UNIT_PATTERN})(?![A-Za-z0-9_])`, 'g'),
     (_m, num, unit: string) => {
@@ -164,6 +224,8 @@ function normalizeMathUnicodeToLatex(tex: string): string {
           return `${num}\\,\\text{k}\\Omega`;
         case 'MΩ':
           return `${num}\\,\\text{M}\\Omega`;
+        case 'GΩ':
+          return `${num}\\,\\text{G}\\Omega`;
         case 'mΩ':
           return `${num}\\,\\text{m}\\Omega`;
         case 'Ω':
@@ -174,6 +236,21 @@ function normalizeMathUnicodeToLatex(tex: string): string {
         case 'μA':
         case 'uA':
           return `${num}\\,\\mu\\text{A}`;
+        case 'μV':
+        case 'uV':
+          return `${num}\\,\\mu\\text{V}`;
+        case 'μW':
+        case 'uW':
+          return `${num}\\,\\mu\\text{W}`;
+        case 'μH':
+        case 'uH':
+          return `${num}\\,\\mu\\text{H}`;
+        case 'μC':
+        case 'uC':
+          return `${num}\\,\\mu\\text{C}`;
+        case 'μS':
+        case 'uS':
+          return `${num}\\,\\mu\\text{S}`;
         case 'μs':
         case 'us':
           return `${num}\\,\\mu\\text{s}`;
@@ -182,6 +259,8 @@ function normalizeMathUnicodeToLatex(tex: string): string {
       }
     }
   );
+
+  out = out.replace(/@@UNITGUARD-(\d+)@@/g, (_m, i) => textProtected[Number(i)] || '');
 
   out = out
     .replace(/≠/g, '\\neq ')
@@ -250,7 +329,7 @@ function normalizeMathUnicodeToLatex(tex: string): string {
  * Normalize bare STEM mathematical tokens/equations across all disciplines
  * (e.g. `u_O = -i_F R_f`, `uP = uN`, `uO = -(Rf / R1) * uI`, `du_C/dt`,
  * `H_2O`, `SO_4^{2-}`, `CH_3COOH`, `O(n \log n)`, `\nabla \times \vec{E}`,
- * `\begin{cases}...\end{cases}`) outside code blocks and existing $...$ delimiters
+ * `\begin{cases}...\end{cases}`) outside code blocks, diagram IDs, and existing $...$ delimiters
  * into crisp `$...$` / `$$...$$` spans so KaTeX renders them identically inside
  * prose, heuristic boxes, exercises, captions, titles, and summary fields.
  */
@@ -264,13 +343,15 @@ export function normalizeBareMathForMarkdown(text: string): string {
     return `@@PROTSPAN-${idx}@@`;
   };
 
-  // 1. Protect code blocks, inline code, existing math delimiters, anchors, URLs, Markdown links/images, HTML tags
+  // 1. Protect code blocks, inline code, existing math delimiters, anchors, diagram IDs, URLs, Markdown links/images, HTML tags
   let work = text
     .replace(/```[\s\S]*?```/g, (m) => stash(m))
     .replace(/`[^`\n]+`/g, (m) => stash(m))
     .replace(/\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]/g, (m) => stash(m))
     .replace(/(?<!\\)\$([^\n$]+?)(?<!\\)\$|\\\([\s\S]+?\\\)/g, (m) => stash(m))
-    .replace(/\{\{\s*(?:heuristic|diagram|exercise)\s*:[^}]+\}\}/gi, (m) => stash(m))
+    .replace(/\{\{\s*(?:heuristic|diagram|diag|exercise)\s*:[^}]+\}\}/gi, (m) => stash(m))
+    .replace(/\[\[\s*(?:heuristic|diagram|diag|exercise)\s*:[^\]]+\]\]/gi, (m) => stash(m))
+    .replace(/\bdiag(?:ram)?[-_][A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*\b/gi, (m) => stash(m))
     .replace(/!\[[^\]]*\]\([^)]+\)|\[[^\]]+\]\([^)]+\)/g, (m) => stash(m))
     .replace(/https?:\/\/[^\s)<>]+/gi, (m) => stash(m))
     .replace(/<\/?[a-zA-Z][^>]*>/g, (m) => stash(m));
@@ -288,7 +369,7 @@ export function normalizeBareMathForMarkdown(text: string): string {
     (m) => stash(m)
   );
 
-  // 1c. Expand compact STEM subscript tokens (uP -> u_P, Rf -> R_f, R1 -> R_1, VGS -> V_{GS}, etc.)
+  // 1c. Expand compact STEM subscript tokens (uP -> u_P, uI1 -> u_{I1}, Rf -> R_f, VGS -> V_{GS}, etc.)
   work = expandCompactStemSubscripts(work);
 
   // 2. Group contiguous bare math expressions containing at least one strong math trigger
@@ -398,8 +479,97 @@ function escapeHtmlAttr(str: string): string {
 }
 
 /**
+ * Canonical key for loose diagram ID matching (e.g. `diag-4c`, `diag_4c`, `DIAG4C` -> `diag4c`).
+ */
+export function normalizeDiagramIdKey(id: string): string {
+  return (id || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^图(?:示)?\s*/, '')
+    .replace(/^fig(?:ure)?\.?\s*/i, '')
+    .replace(/[-_\s]+/g, '');
+}
+
+/**
+ * Extract the core identifier suffix after `diag`/`diagram` (e.g. `diag-4c` -> `4c`, `diag-1` -> `1`).
+ */
+export function extractDiagramSuffix(id: string): string {
+  const norm = normalizeDiagramIdKey(id);
+  const m = norm.match(/^(?:diagram|diag)(.+)$/);
+  return m ? m[1] : norm;
+}
+
+/**
+ * Resolve any flexible diagram token (`diag-4c`, `diag_4c`, `diag4c`, `图 diag-4c`, `图 4c`, `diagram-4c`)
+ * against the visual list. Never blindly maps `diag-4c` to array index 4 when `diag-4c` does not exist.
+ */
+export function resolveVisualRefByToken(
+  token: string,
+  visuals: VisualAssetRef[]
+): VisualAssetRef | null {
+  if (!token || !visuals || visuals.length === 0) return null;
+  const clean = token
+    .trim()
+    .replace(/^[\[\(（]+|[\]\)）]+$/g, '')
+    .replace(/^(?:图示|图)\s*/, '')
+    .trim();
+  if (!clean) return null;
+
+  const lowerClean = clean.toLowerCase();
+  const exact = visuals.find((v) => v.id.trim().toLowerCase() === lowerClean);
+  if (exact) return exact;
+
+  const cleanKey = normalizeDiagramIdKey(clean).replace(/^diagram/, 'diag');
+  const byNorm = visuals.find(
+    (v) => normalizeDiagramIdKey(v.id).replace(/^diagram/, 'diag') === cleanKey
+  );
+  if (byNorm) return byNorm;
+
+  const cleanSuffix = extractDiagramSuffix(clean);
+  if (cleanSuffix) {
+    const bySuffix = visuals.find((v) => extractDiagramSuffix(v.id) === cleanSuffix);
+    if (bySuffix) return bySuffix;
+  }
+
+  // Exact title or filename match
+  const byTitle = visuals.find((v) => v.title.trim().toLowerCase() === lowerClean);
+  if (byTitle) return byTitle;
+  const byFile = visuals.find((v) => v.fileName?.trim().toLowerCase() === lowerClean);
+  if (byFile) return byFile;
+
+  // Sub-panel parent fallback: e.g. `diag-4c` or `图 4c` resolves to parent `diag-4`
+  // when all sub-parts (a)(b)(c) are drawn inside one combined SVG diagram
+  const subPanelMatch = cleanSuffix.match(/^(\d+)[a-z]$/i);
+  if (subPanelMatch) {
+    const parentNum = subPanelMatch[1];
+    const byParentSuffix = visuals.find((v) => extractDiagramSuffix(v.id) === parentNum);
+    if (byParentSuffix) return byParentSuffix;
+    const byParentIdx = parseInt(parentNum, 10) - 1;
+    if (
+      byParentIdx >= 0 &&
+      byParentIdx < visuals.length &&
+      visuals.some((v) => /^\d+$/.test(extractDiagramSuffix(v.id)))
+    ) {
+      return visuals[byParentIdx];
+    }
+  }
+
+  // Numeric-only fallback ONLY for pure numbers or plain `diag-N` / `diagram-N` (no letter suffix like 4c)
+  const plainNumMatch = lowerClean.match(/^(?:(?:diagram|diag)[-_\s]*)?(\d+)$/);
+  if (plainNumMatch) {
+    const idx = parseInt(plainNumMatch[1], 10) - 1;
+    if (idx >= 0 && idx < visuals.length) {
+      return visuals[idx];
+    }
+  }
+
+  return null;
+}
+
+/**
  * Linkify diagram and uploaded image references inside rendered HTML text nodes
- * (never mutating HTML attributes, <svg>, <code>, <pre>, <a>, <button>, or KaTeX spans).
+ * AND upgrade inline `<code>diag-xx</code>` pills into clickable floating-diagram links
+ * (never mutating HTML attributes, <svg>, <pre>, <a>, <button>, or KaTeX spans).
  */
 export function linkifyDiagramRefsInHtml(
   html: string,
@@ -415,8 +585,57 @@ export function linkifyDiagramRefsInHtml(
 
     if (cleanId) {
       const escId = escapeRegExp(cleanId);
-      patterns.push({ regexSrc: `(?:图示|图)\\s*${escId}`, priority: 100 + cleanId.length, visual: v });
-      patterns.push({ regexSrc: `\\b${escId}\\b`, priority: 85 + cleanId.length, visual: v });
+      // 1. Exact ID (case-insensitive via combinedRegex 'gi'), never truncating a longer suffix like diag-4c
+      patterns.push({ regexSrc: `(?:图示|图)\\s*${escId}(?![A-Za-z0-9_-])`, priority: 110 + cleanId.length, visual: v });
+      patterns.push({ regexSrc: `\\[${escId}\\]`, priority: 105 + cleanId.length, visual: v });
+      patterns.push({ regexSrc: `\\b${escId}(?![A-Za-z0-9_-])`, priority: 95 + cleanId.length, visual: v });
+
+      // 2. Variants of diag-4c / diag_4c / diag4c / diagram-4c / 图 4c
+      const diagStemMatch = cleanId.match(/^(diag(?:ram)?)[-_]?([A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*)$/i);
+      if (diagStemMatch) {
+        const suffix = diagStemMatch[2];
+        const flexSuffix = escapeRegExp(suffix).replace(/[-_]/g, '[-_\\s]?');
+        const flexDiagVariant = `diag(?:ram)?[-_\\s]?${flexSuffix}`;
+        patterns.push({
+          regexSrc: `(?:图示|图|Fig(?:ure)?\\.?)\\s*${flexDiagVariant}(?![A-Za-z0-9_-])`,
+          priority: 108 + suffix.length,
+          visual: v,
+        });
+        patterns.push({
+          regexSrc: `\\b${flexDiagVariant}(?![A-Za-z0-9_-])`,
+          priority: 92 + suffix.length,
+          visual: v,
+        });
+
+        // Match "图 4c", "图示4c", "Fig. 4c" whenever suffix has a letter (e.g. 4c, 3b) or >= 2 chars
+        if (/[A-Za-z]/.test(suffix) || suffix.length >= 2) {
+          patterns.push({
+            regexSrc: `(?:图示|图|Fig(?:ure)?\\.?)\\s*${flexSuffix}(?![A-Za-z0-9._-])`,
+            priority: 88 + suffix.length,
+            visual: v,
+          });
+        }
+
+        // If cleanId is a pure numeric parent (e.g. diag-4), allow lower-priority sub-panel refs
+        // like diag-4a / diag-4c / 图 4c to resolve to diag-4 when no separate diag-4c exists
+        if (/^\d+$/.test(suffix)) {
+          patterns.push({
+            regexSrc: `(?:图示|图|Fig(?:ure)?\\.?)\\s*diag(?:ram)?[-_\\s]?${escapeRegExp(suffix)}[a-z](?![A-Za-z0-9_-])`,
+            priority: 72,
+            visual: v,
+          });
+          patterns.push({
+            regexSrc: `\\bdiag(?:ram)?[-_\\s]?${escapeRegExp(suffix)}[a-z](?![A-Za-z0-9_-])`,
+            priority: 70,
+            visual: v,
+          });
+          patterns.push({
+            regexSrc: `(?:图示|图|Fig(?:ure)?\\.?)\\s*${escapeRegExp(suffix)}[a-z](?![A-Za-z0-9._-])`,
+            priority: 68,
+            visual: v,
+          });
+        }
+      }
     }
 
     if (cleanTitle.length >= 3) {
@@ -432,7 +651,7 @@ export function linkifyDiagramRefsInHtml(
       if (figNumMatch) {
         const prefix = figNumMatch[1].replace(/\s+/g, '\\s*');
         patterns.push({
-          regexSrc: `${prefix}(?![.\\d])`,
+          regexSrc: `${prefix}(?![A-Za-z.\\d_-])`,
           priority: 80 + figNumMatch[1].length,
           visual: v,
         });
@@ -449,7 +668,7 @@ export function linkifyDiagramRefsInHtml(
 
     // Generic "图 1" / "图1" fallback mapped to 1-based visual index
     patterns.push({
-      regexSrc: `(?:图|图示)\\s*${v.index}(?![.\\d\\-])`,
+      regexSrc: `(?:图|图示)\\s*${v.index}(?![A-Za-z.\\d\\-])`,
       priority: 60,
       visual: v,
     });
@@ -460,8 +679,9 @@ export function linkifyDiagramRefsInHtml(
   const sorted = patterns
     .sort((a, b) => b.priority - a.priority)
     .filter((p) => {
-      if (seenSrc.has(p.regexSrc)) return false;
-      seenSrc.add(p.regexSrc);
+      const key = p.regexSrc.toLowerCase();
+      if (seenSrc.has(key)) return false;
+      seenSrc.add(key);
       return true;
     });
 
@@ -469,66 +689,106 @@ export function linkifyDiagramRefsInHtml(
 
   const combinedRegex = new RegExp(
     sorted.map((p, i) => `(?<g${i}>${p.regexSrc})`).join('|'),
-    'g'
+    'gi'
   );
 
-  // Split HTML into tags and text nodes, tracking depth inside non-linkifiable elements
+  const buildRefButton = (visual: VisualAssetRef, labelHtml: string) =>
+    `<button type="button" data-visual-ref="${escapeHtmlAttr(visual.id)}" class="diagram-ref-link inline text-sky-300 hover:text-sky-200 underline decoration-sky-500/70 hover:decoration-sky-300 underline-offset-4 cursor-pointer font-medium transition-colors" title="点击在小窗中查看图示：${escapeHtmlAttr(visual.title)}">${labelHtml}</button>`;
+
+  // Split HTML into tags and text nodes, tracking depth inside non-linkifiable elements.
+  // Inline <code>diag-4c</code> (outside <pre>) IS upgraded into a clickable floating-diagram button,
+  // whereas <pre><code>...</code></pre>, <svg>, <a>, <button>, and KaTeX spans remain untouched.
   const tokens = html.split(/(<[^>]+>)/g);
   const skipTagStack: string[] = [];
-  const SKIP_TAGS = new Set(['svg', 'code', 'pre', 'a', 'button', 'script', 'style']);
+  const SKIP_TAGS = new Set(['svg', 'pre', 'a', 'button', 'script', 'style']);
   let katexDepth = 0;
+  const output: string[] = [];
 
-  return tokens
-    .map((tok) => {
-      if (!tok) return '';
-      if (tok.startsWith('<')) {
-        const lower = tok.toLowerCase();
-        const isClosing = /^<\//.test(lower);
-        const isSelfClosing = /\/>$/.test(lower);
-        const tagMatch = lower.match(/^<\/?([a-z0-9-]+)/);
-        const tagName = tagMatch ? tagMatch[1] : '';
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (!tok) continue;
 
-        if (tagName === 'span') {
-          if (!isClosing && !isSelfClosing && /class="[^"]*\bkatex\b/i.test(tok)) {
-            katexDepth++;
-          } else if (isClosing && katexDepth > 0) {
-            katexDepth--;
-          }
+    // Upgrade inline <code>diag-4c</code> pills when NOT inside a protected tag or KaTeX
+    if (
+      skipTagStack.length === 0 &&
+      katexDepth === 0 &&
+      /^<code(?:\s+[^>]*)?>$/i.test(tok) &&
+      i + 2 < tokens.length &&
+      /^<\/code>$/i.test(tokens[i + 2])
+    ) {
+      const codeInner = (tokens[i + 1] || '').trim();
+      if (
+        codeInner &&
+        /^(?:[\[(（]?\s*(?:图示?|Fig(?:ure)?\.?)?\s*(?:diag(?:ram)?[-_\s]?[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*|[0-9]+[A-Za-z]?)\s*[\])）]?)$/i.test(
+          codeInner
+        )
+      ) {
+        const matchedVisual = resolveVisualRefByToken(codeInner, visuals);
+        if (matchedVisual) {
+          output.push(buildRefButton(matchedVisual, escapeHtmlAttr(codeInner)));
+          i += 2;
+          continue;
         }
+      }
+      // Keep non-diagram inline <code>...</code> intact without linkifying inner text
+      output.push(tok, tokens[i + 1] || '', tokens[i + 2]);
+      i += 2;
+      continue;
+    }
 
-        if (SKIP_TAGS.has(tagName) && !isSelfClosing) {
-          if (!isClosing) {
-            skipTagStack.push(tagName);
-          } else {
-            const idx = skipTagStack.lastIndexOf(tagName);
-            if (idx !== -1) skipTagStack.splice(idx, 1);
-          }
+    if (tok.startsWith('<')) {
+      const lower = tok.toLowerCase();
+      const isClosing = /^<\//.test(lower);
+      const isSelfClosing = /\/>$/.test(lower);
+      const tagMatch = lower.match(/^<\/?([a-z0-9-]+)/);
+      const tagName = tagMatch ? tagMatch[1] : '';
+
+      if (tagName === 'span') {
+        if (!isClosing && !isSelfClosing && /class="[^"]*\bkatex\b/i.test(tok)) {
+          katexDepth++;
+        } else if (isClosing && katexDepth > 0) {
+          katexDepth--;
         }
-        return tok;
       }
 
-      // Skip text nodes inside protected containers or KaTeX math trees
-      if (skipTagStack.length > 0 || katexDepth > 0) {
-        return tok;
+      if (SKIP_TAGS.has(tagName) && !isSelfClosing) {
+        if (!isClosing) {
+          skipTagStack.push(tagName);
+        } else {
+          const idx = skipTagStack.lastIndexOf(tagName);
+          if (idx !== -1) skipTagStack.splice(idx, 1);
+        }
       }
+      output.push(tok);
+      continue;
+    }
 
-      return tok.replace(combinedRegex, (...args) => {
+    // Skip text nodes inside protected containers or KaTeX math trees
+    if (skipTagStack.length > 0 || katexDepth > 0) {
+      output.push(tok);
+      continue;
+    }
+
+    output.push(
+      tok.replace(combinedRegex, (...args) => {
         const fullMatch = args[0] as string;
         const groups = args[args.length - 1] as Record<string, string | undefined>;
         let matchedVisual: VisualAssetRef | null = null;
         if (groups) {
-          for (let i = 0; i < sorted.length; i++) {
-            if (groups[`g${i}`] !== undefined) {
-              matchedVisual = sorted[i].visual;
+          for (let gIdx = 0; gIdx < sorted.length; gIdx++) {
+            if (groups[`g${gIdx}`] !== undefined) {
+              matchedVisual = sorted[gIdx].visual;
               break;
             }
           }
         }
         if (!matchedVisual) return fullMatch;
-        return `<button type="button" data-visual-ref="${escapeHtmlAttr(matchedVisual.id)}" class="diagram-ref-link inline text-sky-300 hover:text-sky-200 underline decoration-sky-500/70 hover:decoration-sky-300 underline-offset-4 cursor-pointer font-medium transition-colors" title="点击在小窗中查看图示：${escapeHtmlAttr(matchedVisual.title)}">${fullMatch}</button>`;
-      });
-    })
-    .join('');
+        return buildRefButton(matchedVisual, fullMatch);
+      })
+    );
+  }
+
+  return output.join('');
 }
 
 function processLatexAndHtml(
@@ -603,19 +863,81 @@ function processLatexAndHtml(
   // 7. Restore rendered KaTeX HTML blocks
   const withMath = rawHtml.replace(/@@MATHBLOCK-(\d+)@@/g, (_m, i) => mathBlocks[Number(i)] || '');
 
-  // 8. Linkify diagram/image references inside visible text nodes
+  // 8. Linkify diagram/image references inside visible text nodes & inline code pills
   return linkifyDiagramRefsInHtml(withMath, visuals);
+}
+
+const SEMANTIC_CALLOUT_META: Record<
+  'TEXTBOOK' | 'PREREQ' | 'INTUITION' | 'EXTENSION',
+  { className: string; badgeLabel: string }
+> = {
+  TEXTBOOK: { className: 'lesson-callout-textbook', badgeLabel: '教材正文' },
+  PREREQ: { className: 'lesson-callout-prereq', badgeLabel: '先修补充' },
+  INTUITION: { className: 'lesson-callout-intuition', badgeLabel: '直观解释' },
+  EXTENSION: { className: 'lesson-callout-extension', badgeLabel: '边界与拓展' },
+};
+
+/**
+ * Transform Obsidian/GitHub-style semantic callout blockquotes
+ * (> [!TEXTBOOK], > [!PREREQ], > [!INTUITION], > [!EXTENSION])
+ * into dark-mode styled containers with clear classification badges.
+ */
+export function enhanceSemanticCalloutBlockquotes(html: string): string {
+  if (!html || !html.includes('<blockquote')) return html;
+  return html.replace(
+    /<blockquote(\s[^>]*)?>([\s\S]*?)<\/blockquote>/gi,
+    (fullMatch, attrs = '', inner = '') => {
+      const trimmedInner = String(inner).trim();
+      const match = trimmedInner.match(
+        /^<p([^>]*)>\s*\[!(TEXTBOOK|PREREQ|INTUITION|EXTENSION)\](?:[ \t]*((?:(?!<\/p>|<br\s*\/?>)[^\r\n])*?))?\s*(?:(<\/p>)|(?:<br\s*\/?>|\r?\n)\s*([\s\S]*)$)/i
+      );
+      if (!match) return fullMatch;
+
+      const pAttrs = match[1] || '';
+      const kind = match[2].toUpperCase() as keyof typeof SEMANTIC_CALLOUT_META;
+      const meta = SEMANTIC_CALLOUT_META[kind];
+      const rawInline = (match[3] || '').trim();
+      const hadClosingP = Boolean(match[4]);
+
+      let headerTitle = '';
+      let bodyHtml = '';
+
+      if (hadClosingP) {
+        const afterFirstP = trimmedInner.slice(match[0].length);
+        if (!afterFirstP.trim() && rawInline.length > 24) {
+          bodyHtml = `<p${pAttrs}>${rawInline}</p>`;
+        } else {
+          headerTitle = rawInline;
+          bodyHtml = afterFirstP;
+        }
+      } else {
+        headerTitle = rawInline;
+        const remainder = match[5] || '';
+        bodyHtml = `<p${pAttrs}>${remainder}`;
+      }
+
+      const titleSpan = headerTitle ? `<span class="lesson-callout-title">${headerTitle}</span>` : '';
+      const existingClassMatch = String(attrs).match(/\bclass="([^"]*)"/i);
+      const classValue = existingClassMatch
+        ? `${existingClassMatch[1]} lesson-callout ${meta.className}`
+        : `lesson-callout ${meta.className}`;
+      const cleanedAttrs = String(attrs).replace(/\s*\bclass="[^"]*"/i, '');
+
+      return `<blockquote${cleanedAttrs} class="${classValue}"><div class="lesson-callout-header${headerTitle ? '' : ' lesson-callout-header-badge-only'}"><span class="lesson-callout-badge">${meta.badgeLabel}</span>${titleSpan}</div>${bodyHtml}</blockquote>`;
+    }
+  );
 }
 
 /**
  * Render Markdown text containing inline ($...$) and block ($$...$$) LaTeX formulas
- * safely into HTML string. Automatically upgrades bare STEM formulas and linkifies diagram refs.
+ * safely into HTML string. Automatically upgrades bare STEM formulas, linkifies diagram refs,
+ * and styles dark-mode semantic classification callouts ([!TEXTBOOK], [!PREREQ], [!INTUITION], [!EXTENSION]).
  */
 export function renderMarkdownWithLatex(
   markdown: string,
   visuals?: VisualAssetRef[]
 ): string {
-  return processLatexAndHtml(markdown, false, visuals);
+  return enhanceSemanticCalloutBlockquotes(processLatexAndHtml(markdown, false, visuals));
 }
 
 /**

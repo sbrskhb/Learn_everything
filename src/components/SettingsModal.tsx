@@ -1,19 +1,54 @@
-import React, { useEffect, useState } from 'react';
-import { Activity, Check, Download, RotateCcw, Sliders, X } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
+import {
+  Activity,
+  BarChart2,
+  Check,
+  CheckCircle2,
+  Clock,
+  Compass,
+  Download,
+  MapPin,
+  RotateCcw,
+  Sliders,
+  X,
+} from 'lucide-react';
 import type {
   AppSettings,
+  Course,
+  LastBrowsingState,
+  LearnerBaselinePreset,
   LearnerLevel,
+  LearningDepthPreset,
   PromptModuleToggles,
+  StudyStats,
   SubjectProfile,
 } from '../types';
 import type { PromptPresetItem } from '../prompts/promptLibrary';
+import {
+  BASELINE_LABELS,
+  DEPTH_LABELS,
+  deriveLegacyLearnerLevel,
+  mapLegacyLevelToDualAxis,
+  resolveLearnerProfile,
+} from '../utils/learnerProfile';
+import {
+  computeLearningStats,
+  formatStudyDuration,
+  getTodayDateString,
+} from '../utils/learningLogic';
 
 interface SettingsModalProps {
   isOpen: boolean;
   settings: AppSettings;
   promptPresets: PromptPresetItem[];
+  courses?: Course[];
+  studyStats?: StudyStats;
+  liveSessionSeconds?: number;
+  lastBrowsingState?: LastBrowsingState | null;
   onClose: () => void;
   onSettingsUpdated: (settings: AppSettings, presets?: PromptPresetItem[]) => void;
+  onOpenWelcome?: () => void;
 }
 
 const MODULE_LABELS: Array<{
@@ -38,9 +73,50 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   isOpen,
   settings,
   promptPresets,
+  courses = [],
+  studyStats = { totalSeconds: 0, secondsByDate: {}, secondsByCourse: {} },
+  liveSessionSeconds = 0,
+  lastBrowsingState = null,
   onClose,
   onSettingsUpdated,
+  onOpenWelcome,
 }) => {
+  const todayStr = getTodayDateString();
+  const learningStats = useMemo(() => {
+    const base = computeLearningStats(courses, studyStats, todayStr);
+    return {
+      ...base,
+      totalStudySeconds: base.totalStudySeconds + Math.max(0, liveSessionSeconds),
+      todayStudySeconds: base.todayStudySeconds + Math.max(0, liveSessionSeconds),
+    };
+  }, [courses, studyStats, todayStr, liveSessionSeconds]);
+
+  const accuracyLabel =
+    learningStats.accuracyPercent !== null ? `${learningStats.accuracyPercent}%` : '--';
+
+  const lastPositionLabel = useMemo(() => {
+    if (!lastBrowsingState) return '主界面时间轴（默认今日课程行）';
+    if (lastBrowsingState.view === 'lesson' && lastBrowsingState.activeLessonRef) {
+      const targetCourse = courses.find(
+        (c) => c.id === lastBrowsingState.activeLessonRef?.courseId
+      );
+      const dayIdx = lastBrowsingState.activeLessonRef.dayIndex;
+      const slot = targetCourse?.dailyPlan.find((d) => d.dayIndex === dayIdx);
+      const cName = targetCourse?.name || '课程';
+      const sTitle = slot?.title || `第 ${dayIdx} 讲`;
+      return `${cName} · ${sTitle}（滚动位置 ${Math.round(lastBrowsingState.scrollY || 0)}px）`;
+    }
+    if (lastBrowsingState.view === 'daily' && lastBrowsingState.focusedDate) {
+      return `单日课程聚焦 · ${lastBrowsingState.focusedDate}（滚动位置 ${Math.round(lastBrowsingState.scrollY || 0)}px）`;
+    }
+    const filterCourse =
+      lastBrowsingState.selectedCourseFilter &&
+      lastBrowsingState.selectedCourseFilter !== 'all'
+        ? courses.find((c) => c.id === lastBrowsingState.selectedCourseFilter)?.name
+        : null;
+    return `主界面时间轴${filterCourse ? `（筛选：${filterCourse}）` : ''} · 滚动位置 ${Math.round(lastBrowsingState.scrollY || 0)}px`;
+  }, [lastBrowsingState, courses]);
+
   const [providerMode, setProviderMode] = useState<'builtin_gemini' | 'openai_compatible'>(
     settings.providerMode
   );
@@ -50,8 +126,24 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [defaultLearnerLevel, setDefaultLearnerLevel] = useState<LearnerLevel>(
     settings.defaultLearnerLevel || 'intermediate'
   );
+  const initialDual = mapLegacyLevelToDualAxis(settings.defaultLearnerLevel || 'intermediate');
+  const [defaultLearnerBaseline, setDefaultLearnerBaseline] = useState<LearnerBaselinePreset>(
+    settings.defaultLearnerBaseline || initialDual.baseline
+  );
+  const [defaultCustomLearnerBaseline, setDefaultCustomLearnerBaseline] = useState<string>(
+    settings.defaultCustomLearnerBaseline || ''
+  );
+  const [defaultLearningDepth, setDefaultLearningDepth] = useState<LearningDepthPreset>(
+    settings.defaultLearningDepth || initialDual.depth
+  );
+  const [defaultCustomLearningDepth, setDefaultCustomLearningDepth] = useState<string>(
+    settings.defaultCustomLearningDepth || ''
+  );
   const [showAdvancedWorkflowDetails, setShowAdvancedWorkflowDetails] = useState<boolean>(
     Boolean(settings.showAdvancedWorkflowDetails)
+  );
+  const [showContentCategoryBadges, setShowContentCategoryBadges] = useState<boolean>(
+    Boolean(settings.showContentCategoryBadges)
   );
   const [composeProfile, setComposeProfile] = useState<SubjectProfile>('electronics_engineering');
   const [promptModules, setPromptModules] = useState<PromptModuleToggles>(settings.promptModules);
@@ -72,11 +164,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
 
   useEffect(() => {
+    const nextFallback = mapLegacyLevelToDualAxis(settings.defaultLearnerLevel || 'intermediate');
     setProviderMode(settings.providerMode);
     setApiBaseUrl(settings.apiBaseUrl);
     setModelName(settings.modelName);
     setDefaultLearnerLevel(settings.defaultLearnerLevel || 'intermediate');
+    setDefaultLearnerBaseline(settings.defaultLearnerBaseline || nextFallback.baseline);
+    setDefaultCustomLearnerBaseline(settings.defaultCustomLearnerBaseline || '');
+    setDefaultLearningDepth(settings.defaultLearningDepth || nextFallback.depth);
+    setDefaultCustomLearningDepth(settings.defaultCustomLearningDepth || '');
     setShowAdvancedWorkflowDetails(Boolean(settings.showAdvancedWorkflowDetails));
+    setShowContentCategoryBadges(Boolean(settings.showContentCategoryBadges));
     setPromptModules(settings.promptModules);
     setSyllabusSystemPrompt(settings.syllabusSystemPrompt);
     setCourseSystemPrompt(settings.courseSystemPrompt);
@@ -87,7 +185,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setTestResult(null);
   }, [settings, isOpen]);
 
-  if (!isOpen) return null;
+  // Render animated overlay via AnimatePresence below
 
   const handleToggleModule = (key: keyof PromptModuleToggles) => {
     setPromptModules((prev) => ({
@@ -98,17 +196,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const handleComposeFromSkill = async (
     targetProfile: SubjectProfile = composeProfile,
-    targetLevel: LearnerLevel = defaultLearnerLevel,
+    targetBaseline: LearnerBaselinePreset = defaultLearnerBaseline,
+    targetDepth: LearningDepthPreset = defaultLearningDepth,
     targetModules: PromptModuleToggles = promptModules
   ) => {
     setIsComposing(true);
     try {
+      const derivedLevel = deriveLegacyLearnerLevel(targetBaseline, targetDepth);
       const res = await fetch('/api/compose-prompt', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           subjectProfile: targetProfile,
-          learnerLevel: targetLevel,
+          learnerLevel: derivedLevel,
+          learnerBaseline: targetBaseline,
+          customLearnerBaseline: defaultCustomLearnerBaseline.trim(),
+          learningDepth: targetDepth,
+          customLearningDepth: defaultCustomLearningDepth.trim(),
           promptModules: targetModules,
           customSupplement: customTeachingSupplement,
         }),
@@ -165,6 +269,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setIsSaving(true);
     setSavedNotice(false);
     try {
+      const nextLegacyLevel = deriveLegacyLearnerLevel(defaultLearnerBaseline, defaultLearningDepth);
       const res = await fetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -173,8 +278,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           apiBaseUrl: apiBaseUrl.trim(),
           modelName: modelName.trim(),
           newApiKey: newApiKey.trim() || undefined,
-          defaultLearnerLevel,
+          defaultLearnerLevel: nextLegacyLevel || defaultLearnerLevel,
+          defaultLearnerBaseline,
+          defaultCustomLearnerBaseline: defaultCustomLearnerBaseline.trim(),
+          defaultLearningDepth,
+          defaultCustomLearningDepth: defaultCustomLearningDepth.trim(),
           showAdvancedWorkflowDetails,
+          showContentCategoryBadges,
           promptModules,
           syllabusSystemPrompt,
           courseSystemPrompt,
@@ -198,18 +308,32 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const syllabusPresets = promptPresets.filter((p) => p.targetField === 'syllabus');
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4 overflow-y-auto"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="settings-modal-title"
-    >
-      <div className="w-full max-w-3xl bg-black border border-neutral-800 rounded-md p-6 my-8 max-h-[92vh] overflow-y-auto">
-        <div className="flex items-center justify-between border-b border-neutral-800 pb-4 mb-5">
-          <div>
-            <h2 id="settings-modal-title" className="text-lg font-semibold text-white">
-              设置
-            </h2>
+    <AnimatePresence>
+      {isOpen && (
+        <motion.div
+          key="settings-modal-backdrop"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-sm p-4 overflow-y-auto"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="settings-modal-title"
+        >
+          <motion.div
+            key="settings-modal-panel"
+            initial={{ opacity: 0, scale: 0.96 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.97 }}
+            transition={{ duration: 0.21, ease: [0.16, 1, 0.3, 1] }}
+            className="glow-border w-full max-w-3xl bg-black border border-neutral-800 rounded-md p-6 my-8 max-h-[92vh] overflow-y-auto shadow-2xl"
+          >
+            <div className="flex items-center justify-between border-b border-neutral-800 pb-4 mb-5">
+              <div>
+                <h2 id="settings-modal-title" className="font-display text-lg font-semibold text-white">
+                  设置
+                </h2>
             <p className="text-xs text-neutral-500 mt-0.5">
               配置模型接口参数与可复用的课件生成提示词系统（提示词源文件位于 learn-everything-prompts）
             </p>
@@ -225,10 +349,142 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         </div>
 
         <form onSubmit={handleSave} className="space-y-5">
-          {/* 0. 界面精简与工作流细节开关 */}
-          <div className="border border-neutral-800 rounded p-3.5 bg-neutral-950/60 space-y-2">
-            <div className="text-xs font-semibold text-white">
-              工作台界面模式（降低日常操作复杂度）
+          {/* 0a. 学习数据统计（原左下角统计面板迁移至设置中心） */}
+          <div
+            data-testid="settings-stats-section"
+            role="region"
+            aria-label="学习数据统计详情"
+            className="glow-border border border-neutral-800 rounded p-4 bg-neutral-950/70 space-y-3.5"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-neutral-900 pb-2.5">
+              <div className="flex items-center gap-2">
+                <BarChart2 className="w-4 h-4 text-sky-400 shrink-0" />
+                <span className="font-display text-xs font-semibold text-white tracking-wide">
+                  学习数据统计
+                </span>
+              </div>
+              <span className="font-mono text-[10px] text-neutral-500">
+                STUDY OVERVIEW · 实时累计与离线判分统计
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="border border-neutral-900 bg-black/80 rounded p-3">
+                <div className="flex items-center gap-1.5 text-[11px] text-neutral-400">
+                  <Clock className="w-3 h-3 text-neutral-500" />
+                  <span>课件累计学习</span>
+                </div>
+                <div
+                  data-testid="settings-stat-total-time"
+                  className="font-mono text-sm font-semibold text-white mt-1 tabular-nums"
+                >
+                  {formatStudyDuration(learningStats.totalStudySeconds)}
+                </div>
+              </div>
+
+              <div className="border border-neutral-900 bg-black/80 rounded p-3">
+                <div className="text-[11px] text-neutral-400">今日课件学习</div>
+                <div
+                  data-testid="settings-stat-today-time"
+                  className="font-mono text-sm font-semibold text-sky-300 mt-1 tabular-nums"
+                >
+                  {formatStudyDuration(learningStats.todayStudySeconds)}
+                </div>
+              </div>
+
+              <div className="border border-neutral-900 bg-black/80 rounded p-3">
+                <div className="flex items-center gap-1.5 text-[11px] text-neutral-400">
+                  <CheckCircle2 className="w-3 h-3 text-neutral-500" />
+                  <span>答题综合正确率</span>
+                </div>
+                <div
+                  data-testid="settings-stat-accuracy"
+                  className="font-mono text-sm font-semibold text-white mt-1 tabular-nums"
+                >
+                  {accuracyLabel}
+                </div>
+                <div className="text-[10px] font-mono text-neutral-500 mt-0.5">
+                  {learningStats.totalQuestionsAnswered > 0
+                    ? `${learningStats.totalQuestionsCorrect}/${learningStats.totalQuestionsAnswered} 题`
+                    : '暂无交卷记录'}
+                </div>
+              </div>
+
+              <div className="border border-neutral-900 bg-black/80 rounded p-3">
+                <div className="text-[11px] text-neutral-400">已生成课件</div>
+                <div
+                  data-testid="settings-stat-lessons"
+                  className="font-mono text-sm font-semibold text-neutral-200 mt-1 tabular-nums"
+                >
+                  {learningStats.completedLessonsCount}/{learningStats.totalLessonsCount} 讲
+                </div>
+                <div className="text-[10px] font-mono text-neutral-500 mt-0.5">
+                  共 {courses.length} 门课程
+                </div>
+              </div>
+            </div>
+
+            {courses.length > 0 && (
+              <div className="pt-1 space-y-1.5">
+                <div className="text-[11px] text-neutral-500 font-mono">
+                  各课程学习时长与课件进度：
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {courses.map((course) => {
+                    const cSeconds = studyStats.secondsByCourse?.[course.id] || 0;
+                    const cGenerated = course.dailyPlan.filter((d) => Boolean(d.lesson)).length;
+                    return (
+                      <div
+                        key={course.id}
+                        className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded border border-neutral-900 bg-black/60 text-xs"
+                      >
+                        <span className="text-neutral-200 truncate">{course.name}</span>
+                        <span className="font-mono text-[11px] text-neutral-400 shrink-0 tabular-nums">
+                          {formatStudyDuration(cSeconds)} · {cGenerated}/{course.dailyPlan.length} 讲
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-neutral-900 text-[11px] text-neutral-400">
+              <div className="inline-flex items-center gap-1.5 min-w-0">
+                <MapPin className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                <span className="text-neutral-500 shrink-0">当前记忆浏览位置：</span>
+                <span
+                  data-testid="settings-last-position-summary"
+                  className="font-mono text-neutral-300 truncate"
+                >
+                  {lastPositionLabel}
+                </span>
+              </div>
+              <span className="text-[10px] font-mono text-neutral-500">
+                刷新或重开应用自动恢复
+              </span>
+            </div>
+          </div>
+
+          {/* 0b. 界面精简、新手引导与工作流细节开关 */}
+          <div className="glow-border border border-neutral-800 rounded p-3.5 bg-neutral-950/60 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-xs font-semibold text-white">
+                工作台界面模式与新手引导
+              </div>
+              {onOpenWelcome && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    onOpenWelcome();
+                  }}
+                  className="glow-border inline-flex items-center gap-1.5 px-3 py-1 text-xs border border-neutral-700 hover:border-sky-400/70 text-neutral-200 hover:text-white bg-black rounded transition-colors"
+                >
+                  <Compass className="w-3.5 h-3.5 text-sky-400" />
+                  <span>重新打开新手引导与模式选择</span>
+                </button>
+              )}
             </div>
             <label
               htmlFor="settings-advanced-workflow-toggle"
@@ -250,6 +506,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </div>
             </label>
+
+            <label
+              htmlFor="settings-content-category-badges-toggle"
+              className="flex items-start gap-2.5 text-xs cursor-pointer pt-2.5 border-t border-neutral-900"
+            >
+              <input
+                id="settings-content-category-badges-toggle"
+                type="checkbox"
+                checked={showContentCategoryBadges}
+                onChange={(e) => setShowContentCategoryBadges(e.target.checked)}
+                className="mt-0.5 accent-white"
+              />
+              <div>
+                <div className="text-neutral-200 font-medium">
+                  显示单节课件中的内容分类标签与提示框（教材正文 / 先修补充 / 直观解释 / 边界与拓展）
+                </div>
+                <div className="text-[11px] text-neutral-500 mt-0.5 leading-relaxed">
+                  默认关闭，在单节课件阅读页中隐藏“教材正文（课本内容）”“边界与拓展（拓展内容）”“先修补充”“直观解释”等分类标签与色块边框，保持纯净连贯的正文排版；开启后展示四类深色语义提示框。
+                </div>
+              </div>
+            </label>
           </div>
 
           {/* 1. 接口模式选择 */}
@@ -266,7 +543,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     setModelName('gpt-4o-mini');
                   }
                 }}
-                className={`p-3 rounded border text-left text-xs transition-colors ${
+                className={`glow-border p-3 rounded border text-left text-xs transition-colors ${
                   providerMode === 'openai_compatible'
                     ? 'bg-neutral-900 border-white text-white'
                     : 'bg-black border-neutral-800 text-neutral-400 hover:border-neutral-700'
@@ -286,7 +563,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     setModelName('gemini-3.8-flash');
                   }
                 }}
-                className={`p-3 rounded border text-left text-xs transition-colors ${
+                className={`glow-border p-3 rounded border text-left text-xs transition-colors ${
                   providerMode === 'builtin_gemini'
                     ? 'bg-neutral-900 border-white text-white'
                     : 'bg-black border-neutral-800 text-neutral-400 hover:border-neutral-700'
@@ -294,7 +571,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               >
                 <div className="font-medium mb-0.5">服务端默认多模态模型（Gemini）</div>
                 <div className="text-neutral-500">
-                  使用服务端环境变量凭证与 gemini-3.8-flash 原生直读 PDF（不依赖 OCR 文本）
+                  使用服务端环境变量凭证与 gemini-3.8-flash 原生直读 PDF 原文件
                 </div>
               </button>
             </div>
@@ -440,7 +717,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <div className="space-y-4">
                 {/* 学科与学习者水平选择 + 教学要求模块开关 */}
                 <div className="border border-neutral-900 rounded p-3.5 bg-neutral-950/50 space-y-3">
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="space-y-3">
                     <div>
                       <label className="block text-xs text-neutral-400 mb-1">
                         学科适配模块
@@ -456,24 +733,91 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         <option value="electronics_engineering">电子技术与工科（电路图/连续推导）</option>
                         <option value="math_physics">数学与物理（几何物理图像/严密证明）</option>
                         <option value="computer_science">计算机科学（状态图示/核心代码）</option>
-                        <option value="general_academic">通用专业课程（概念脉络/资料覆盖）</option>
                       </select>
                     </div>
 
-                    <div>
-                      <label className="block text-xs text-neutral-400 mb-1">
-                        默认学习者水平
-                      </label>
-                      <select
-                        value={defaultLearnerLevel}
-                        onChange={(e) => setDefaultLearnerLevel(e.target.value as LearnerLevel)}
-                        className="w-full bg-black border border-neutral-800 rounded px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-neutral-500"
-                      >
-                        <option value="beginner">初学者 / 零基础（解释全部术语与基础变形）</option>
-                        <option value="intermediate">具备基础 / 教材同步（标准教材深度与完整推导）</option>
-                        <option value="advanced">进阶深入（强化边界条件、非理想效应与迁移分析）</option>
-                      </select>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div>
+                        <label
+                          htmlFor="settings-default-baseline"
+                          className="block text-xs text-neutral-400 mb-1"
+                        >
+                          默认当前水平（起点铺垫门槛）
+                        </label>
+                        <select
+                          id="settings-default-baseline"
+                          value={defaultLearnerBaseline}
+                          onChange={(e) => {
+                            const next = e.target.value as LearnerBaselinePreset;
+                            setDefaultLearnerBaseline(next);
+                            setDefaultLearnerLevel(
+                              deriveLegacyLearnerLevel(next, defaultLearningDepth)
+                            );
+                          }}
+                          className="w-full bg-black border border-neutral-800 rounded px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-neutral-500"
+                        >
+                          <option value="zero_base">{BASELINE_LABELS.zero_base}</option>
+                          <option value="partial_base">{BASELINE_LABELS.partial_base}</option>
+                          <option value="solid_base">{BASELINE_LABELS.solid_base}</option>
+                          <option value="custom">自定义当前水平</option>
+                        </select>
+                        {defaultLearnerBaseline === 'custom' && (
+                          <input
+                            type="text"
+                            value={defaultCustomLearnerBaseline}
+                            onChange={(e) => setDefaultCustomLearnerBaseline(e.target.value)}
+                            placeholder="填写默认当前水平背景..."
+                            className="mt-1.5 w-full bg-black border border-neutral-800 rounded px-2.5 py-1.5 text-xs text-white placeholder:text-neutral-600 focus:outline-none focus:border-neutral-500"
+                          />
+                        )}
+                      </div>
+
+                      <div>
+                        <label
+                          htmlFor="settings-default-depth"
+                          className="block text-xs text-neutral-400 mb-1"
+                        >
+                          默认学习目标深度（终点推导难度）
+                        </label>
+                        <select
+                          id="settings-default-depth"
+                          value={defaultLearningDepth}
+                          onChange={(e) => {
+                            const next = e.target.value as LearningDepthPreset;
+                            setDefaultLearningDepth(next);
+                            setDefaultLearnerLevel(
+                              deriveLegacyLearnerLevel(defaultLearnerBaseline, next)
+                            );
+                          }}
+                          className="w-full bg-black border border-neutral-800 rounded px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-neutral-500"
+                        >
+                          <option value="understand_basics">{DEPTH_LABELS.understand_basics}</option>
+                          <option value="master_textbook">{DEPTH_LABELS.master_textbook}</option>
+                          <option value="deep_rigorous">{DEPTH_LABELS.deep_rigorous}</option>
+                          <option value="custom">自定义学习目标深度</option>
+                        </select>
+                        {defaultLearningDepth === 'custom' && (
+                          <input
+                            type="text"
+                            value={defaultCustomLearningDepth}
+                            onChange={(e) => setDefaultCustomLearningDepth(e.target.value)}
+                            placeholder="填写默认目标深度要求..."
+                            className="mt-1.5 w-full bg-black border border-neutral-800 rounded px-2.5 py-1.5 text-xs text-white placeholder:text-neutral-600 focus:outline-none focus:border-neutral-500"
+                          />
+                        )}
+                      </div>
                     </div>
+
+                    <p className="text-[11px] text-neutral-400 leading-relaxed border border-neutral-900 bg-black/70 rounded px-2.5 py-1.5">
+                      {
+                        resolveLearnerProfile({
+                          learnerBaseline: defaultLearnerBaseline,
+                          customLearnerBaseline: defaultCustomLearnerBaseline,
+                          learningDepth: defaultLearningDepth,
+                          customLearningDepth: defaultCustomLearningDepth,
+                        }).strategySummary
+                      }
+                    </p>
                   </div>
 
                   <div>
@@ -485,7 +829,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         type="button"
                         disabled={isComposing}
                         onClick={() =>
-                          handleComposeFromSkill(composeProfile, defaultLearnerLevel, promptModules)
+                          handleComposeFromSkill(
+                            composeProfile,
+                            defaultLearnerBaseline,
+                            defaultLearningDepth,
+                            promptModules
+                          )
                         }
                         className="inline-flex items-center gap-1 px-2.5 py-1 text-xs bg-neutral-900 hover:bg-neutral-800 text-white border border-neutral-700 rounded transition-colors"
                       >
@@ -655,7 +1004,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
         </form>
-      </div>
-    </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 };

@@ -1,7 +1,10 @@
 import {
   Course,
   DailyPlanSlot,
+  DailyScheduleDay,
   ExerciseQuestion,
+  ExerciseSubmissionRecord,
+  PdfSplitPlanItem,
   VocabCoverageStats,
   VocabItem,
 } from '../types';
@@ -669,6 +672,27 @@ export function buildDateTimeline(
 }
 
 /**
+ * Partition timeline entries so Today is always Row 1 of `todayAndUpcomingEntries`,
+ * while any earlier dates (`date < todayStr`) are placed in `pastEntries`.
+ */
+export function partitionTimelineAroundToday(entries: TimelineDateEntry[]): {
+  pastEntries: TimelineDateEntry[];
+  todayAndUpcomingEntries: TimelineDateEntry[];
+} {
+  const todayIdx = entries.findIndex((e) => e.isToday);
+  if (todayIdx <= 0) {
+    return {
+      pastEntries: [],
+      todayAndUpcomingEntries: entries,
+    };
+  }
+  return {
+    pastEntries: entries.slice(0, todayIdx),
+    todayAndUpcomingEntries: entries.slice(todayIdx),
+  };
+}
+
+/**
  * Deterministic offline exercise grading (requires NO LLM or internet connection).
  */
 export function gradeSingleExercise(
@@ -725,7 +749,7 @@ export function gradeExerciseSet(
     details[q.id] = {
       isCorrect: res.isCorrect,
       expected: q.answer,
-      explanation: q.explanation,
+      explanation: q.explanation || '',
     };
   }
 
@@ -735,3 +759,610 @@ export function gradeExerciseSet(
     details,
   };
 }
+
+export function formatStudyDuration(totalSeconds: number): string {
+  const safe = Math.max(0, Math.floor(totalSeconds || 0));
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const seconds = safe % 60;
+  if (hours > 0) {
+    return `${hours}h ${String(minutes).padStart(2, '0')}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+  }
+  return `${seconds}s`;
+}
+
+export interface ComputedLearningStats {
+  totalStudySeconds: number;
+  todayStudySeconds: number;
+  totalQuestionsAnswered: number;
+  totalQuestionsCorrect: number;
+  accuracyPercent: number | null;
+  todayQuestionsAnswered: number;
+  todayQuestionsCorrect: number;
+  todayAccuracyPercent: number | null;
+  completedLessonsCount: number;
+  totalLessonsCount: number;
+}
+
+export function getSlotExerciseSubmission(
+  course: Course,
+  slot: DailyPlanSlot
+): ExerciseSubmissionRecord | undefined {
+  const subs = course.exerciseSubmissions || {};
+  if (slot.id && subs[slot.id]) {
+    return subs[slot.id];
+  }
+  const secKey = ensureStableSectionId(slot.dayIndex, slot.id);
+  if (subs[secKey]) {
+    return subs[secKey];
+  }
+  if (slot.date && subs[slot.date]) {
+    const record = subs[slot.date];
+    if (!record.sectionId || record.sectionId === secKey || record.sectionId === slot.id) {
+      return record;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Return explicitly assessed study minutes (written lesson's `estimatedMinutes` first,
+ * then explicit slot `estimatedMinutes`) WITHOUT falling back to pre-lesson heuristics.
+ */
+export function getEvaluatedSectionMinutes(
+  slot: Partial<DailyPlanSlot>
+): number | undefined {
+  const lessonMinutes = Number(slot.lesson?.estimatedMinutes);
+  if (Number.isFinite(lessonMinutes) && lessonMinutes > 0) {
+    return Math.max(10, Math.min(300, Math.round(lessonMinutes)));
+  }
+  const raw = Number(slot.estimatedMinutes);
+  if (Number.isFinite(raw) && raw > 0) {
+    return Math.max(10, Math.min(300, Math.round(raw)));
+  }
+  return undefined;
+}
+
+/**
+ * Deterministic estimation fallback for a teaching section's study duration in minutes
+ * when an imported/legacy outline omits `estimatedMinutes`.
+ */
+export function estimateSectionMinutesFallback(slot: Partial<DailyPlanSlot>): number {
+  const evaluated = getEvaluatedSectionMinutes(slot);
+  if (evaluated !== undefined) {
+    return evaluated;
+  }
+  const segPages = slot.pdfSegment
+    ? Math.max(
+        1,
+        (Number(slot.pdfSegment.physicalEndPage) || 1) -
+          (Number(slot.pdfSegment.physicalStartPage) || 1) +
+          1
+      )
+    : 0;
+  const topicCount = Array.isArray(slot.keyTopics) ? slot.keyTopics.length : 0;
+
+  let estimate = 45;
+  if (segPages > 0 && topicCount > 0) {
+    estimate = Math.round(segPages * 4.5 + topicCount * 6);
+  } else if (segPages > 0) {
+    estimate = Math.round(segPages * 5.5);
+  } else if (topicCount > 0) {
+    estimate = Math.round(topicCount * 14);
+  }
+  return Math.max(20, Math.min(120, estimate));
+}
+
+/**
+ * Deterministic sequence-preserving day allocation algorithm:
+ * Partitions ordered sections across `durationDays` based on `estimatedMinutes`,
+ * using `totalMinutes / durationDays` as the baseline daily load while preserving
+ * strict section order and section indivisibility (no AI used for scheduling).
+ */
+export function allocateSectionsToDays(
+  slots: DailyPlanSlot[],
+  durationDays: number,
+  startDate: string
+): DailyPlanSlot[] {
+  if (!Array.isArray(slots) || slots.length === 0) return [];
+  const safeStartDate =
+    typeof startDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(startDate)
+      ? startDate
+      : getTodayDateString();
+  const M = slots.length;
+  const N = Math.max(1, Math.min(180, Math.round(Number(durationDays) || M)));
+
+  const normalized: DailyPlanSlot[] = slots.map((slot, idx) => {
+    const secNum = idx + 1;
+    const stableId = ensureStableSectionId(secNum, slot.id);
+    const evaluatedOrExplicit = getEvaluatedSectionMinutes(slot);
+    return {
+      ...slot,
+      id: stableId,
+      dayIndex: secNum,
+      estimatedMinutes: evaluatedOrExplicit,
+    };
+  });
+
+  if (M === N) {
+    return normalized.map((slot, idx) => ({
+      ...slot,
+      scheduledDay: idx + 1,
+      date: addDaysToDateString(safeStartDate, idx),
+    }));
+  }
+
+  const weights = normalized.map((s) => estimateSectionMinutesFallback(s));
+  const totalMinutes = weights.reduce((acc, w) => acc + w, 0);
+
+  if (M < N) {
+    // Spread M indivisible sections proportionally across N days by cumulative midpoint,
+    // keeping strict monotonic progression: Day 1 gets section 1, and each section advances.
+    const assignedDays: number[] = new Array(M).fill(1);
+    let cumBefore = 0;
+    for (let i = 0; i < M; i++) {
+      const w = weights[i];
+      if (i === 0) {
+        assignedDays[i] = 1;
+      } else {
+        const midpointRatio = totalMinutes > 0 ? (cumBefore + w * 0.5) / totalMinutes : i / M;
+        const idealDay = Math.floor(midpointRatio * N) + 1;
+        const minAllowed = assignedDays[i - 1] + 1;
+        const maxAllowed = N - (M - 1 - i);
+        assignedDays[i] = Math.max(minAllowed, Math.min(maxAllowed, idealDay));
+      }
+      cumBefore += w;
+    }
+    return normalized.map((slot, idx) => {
+      const d = assignedDays[idx];
+      return {
+        ...slot,
+        scheduledDay: d,
+        date: addDaysToDateString(safeStartDate, d - 1),
+      };
+    });
+  }
+
+  // M > N: Exact dynamic programming partition minimizing SSE from targetMinutes = totalMinutes / N
+  const target = totalMinutes / N;
+  const prefix = new Array<number>(M + 1).fill(0);
+  for (let i = 0; i < M; i++) {
+    prefix[i + 1] = prefix[i] + weights[i];
+  }
+
+  const INF = Number.POSITIVE_INFINITY;
+  const dpSse: number[][] = Array.from({ length: N + 1 }, () => new Array(M + 1).fill(INF));
+  const dpMaxLoad: number[][] = Array.from({ length: N + 1 }, () => new Array(M + 1).fill(INF));
+  const prevSplit: number[][] = Array.from({ length: N + 1 }, () => new Array(M + 1).fill(0));
+
+  for (let i = 1; i <= M - (N - 1); i++) {
+    const load = prefix[i];
+    const diff = load - target;
+    dpSse[1][i] = diff * diff;
+    dpMaxLoad[1][i] = load;
+    prevSplit[1][i] = 0;
+  }
+
+  for (let d = 2; d <= N; d++) {
+    const maxI = M - (N - d);
+    for (let i = d; i <= maxI; i++) {
+      let bestSse = INF;
+      let bestMax = INF;
+      let bestJ = d - 1;
+      for (let j = d - 1; j < i; j++) {
+        if (dpSse[d - 1][j] === INF) continue;
+        const segLoad = prefix[i] - prefix[j];
+        const diff = segLoad - target;
+        const candSse = dpSse[d - 1][j] + diff * diff;
+        const candMax = Math.max(dpMaxLoad[d - 1][j], segLoad);
+        if (
+          candSse < bestSse - 1e-6 ||
+          (Math.abs(candSse - bestSse) <= 1e-6 && candMax < bestMax)
+        ) {
+          bestSse = candSse;
+          bestMax = candMax;
+          bestJ = j;
+        }
+      }
+      dpSse[d][i] = bestSse;
+      dpMaxLoad[d][i] = bestMax;
+      prevSplit[d][i] = bestJ;
+    }
+  }
+
+  // Reconstruct day index (1..N) for each section 0..M-1
+  const assignedDays = new Array<number>(M).fill(N);
+  let cursorEnd = M;
+  for (let d = N; d >= 1; d--) {
+    const startIdx = prevSplit[d][cursorEnd];
+    for (let k = startIdx; k < cursorEnd; k++) {
+      assignedDays[k] = d;
+    }
+    cursorEnd = startIdx;
+  }
+
+  return normalized.map((slot, idx) => {
+    const d = assignedDays[idx];
+    return {
+      ...slot,
+      scheduledDay: d,
+      date: addDaysToDateString(safeStartDate, d - 1),
+    };
+  });
+}
+
+/**
+ * Build day-by-day grouped study schedule summary from allocated section slots.
+ */
+export function buildCourseDailySchedule(
+  slots: DailyPlanSlot[],
+  durationDays: number,
+  startDate: string
+): DailyScheduleDay[] {
+  const safeStartDate =
+    typeof startDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(startDate)
+      ? startDate
+      : getTodayDateString();
+  const safeDays = Math.max(1, Math.min(180, Math.round(Number(durationDays) || slots.length || 1)));
+  const totalMinutes = slots.reduce((sum, s) => sum + (getEvaluatedSectionMinutes(s) || 0), 0);
+  const targetMinutes = Math.round(totalMinutes / safeDays);
+
+  const byDate = new Map<string, DailyPlanSlot[]>();
+  for (const s of slots) {
+    const key = s.date || addDaysToDateString(safeStartDate, Math.max(0, (s.scheduledDay || s.dayIndex) - 1));
+    const list = byDate.get(key) || [];
+    list.push(s);
+    byDate.set(key, list);
+  }
+
+  const schedule: DailyScheduleDay[] = [];
+  for (let d = 1; d <= safeDays; d++) {
+    const date = addDaysToDateString(safeStartDate, d - 1);
+    const daySlots = byDate.get(date) || [];
+    schedule.push({
+      dayNumber: d,
+      date,
+      sectionIds: daySlots.map((s) => ensureStableSectionId(s.dayIndex, s.id)),
+      estimatedMinutes: daySlots.reduce((sum, s) => sum + (getEvaluatedSectionMinutes(s) || 0), 0),
+      targetMinutes,
+    });
+  }
+  return schedule;
+}
+
+export function computeLearningStats(
+  courses: Course[],
+  studyStats: {
+    totalSeconds?: number;
+    secondsByDate?: Record<string, number>;
+    secondsByCourse?: Record<string, number>;
+  } | null | undefined,
+  todayStr: string = getTodayDateString()
+): ComputedLearningStats {
+  const totalStudySeconds = Math.max(0, Math.floor(studyStats?.totalSeconds || 0));
+  const todayStudySeconds = Math.max(
+    0,
+    Math.floor(studyStats?.secondsByDate?.[todayStr] || 0)
+  );
+
+  let totalQuestionsAnswered = 0;
+  let totalQuestionsCorrect = 0;
+  let todayQuestionsAnswered = 0;
+  let todayQuestionsCorrect = 0;
+  let completedLessonsCount = 0;
+  let totalLessonsCount = 0;
+
+  for (const course of courses) {
+    totalLessonsCount += course.dailyPlan.length;
+    const slotDateBySecId = new Map<string, string>();
+    for (const slot of course.dailyPlan) {
+      if (slot.id) slotDateBySecId.set(slot.id, slot.date);
+      slotDateBySecId.set(ensureStableSectionId(slot.dayIndex, slot.id), slot.date);
+      if (slot.lesson) {
+        completedLessonsCount++;
+      }
+    }
+    const subs = course.exerciseSubmissions || {};
+    for (const [subKey, sub] of Object.entries(subs)) {
+      if (!sub || typeof sub.total !== 'number' || sub.total <= 0) continue;
+      const total = Math.max(0, Number(sub.total) || 0);
+      const score = Math.max(0, Math.min(total, Number(sub.score) || 0));
+      totalQuestionsAnswered += total;
+      totalQuestionsCorrect += score;
+      const effectiveDate = sub.date || slotDateBySecId.get(subKey) || subKey;
+      if (subKey === todayStr || effectiveDate === todayStr) {
+        todayQuestionsAnswered += total;
+        todayQuestionsCorrect += score;
+      }
+    }
+  }
+
+  const accuracyPercent =
+    totalQuestionsAnswered > 0
+      ? Math.round((totalQuestionsCorrect / totalQuestionsAnswered) * 1000) / 10
+      : null;
+
+  const todayAccuracyPercent =
+    todayQuestionsAnswered > 0
+      ? Math.round((todayQuestionsCorrect / todayQuestionsAnswered) * 1000) / 10
+      : null;
+
+  return {
+    totalStudySeconds,
+    todayStudySeconds,
+    totalQuestionsAnswered,
+    totalQuestionsCorrect,
+    accuracyPercent,
+    todayQuestionsAnswered,
+    todayQuestionsCorrect,
+    todayAccuracyPercent,
+    completedLessonsCount,
+    totalLessonsCount,
+  };
+}
+
+function normalizeRegionToken(raw: string): string {
+  const trimmed = raw.trim();
+  const match = trimmed.match(/^region[-_\s]?(\d+)$/i);
+  if (match) {
+    return `region-${String(Number(match[1])).padStart(2, '0')}`;
+  }
+  return trimmed;
+}
+
+/**
+ * Extract all referenced PDF region IDs (`region-01`, `region-02`, ...) from a section's
+ * `regionIds`, `regionId`, `teachingScope`, and `title`.
+ */
+export function extractReferencedRegionIds(slot: {
+  regionId?: string;
+  regionIds?: string[];
+  teachingScope?: string;
+  title?: string;
+}): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const pushId = (raw: string) => {
+    const normalized = normalizeRegionToken(raw);
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    out.push(normalized);
+  };
+
+  if (Array.isArray(slot.regionIds)) {
+    for (const entry of slot.regionIds) {
+      if (typeof entry !== 'string') continue;
+      for (const token of entry.split(/[,，、;；/+&\s]+/)) {
+        if (token.trim()) pushId(token);
+      }
+    }
+  }
+
+  if (typeof slot.regionId === 'string' && slot.regionId.trim()) {
+    for (const token of slot.regionId.split(/[,，、;；/+&\s]+/)) {
+      if (token.trim()) pushId(token);
+    }
+  }
+
+  const scanText = `${slot.teachingScope || ''}\n${slot.title || ''}`;
+  const matches = scanText.match(/region[-_\s]?\d+/gi) || [];
+  for (const m of matches) {
+    pushId(m);
+  }
+
+  return out;
+}
+
+/**
+ * Resolve ALL PDF segments bound to a section (supporting 1-to-1 and many-to-one merged regions).
+ */
+export function resolveSlotPdfSegments(
+  slot: Pick<
+    DailyPlanSlot,
+    'id' | 'dayIndex' | 'regionId' | 'regionIds' | 'teachingScope' | 'title' | 'pdfSegment' | 'pdfSegments'
+  >,
+  splitPlan?: PdfSplitPlanItem[]
+): PdfSplitPlanItem[] {
+  const fallbackList = (): PdfSplitPlanItem[] => {
+    const items: PdfSplitPlanItem[] = [];
+    const seen = new Set<string>();
+    const add = (seg?: PdfSplitPlanItem) => {
+      if (!seg) return;
+      const key = seg.sectionId || seg.segmentFileName || seg.segmentRelPath || String(seg.dayIndex);
+      if (seen.has(key)) return;
+      seen.add(key);
+      items.push(seg);
+    };
+    if (Array.isArray(slot.pdfSegments)) {
+      for (const s of slot.pdfSegments) add(s);
+    }
+    add(slot.pdfSegment);
+    return items;
+  };
+
+  if (!splitPlan || splitPlan.length === 0) {
+    return fallbackList();
+  }
+
+  const findInPlan = (id: string): PdfSplitPlanItem | undefined => {
+    const norm = normalizeRegionToken(id);
+    return splitPlan.find(
+      (p) => p.sectionId === id || normalizeRegionToken(p.sectionId) === norm
+    );
+  };
+
+  const refIds = extractReferencedRegionIds(slot);
+  const matched: PdfSplitPlanItem[] = [];
+  const seen = new Set<string>();
+  for (const refId of refIds) {
+    const found = findInPlan(refId);
+    if (found && !seen.has(found.sectionId)) {
+      seen.add(found.sectionId);
+      matched.push(found);
+    }
+  }
+  if (matched.length > 0) {
+    return matched;
+  }
+
+  // Compatibility fallback when section didn't specify regionId
+  const bySecId = findInPlan(slot.id);
+  if (bySecId) return [bySecId];
+  const byDayIndex = splitPlan.find((p) => p.dayIndex === slot.dayIndex);
+  if (byDayIndex) return [byDayIndex];
+
+  return fallbackList();
+}
+
+function findBestSlotIndexByPageOverlap(
+  slots: DailyPlanSlot[],
+  region: PdfSplitPlanItem
+): number {
+  let bestIdx = -1;
+  let bestScore = 0;
+
+  for (let i = 0; i < slots.length; i++) {
+    const text = `${slots[i].teachingScope || ''}\n${slots[i].title || ''}`;
+    let score = 0;
+
+    // Look for physical or printed page ranges like "物理页54~64" or "329~339"
+    const rangeRegex = /(\d{1,4})\s*[~–\-－至到]\s*(\d{1,4})/g;
+    let m: RegExpExecArray | null;
+    while ((m = rangeRegex.exec(text)) !== null) {
+      const a = Number(m[1]);
+      const b = Number(m[2]);
+      if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) continue;
+      const physOverlap = Math.max(
+        0,
+        Math.min(b, region.physicalEndPage) - Math.max(a, region.physicalStartPage) + 1
+      );
+      if (physOverlap > 0) {
+        score += physOverlap * 2;
+      }
+      if (
+        typeof region.printedStartPage === 'number' &&
+        typeof region.printedEndPage === 'number'
+      ) {
+        const printedOverlap = Math.max(
+          0,
+          Math.min(b, region.printedEndPage) - Math.max(a, region.printedStartPage) + 1
+        );
+        if (printedOverlap > 0) {
+          score += printedOverlap * 2;
+        }
+      }
+    }
+
+    if (score >= bestScore && score > 0) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  }
+
+  return bestIdx;
+}
+
+/**
+ * Bind every section to its referenced PDF region(s) and guarantee 100% coverage of all
+ * split PDF regions in `splitPlan` so no sliced PDF is left unused.
+ */
+export function bindAndEnsureAllPdfRegionsCovered(
+  slots: DailyPlanSlot[],
+  splitPlan?: PdfSplitPlanItem[]
+): DailyPlanSlot[] {
+  if (!slots || slots.length === 0) return [];
+  if (!splitPlan || splitPlan.length === 0) {
+    return slots.map((slot) => {
+      const existingSegs = resolveSlotPdfSegments(slot, undefined);
+      const existingIds = extractReferencedRegionIds(slot);
+      return {
+        ...slot,
+        regionId: existingIds[0] || slot.regionId || existingSegs[0]?.sectionId,
+        regionIds:
+          existingIds.length > 0
+            ? existingIds
+            : existingSegs.length > 0
+              ? existingSegs.map((s) => s.sectionId)
+              : slot.regionIds,
+        pdfSegment: existingSegs[0] || slot.pdfSegment,
+        pdfSegments: existingSegs.length > 0 ? existingSegs : slot.pdfSegments,
+      };
+    });
+  }
+
+  const orderIndex = new Map<string, number>();
+  splitPlan.forEach((p, idx) => orderIndex.set(p.sectionId, idx));
+
+  // Pass 1: resolve explicitly referenced regions per slot
+  const slotSegLists: PdfSplitPlanItem[][] = slots.map((slot) =>
+    resolveSlotPdfSegments(slot, splitPlan)
+  );
+
+  const covered = new Set<string>();
+  for (const list of slotSegLists) {
+    for (const seg of list) {
+      covered.add(seg.sectionId);
+    }
+  }
+
+  // Pass 2: assign any uncovered regions so every split PDF region is attached to a section
+  for (let rIdx = 0; rIdx < splitPlan.length; rIdx++) {
+    const region = splitPlan[rIdx];
+    if (covered.has(region.sectionId)) continue;
+
+    let targetSlotIdx = findBestSlotIndexByPageOverlap(slots, region);
+
+    if (targetSlotIdx < 0 && rIdx > 0) {
+      const prevRegionId = splitPlan[rIdx - 1].sectionId;
+      for (let i = slots.length - 1; i >= 0; i--) {
+        if (slotSegLists[i].some((s) => s.sectionId === prevRegionId)) {
+          targetSlotIdx = i;
+          break;
+        }
+      }
+    }
+
+    if (targetSlotIdx < 0 && rIdx + 1 < splitPlan.length) {
+      const nextRegionId = splitPlan[rIdx + 1].sectionId;
+      for (let i = 0; i < slots.length; i++) {
+        if (slotSegLists[i].some((s) => s.sectionId === nextRegionId)) {
+          targetSlotIdx = i;
+          break;
+        }
+      }
+    }
+
+    if (targetSlotIdx < 0) {
+      const proportional = Math.floor((rIdx / Math.max(1, splitPlan.length)) * slots.length);
+      targetSlotIdx = Math.max(0, Math.min(slots.length - 1, proportional));
+    }
+
+    if (!slotSegLists[targetSlotIdx].some((s) => s.sectionId === region.sectionId)) {
+      slotSegLists[targetSlotIdx].push(region);
+    }
+    covered.add(region.sectionId);
+  }
+
+  // Pass 3: normalize ordering and sync regionId/regionIds/pdfSegment/pdfSegments
+  return slots.map((slot, idx) => {
+    const unique = new Map<string, PdfSplitPlanItem>();
+    for (const seg of slotSegLists[idx]) {
+      if (!unique.has(seg.sectionId)) unique.set(seg.sectionId, seg);
+    }
+    const sortedSegs = Array.from(unique.values()).sort(
+      (a, b) => (orderIndex.get(a.sectionId) ?? 9999) - (orderIndex.get(b.sectionId) ?? 9999)
+    );
+    const regionIds = sortedSegs.map((s) => s.sectionId);
+    return {
+      ...slot,
+      regionId: regionIds[0] || slot.regionId,
+      regionIds: regionIds.length > 0 ? regionIds : undefined,
+      pdfSegment: sortedSegs[0] || slot.pdfSegment,
+      pdfSegments: sortedSegs.length > 0 ? sortedSegs : undefined,
+    };
+  });
+}
+

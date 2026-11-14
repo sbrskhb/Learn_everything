@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import { Trash2, X } from 'lucide-react';
 import type { Course } from '../types';
 
@@ -15,10 +16,27 @@ export const DeleteCourseModal: React.FC<DeleteCourseModalProps> = ({
   onClose,
   onConfirmDelete,
 }) => {
+  return (
+    <AnimatePresence>
+      {isOpen && course && (
+        <DeleteCourseModalInner
+          key={course.id}
+          course={course}
+          onClose={onClose}
+          onConfirmDelete={onConfirmDelete}
+        />
+      )}
+    </AnimatePresence>
+  );
+};
+
+const DeleteCourseModalInner: React.FC<{
+  course: Course;
+  onClose: () => void;
+  onConfirmDelete: (courseId: string, deleteLocalFolder: boolean) => Promise<void>;
+}> = ({ course, onClose, onConfirmDelete }) => {
   const [deleteLocalFolder, setDeleteLocalFolder] = useState<boolean>(true);
   const [isDeleting, setIsDeleting] = useState(false);
-
-  if (!isOpen || !course) return null;
 
   const folderPath = course.courseDirPath || `courses/${course.folderName || course.id}`;
 
@@ -33,16 +51,28 @@ export const DeleteCourseModal: React.FC<DeleteCourseModalProps> = ({
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="delete-course-dialog-title"
-    >
-      <div className="w-full max-w-md bg-black border border-neutral-800 rounded-md p-6 space-y-4">
-        <div className="flex items-center justify-between border-b border-neutral-800 pb-3">
-          <h2 id="delete-course-dialog-title" className="text-base font-semibold text-white">
-            确认删除课程《{course.name}》
+        <motion.div
+          key="delete-course-backdrop"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-sm p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-course-dialog-title"
+        >
+          <motion.div
+            key="delete-course-panel"
+            initial={{ opacity: 0, scale: 0.96 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.97 }}
+            transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+            className="glow-border w-full max-w-md bg-black border border-neutral-800 rounded-md p-6 space-y-4 shadow-2xl"
+          >
+            <div className="flex items-center justify-between border-b border-neutral-800 pb-3">
+              <h2 id="delete-course-dialog-title" className="font-display text-base font-semibold text-white">
+                确认删除课程《{course.name}》
           </h2>
           <button
             type="button"
@@ -113,7 +143,7 @@ export const DeleteCourseModal: React.FC<DeleteCourseModalProps> = ({
             </span>
           </button>
         </div>
-      </div>
-    </div>
+          </motion.div>
+        </motion.div>
   );
 };

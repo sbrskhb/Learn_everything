@@ -13,10 +13,13 @@ import type {
   DailyPlanSlot,
   EnglishArticleMode,
   KnowledgeCatalogNode,
+  LearnerBaselinePreset,
   LearnerLevel,
+  LearningDepthPreset,
   PdfDocumentMeta,
   PdfSplitPlanItem,
   PromptModuleToggles,
+  StudyStats,
   SubjectProfile,
   UploadedMaterial,
   VocabItem,
@@ -24,12 +27,24 @@ import type {
 import {
   addDaysToDateString,
   allocateEnglishWordsRandomly,
+  allocateSectionsToDays,
+  bindAndEnsureAllPdfRegionsCovered,
+  buildCourseDailySchedule,
   computeVocabCoverageStats,
   ensureStableSectionId,
+  extractReferencedRegionIds,
+  getEvaluatedSectionMinutes,
   getTodayDateString,
+  resolveSlotPdfSegments,
   sanitizeCourseFolderName,
 } from './src/utils/learningLogic';
 import {
+  deriveLegacyLearnerLevel,
+  mapLegacyLevelToDualAxis,
+} from './src/utils/learnerProfile';
+import {
+  extractPendingDiagramSpecs,
+  mergeStage2DiagramsIntoStage1,
   parseImportedLessonContent,
   parseImportedSyllabusContent,
   resolveLessonAssetReferences,
@@ -38,6 +53,7 @@ import {
 } from './src/utils/coursewareParser';
 import {
   analyzePdfBuffer,
+  analyzePdfFile,
   applyPageOffsetToSplitPlan,
   buildHeuristicPdfSplitPlan,
   createMultiPagePdfBuffer,
@@ -47,11 +63,15 @@ import {
 import {
   DEFAULT_PROMPT_MODULE_TOGGLES,
   buildAgentExecutionPrompt,
+  buildAgentSectionStagePrompt,
   buildAgentSyllabusPrompt,
   buildChatLessonPrompt,
+  buildChatLessonStage1Prompt,
   buildChatSyllabusPrompt,
+  buildCourseLessonStage1Prompt,
   buildCourseLessonUserPrompt,
   buildEnglishLessonUserPrompt,
+  buildLessonStage2DiagramsPrompt,
   buildPdfSplitPrompts,
   buildSyllabusUserPrompt,
   composeCoursewareSystemPrompt,
@@ -59,6 +79,10 @@ import {
   getPromptPresetsFromSkill,
   inferSubjectProfile,
 } from './src/prompts/promptLibrary';
+import {
+  analyzeStreamedLessonBuffer,
+  type GenerationProgressEvent,
+} from './src/utils/streamProgress';
 
 dotenv.config();
 
@@ -67,12 +91,16 @@ const PYTHON_BACKEND_PORT = Number(process.env.PYTHON_BACKEND_PORT) || 3001;
 const PYTHON_BACKEND_URL =
   (process.env.PYTHON_BACKEND_URL || `http://127.0.0.1:${PYTHON_BACKEND_PORT}`).replace(/\/+$/, '');
 const DATA_DIR = path.resolve(process.cwd(), 'data');
+const TMP_UPLOADS_DIR = path.join(DATA_DIR, 'tmp_uploads');
 const COURSES_ROOT = path.resolve(process.cwd(), 'courses');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+if (!fs.existsSync(TMP_UPLOADS_DIR)) {
+  fs.mkdirSync(TMP_UPLOADS_DIR, { recursive: true });
 }
 if (!fs.existsSync(COURSES_ROOT)) {
   fs.mkdirSync(COURSES_ROOT, { recursive: true });
@@ -271,7 +299,12 @@ interface StoredSettings {
   modelName: string;
   customApiKey: string;
   defaultLearnerLevel: LearnerLevel;
+  defaultLearnerBaseline: LearnerBaselinePreset;
+  defaultCustomLearnerBaseline: string;
+  defaultLearningDepth: LearningDepthPreset;
+  defaultCustomLearningDepth: string;
   showAdvancedWorkflowDetails: boolean;
+  showContentCategoryBadges: boolean;
   promptModules: PromptModuleToggles;
   syllabusSystemPrompt: string;
   courseSystemPrompt: string;
@@ -287,13 +320,20 @@ function loadSettings(): StoredSettings {
       const isUpgradedPrompt =
         typeof raw.courseSystemPrompt === 'string' &&
         raw.courseSystemPrompt.includes('{{heuristic:hq-1}}');
+      const legacyLevel: LearnerLevel = raw.defaultLearnerLevel || 'intermediate';
+      const fallbackDual = mapLegacyLevelToDualAxis(legacyLevel);
       return {
         providerMode: raw.providerMode || 'builtin_gemini',
         apiBaseUrl: raw.apiBaseUrl || 'https://api.openai.com/v1',
         modelName: raw.modelName || 'gemini-3.8-flash',
         customApiKey: raw.customApiKey || '',
-        defaultLearnerLevel: raw.defaultLearnerLevel || 'intermediate',
+        defaultLearnerLevel: legacyLevel,
+        defaultLearnerBaseline: raw.defaultLearnerBaseline || fallbackDual.baseline,
+        defaultCustomLearnerBaseline: raw.defaultCustomLearnerBaseline || '',
+        defaultLearningDepth: raw.defaultLearningDepth || fallbackDual.depth,
+        defaultCustomLearningDepth: raw.defaultCustomLearningDepth || '',
         showAdvancedWorkflowDetails: Boolean(raw.showAdvancedWorkflowDetails),
+        showContentCategoryBadges: Boolean(raw.showContentCategoryBadges),
         promptModules: {
           ...DEFAULT_PROMPT_MODULE_TOGGLES,
           ...(raw.promptModules || {}),
@@ -319,7 +359,12 @@ function loadSettings(): StoredSettings {
     modelName: 'gemini-3.8-flash',
     customApiKey: '',
     defaultLearnerLevel: 'intermediate',
+    defaultLearnerBaseline: 'partial_base',
+    defaultCustomLearnerBaseline: '',
+    defaultLearningDepth: 'master_textbook',
+    defaultCustomLearningDepth: '',
     showAdvancedWorkflowDetails: false,
+    showContentCategoryBadges: false,
     promptModules: { ...DEFAULT_PROMPT_MODULE_TOGGLES },
     syllabusSystemPrompt: skillDefaults.syllabusSystemPrompt,
     courseSystemPrompt: skillDefaults.courseSystemPrompt,
@@ -340,6 +385,15 @@ function getEffectiveTeachingSystemPrompt(course: Course, settings: StoredSettin
     course.subjectProfile ||
     inferSubjectProfile(course.category, course.name, course.extraRequirements);
   const resolvedLevel = course.learnerLevel || settings.defaultLearnerLevel || 'intermediate';
+  const fallbackDual = mapLegacyLevelToDualAxis(resolvedLevel);
+  const resolvedBaseline =
+    course.learnerBaseline || settings.defaultLearnerBaseline || fallbackDual.baseline;
+  const resolvedCustomBaseline =
+    course.customLearnerBaseline ?? settings.defaultCustomLearnerBaseline ?? '';
+  const resolvedDepth =
+    course.learningDepth || settings.defaultLearningDepth || fallbackDual.depth;
+  const resolvedCustomDepth =
+    course.customLearningDepth ?? settings.defaultCustomLearningDepth ?? '';
   const defaultPrompts = getDefaultPromptsFromSkill();
 
   if (
@@ -359,6 +413,10 @@ function getEffectiveTeachingSystemPrompt(course: Course, settings: StoredSettin
   return composeCoursewareSystemPrompt({
     subjectProfile: resolvedProfile,
     learnerLevel: resolvedLevel,
+    learnerBaseline: resolvedBaseline,
+    customLearnerBaseline: resolvedCustomBaseline,
+    learningDepth: resolvedDepth,
+    customLearningDepth: resolvedCustomDepth,
     modules: settings.promptModules,
     customSupplement: [settings.customTeachingSupplement, course.extraRequirements]
       .filter(Boolean)
@@ -404,19 +462,10 @@ function getCourseDirectory(course: Course): {
  * Resolve the PDF region/segment bound to an outline slot via regionId, slot id, or dayIndex.
  */
 function resolveSlotPdfSegment(
-  slot: Pick<DailyPlanSlot, 'id' | 'dayIndex' | 'regionId' | 'pdfSegment'>,
+  slot: Pick<DailyPlanSlot, 'id' | 'dayIndex' | 'regionId' | 'regionIds' | 'teachingScope' | 'title' | 'pdfSegment' | 'pdfSegments'>,
   splitPlan?: PdfSplitPlanItem[]
 ): PdfSplitPlanItem | undefined {
-  if (!splitPlan || splitPlan.length === 0) return slot.pdfSegment;
-  if (slot.regionId) {
-    const byRegion = splitPlan.find((p) => p.sectionId === slot.regionId);
-    if (byRegion) return byRegion;
-  }
-  const bySectionId = splitPlan.find((p) => p.sectionId === slot.id);
-  if (bySectionId) return bySectionId;
-  const byDayIndex = splitPlan.find((p) => p.dayIndex === slot.dayIndex);
-  if (byDayIndex) return byDayIndex;
-  return slot.pdfSegment;
+  return resolveSlotPdfSegments(slot, splitPlan)[0] || slot.pdfSegment;
 }
 
 /**
@@ -486,13 +535,31 @@ async function persistCourseToFolder(
   fs.mkdirSync(lessonsDir, { recursive: true });
   fs.mkdirSync(assetsDir, { recursive: true });
 
-  // Ensure every slot has a stable unique sectionId
+  // Ensure every slot has a stable unique sectionId and preserve evaluated estimatedMinutes without fabricating estimates
   course.dailyPlan.forEach((slot) => {
     slot.id = ensureStableSectionId(slot.dayIndex, slot.id);
+    const evaluatedMinutes = getEvaluatedSectionMinutes(slot);
+    if (evaluatedMinutes !== undefined) {
+      slot.estimatedMinutes = evaluatedMinutes;
+    } else {
+      delete slot.estimatedMinutes;
+    }
     if (slot.lesson) {
       slot.lesson.sectionId = slot.id;
     }
   });
+  if (course.dailyPlan.length > 0) {
+    course.dailyPlan = allocateSectionsToDays(
+      course.dailyPlan,
+      course.durationDays,
+      course.startDate
+    );
+  }
+  course.dailySchedule = buildCourseDailySchedule(
+    course.dailyPlan,
+    course.durationDays,
+    course.startDate
+  );
 
   // 1. Save uploaded materials into `sources/`
   const materialFilePaths: string[] = [];
@@ -504,7 +571,38 @@ async function persistCourseToFolder(
     const relSourceFile = `${relCourseDir}/sources/${safeFileName}`;
     m.sourceRelPath = relSourceFile;
 
-    if (m.base64Data) {
+    const tmpUploadIdSafe = m.tempUploadId
+      ? String(m.tempUploadId).replace(/[^a-zA-Z0-9_-]/g, '')
+      : '';
+    const tmpUploadPdfPath = tmpUploadIdSafe
+      ? path.join(TMP_UPLOADS_DIR, `${tmpUploadIdSafe}.pdf`)
+      : '';
+
+    if (tmpUploadPdfPath && fs.existsSync(tmpUploadPdfPath)) {
+      fs.copyFileSync(tmpUploadPdfPath, absSourceFile);
+      try {
+        fs.unlinkSync(tmpUploadPdfPath);
+      } catch {
+        // ignore cleanup failure
+      }
+      if (isPdf) {
+        try {
+          const analyzed = await analyzePdfFile(absSourceFile, safeFileName);
+          m.totalPages = analyzed.meta.totalPages;
+          m.detectedPageOffset = analyzed.meta.detectedPageOffset;
+          m.tocEntries = analyzed.meta.tocEntries;
+          m.pages = [];
+          fs.writeFileSync(
+            `${absSourceFile}.pages.json`,
+            JSON.stringify(analyzed.meta, null, 2),
+            'utf-8'
+          );
+        } catch {
+          // ignore
+        }
+      }
+      delete m.tempUploadId;
+    } else if (m.base64Data) {
       const rawBuf = Buffer.from(m.base64Data, 'base64');
       fs.writeFileSync(absSourceFile, rawBuf);
       if (isPdf) {
@@ -513,7 +611,7 @@ async function persistCourseToFolder(
           m.totalPages = analyzed.meta.totalPages;
           m.detectedPageOffset = analyzed.meta.detectedPageOffset;
           m.tocEntries = analyzed.meta.tocEntries;
-          m.pages = analyzed.meta.pages;
+          m.pages = [];
           fs.writeFileSync(
             `${absSourceFile}.pages.json`,
             JSON.stringify(analyzed.meta, null, 2),
@@ -527,7 +625,6 @@ async function persistCourseToFolder(
       delete m.base64Data;
     } else if (!fs.existsSync(absSourceFile)) {
       if (isPdf) {
-        // Create a valid multi-page PDF from extractedText lines if raw binary wasn't attached
         const lines = (m.extractedText || safeFileName)
           .split(/\r?\n/)
           .filter(Boolean);
@@ -541,7 +638,7 @@ async function persistCourseToFolder(
       }
     }
 
-    // Save plain text companion only for non-PDF, non-.txt files (never write PDF OCR .txt dumps)
+    // Save plain text companion only for non-PDF, non-.txt files
     if (!isPdf && !safeFileName.toLowerCase().endsWith('.txt')) {
       const txtCompanion = path.join(sourcesDir, `${safeFileName}.txt`);
       if (m.extractedText && !fs.existsSync(txtCompanion)) {
@@ -571,17 +668,9 @@ async function persistCourseToFolder(
     );
   }
 
-  // 2. Save `segments/split-plan.json` if present
+  // 2. Save `segments/split-plan.json` if present & ensure 100% region coverage
   if (course.pdfSplitPlan && course.pdfSplitPlan.length > 0) {
-    for (const slot of course.dailyPlan) {
-      const seg = resolveSlotPdfSegment(slot, course.pdfSplitPlan);
-      if (seg) {
-        slot.pdfSegment = seg;
-        if (!slot.regionId) {
-          slot.regionId = seg.sectionId;
-        }
-      }
-    }
+    course.dailyPlan = bindAndEnsureAllPdfRegionsCovered(course.dailyPlan, course.pdfSplitPlan);
     fs.writeFileSync(
       path.join(segmentsDir, 'split-plan.json'),
       JSON.stringify(course.pdfSplitPlan, null, 2),
@@ -589,21 +678,34 @@ async function persistCourseToFolder(
     );
   }
 
-  // 3. Save `outline.json` (Course Outline separated from lesson contents!)
-  const outlineData = {
-    courseId: course.id,
-    courseName: course.name,
-    startDate: course.startDate,
-    durationDays: course.durationDays,
-    outlineConfirmed: Boolean(course.outlineConfirmed),
-    outlineConfirmedAt: course.outlineConfirmedAt,
-    pdfPageOffset: course.pdfPageOffset || 0,
-    knowledgeCatalog: course.knowledgeCatalog || [],
-    days: course.dailyPlan.map((d) => ({
+  // 3. Save `outline.json` (Course Outline separated from lesson contents; keeps both `sections` and legacy `days`!)
+  const compactSegment = (seg: PdfSplitPlanItem) => ({
+    ...seg,
+    // Keep outline.json compact by omitting full extractedSegmentText if long
+    extractedSegmentText: seg.extractedSegmentText
+      ? seg.extractedSegmentText.slice(0, 2000)
+      : undefined,
+  });
+
+  const serializedSections = course.dailyPlan.map((d) => {
+    const segs =
+      Array.isArray(d.pdfSegments) && d.pdfSegments.length > 0
+        ? d.pdfSegments
+        : d.pdfSegment
+          ? [d.pdfSegment]
+          : [];
+    const regionIds =
+      Array.isArray(d.regionIds) && d.regionIds.length > 0
+        ? d.regionIds
+        : extractReferencedRegionIds(d);
+    return {
       id: d.id,
       dayIndex: d.dayIndex,
+      scheduledDay: d.scheduledDay,
       date: d.date,
-      regionId: d.regionId,
+      estimatedMinutes: getEvaluatedSectionMinutes(d),
+      regionId: regionIds[0] || d.regionId,
+      regionIds: regionIds.length > 0 ? regionIds : undefined,
       title: d.title,
       objective: d.objective,
       prerequisites: d.prerequisites || [],
@@ -611,18 +713,31 @@ async function persistCourseToFolder(
       connectionNote: d.connectionNote || '',
       keyTopics: d.keyTopics || [],
       assignedWords: d.assignedWords,
-      pdfSegment: d.pdfSegment
-        ? {
-            ...d.pdfSegment,
-            // Keep outline.json compact by omitting full extractedSegmentText if long
-            extractedSegmentText: d.pdfSegment.extractedSegmentText
-              ? d.pdfSegment.extractedSegmentText.slice(0, 2000)
-              : undefined,
-          }
-        : undefined,
+      pdfSegment: segs[0] ? compactSegment(segs[0]) : undefined,
+      pdfSegments: segs.length > 0 ? segs.map(compactSegment) : undefined,
       lessonFile: `lessons/${d.id}.json`,
+      stage1File: `lessons/${d.id}.stage1.json`,
+      hasStage1Draft: Boolean(d.stage1Draft),
       hasLesson: Boolean(d.lesson),
-    })),
+    };
+  });
+  const totalEstimatedMinutes = serializedSections.reduce(
+    (sum, s) => sum + (s.estimatedMinutes || 0),
+    0
+  );
+  const outlineData = {
+    courseId: course.id,
+    courseName: course.name,
+    startDate: course.startDate,
+    durationDays: course.durationDays,
+    totalEstimatedMinutes,
+    outlineConfirmed: Boolean(course.outlineConfirmed),
+    outlineConfirmedAt: course.outlineConfirmedAt,
+    pdfPageOffset: course.pdfPageOffset || 0,
+    knowledgeCatalog: course.knowledgeCatalog || [],
+    dailySchedule: course.dailySchedule || [],
+    sections: serializedSections,
+    days: serializedSections,
   };
   fs.writeFileSync(
     path.join(absCourseDir, 'outline.json'),
@@ -630,17 +745,17 @@ async function persistCourseToFolder(
     'utf-8'
   );
 
-  // 4. Save each generated lesson into `lessons/<sectionId>.json` (and `day-XX.json` alias)
+  // 4. Save each generated lesson (and Stage 1 draft) into `lessons/<sectionId>.json` / `.stage1.json`
   for (const slot of course.dailyPlan) {
+    if (slot.stage1Draft) {
+      slot.stage1Draft.sectionId = slot.id;
+      const stage1File = path.join(lessonsDir, `${slot.id}.stage1.json`);
+      fs.writeFileSync(stage1File, JSON.stringify(slot.stage1Draft, null, 2), 'utf-8');
+    }
     if (slot.lesson) {
       slot.lesson.sectionId = slot.id;
       const secLessonFile = path.join(lessonsDir, `${slot.id}.json`);
       fs.writeFileSync(secLessonFile, JSON.stringify(slot.lesson, null, 2), 'utf-8');
-      const dayLessonFile = path.join(
-        lessonsDir,
-        `day-${String(slot.dayIndex).padStart(2, '0')}.json`
-      );
-      fs.writeFileSync(dayLessonFile, JSON.stringify(slot.lesson, null, 2), 'utf-8');
     }
   }
 
@@ -654,9 +769,14 @@ async function persistCourseToFolder(
     generationMode: course.generationMode || 'api',
     subjectProfile: course.subjectProfile,
     learnerLevel: course.learnerLevel,
+    learnerBaseline: course.learnerBaseline,
+    customLearnerBaseline: course.customLearnerBaseline,
+    learningDepth: course.learningDepth,
+    customLearningDepth: course.customLearningDepth,
     goal: course.goal,
     startDate: course.startDate,
     durationDays: course.durationDays,
+    dailySchedule: course.dailySchedule || [],
     extraRequirements: course.extraRequirements,
     outlineConfirmed: Boolean(course.outlineConfirmed),
     outlineConfirmedAt: course.outlineConfirmedAt,
@@ -703,8 +823,72 @@ async function persistCourseToFolder(
     }
   }
 
-  // 6. Save Agent task prompt
+  // 6. Save Agent task prompt & scatter per-lesson prompts into `prompts/<secId>/`
   const teachingSystemPrompt = getEffectiveTeachingSystemPrompt(course, settings);
+  const promptsRootDir = path.join(absCourseDir, 'prompts');
+  fs.mkdirSync(promptsRootDir, { recursive: true });
+  for (const slot of course.dailyPlan) {
+    const secId = ensureStableSectionId(slot.dayIndex, slot.id);
+    const secPromptDir = path.join(promptsRootDir, secId);
+    fs.mkdirSync(secPromptDir, { recursive: true });
+    const slotSegs = resolveSlotPdfSegments(slot, course.pdfSplitPlan);
+    const enrichedSlot = {
+      ...slot,
+      pdfSegment: slotSegs[0] || slot.pdfSegment,
+      pdfSegments: slotSegs.length > 0 ? slotSegs : slot.pdfSegments,
+    };
+    const stage1Prompt = buildChatLessonStage1Prompt({
+      course,
+      slot: enrichedSlot,
+      teachingSystemPrompt,
+    });
+    const lessonPrompt = buildChatLessonPrompt({
+      course,
+      slot: enrichedSlot,
+      teachingSystemPrompt,
+    });
+    const agentStage1Prompt = buildAgentSectionStagePrompt({
+      course,
+      slot: enrichedSlot,
+      workspaceDir: relCourseDir,
+      stage: 'stage1',
+      teachingSystemPrompt,
+    });
+    fs.writeFileSync(path.join(secPromptDir, 'stage1-prompt.md'), stage1Prompt, 'utf-8');
+    fs.writeFileSync(path.join(secPromptDir, 'agent-stage1-prompt.md'), agentStage1Prompt, 'utf-8');
+    fs.writeFileSync(path.join(secPromptDir, 'prompt.md'), lessonPrompt, 'utf-8');
+
+    const stageBaseLesson = slot.stage1Draft || slot.lesson;
+    const pendingSpecs = extractPendingDiagramSpecs(stageBaseLesson);
+    const allStageDiagramSpecs =
+      pendingSpecs.length > 0
+        ? pendingSpecs
+        : (stageBaseLesson?.diagrams || []).map((d, idx) => ({
+            id: d.id || `diag-${idx + 1}`,
+            title: d.title || `图示 ${idx + 1}`,
+            stageLabel: d.stageLabel,
+            topologySpec: d.topologySpec || d.caption || d.title || '',
+            caption: d.caption || '',
+          }));
+    if (allStageDiagramSpecs.length > 0) {
+      const stage2Prompt = buildLessonStage2DiagramsPrompt({
+        courseName: course.name,
+        slot: enrichedSlot,
+        diagramSpecs: allStageDiagramSpecs,
+      });
+      const agentStage2Prompt = buildAgentSectionStagePrompt({
+        course,
+        slot: enrichedSlot,
+        workspaceDir: relCourseDir,
+        stage: 'stage2',
+        teachingSystemPrompt,
+        diagramSpecs: allStageDiagramSpecs,
+      });
+      fs.writeFileSync(path.join(secPromptDir, 'stage2-prompt.md'), stage2Prompt, 'utf-8');
+      fs.writeFileSync(path.join(secPromptDir, 'agent-stage2-prompt.md'), agentStage2Prompt, 'utf-8');
+    }
+  }
+
   const agentPrompt = buildAgentExecutionPrompt({
     course,
     workspaceDir: relCourseDir,
@@ -796,21 +980,23 @@ function syncCourseFolderFromDisk(
         syllabusUpdated = true;
         updated = true;
       }
-      for (let i = 0; i < course.dailyPlan.length; i++) {
-        const currentSlot = course.dailyPlan[i];
-        const nextSlot = parsedOutline.dailyPlan[i];
-        if (nextSlot && nextSlot.title && nextSlot.title !== currentSlot.title) {
-          currentSlot.id = ensureStableSectionId(currentSlot.dayIndex, nextSlot.id || currentSlot.id);
-          currentSlot.regionId = nextSlot.regionId || currentSlot.regionId;
-          currentSlot.title = nextSlot.title;
-          currentSlot.objective = nextSlot.objective || currentSlot.objective;
-          currentSlot.prerequisites = nextSlot.prerequisites || currentSlot.prerequisites;
-          currentSlot.teachingScope = nextSlot.teachingScope || currentSlot.teachingScope;
-          currentSlot.connectionNote = nextSlot.connectionNote || currentSlot.connectionNote;
-          currentSlot.keyTopics = nextSlot.keyTopics || currentSlot.keyTopics;
-          syllabusUpdated = true;
-          updated = true;
-        }
+      const makeSig = (arr: DailyPlanSlot[]) =>
+        arr.map(
+          (s) =>
+            `${s.id}|${s.title}|${s.estimatedMinutes || ''}|${s.scheduledDay || ''}|${(s.regionIds || (s.regionId ? [s.regionId] : [])).join(',')}`
+        );
+      if (
+        parsedOutline.dailyPlan.length > 0 &&
+        JSON.stringify(makeSig(course.dailyPlan)) !== JSON.stringify(makeSig(parsedOutline.dailyPlan))
+      ) {
+        course.dailyPlan = parsedOutline.dailyPlan;
+        course.dailySchedule = buildCourseDailySchedule(
+          course.dailyPlan,
+          course.durationDays,
+          course.startDate
+        );
+        syllabusUpdated = true;
+        updated = true;
       }
     } catch {
       // ignore invalid outline
@@ -843,49 +1029,69 @@ function syncCourseFolderFromDisk(
           item.extractedSegmentText = fs.readFileSync(txtPath, 'utf-8');
         }
       }
-      for (const slot of course.dailyPlan) {
-        const seg = resolveSlotPdfSegment(slot, parsedPlan);
-        if (seg) {
-          slot.pdfSegment = seg;
-          if (!slot.regionId) slot.regionId = seg.sectionId;
-        }
-      }
       course.pdfSplitPlan = parsedPlan;
+      course.dailyPlan = bindAndEnsureAllPdfRegionsCovered(course.dailyPlan, parsedPlan);
       splitPlanUpdated = true;
     } catch {
       // ignore
     }
   }
 
-  // 4. Scan lessons/ directory for sec-XX.json, day-XX.json, or YYYY-MM-DD.json
+  // 4. Scan lessons/ directory for Stage 1 drafts (`*.stage1.json`) and final lessons (`sec-XX.json`, `day-XX.json`, `YYYY-MM-DD.json`)
   const lessonsDir = path.join(absCourseDir, 'lessons');
   if (fs.existsSync(lessonsDir)) {
-    const files = fs
-      .readdirSync(lessonsDir)
-      .filter((f) => f.endsWith('.json') || f.endsWith('.md'));
+    const allLessonFiles = fs.readdirSync(lessonsDir);
+
+    const resolveTargetSlotForFile = (fileName: string): DailyPlanSlot | undefined => {
+      const baseNoExt = fileName.replace(/(?:\.stage1)?\.(?:json|md)$/i, '');
+      const byExact = course.dailyPlan.find((d) => d.id === baseNoExt);
+      if (byExact) return byExact;
+      const dayMatch =
+        fileName.match(/(?:sec|day)[-_]?0*(\d+)(?:\.stage1)?\.(?:json|md)$/i) ||
+        fileName.match(/^0*(\d+)(?:\.stage1)?\.(?:json|md)$/);
+      if (dayMatch) {
+        return course.dailyPlan.find((d) => d.dayIndex === Number(dayMatch[1]));
+      }
+      const dateMatch = fileName.match(/^(\d{4}-\d{2}-\d{2})(?:\.stage1)?\.(?:json|md)$/);
+      if (dateMatch) {
+        return course.dailyPlan.find((d) => d.date === dateMatch[1]);
+      }
+      return undefined;
+    };
+
+    // 4a. Sync Stage 1 intermediate artifacts (`sec-XX.stage1.json`)
+    for (const s1File of allLessonFiles.filter((f) => /\.stage1\.json$/i.test(f))) {
+      try {
+        const targetSlot = resolveTargetSlotForFile(s1File);
+        if (!targetSlot) continue;
+        if (targetSlot.stage1Draft && !forceOverwriteLessons) continue;
+        const rawText = fs.readFileSync(path.join(lessonsDir, s1File), 'utf-8');
+        const { lesson: s1Lesson } = parseImportedLessonContent(
+          rawText,
+          targetSlot,
+          course.generationMode === 'agent' ? 'agent' : 'chat',
+          course.customAssets || {},
+          { stageMode: 'stage1' }
+        );
+        if (s1Lesson.markdownBody || s1Lesson.englishPayload) {
+          s1Lesson.sectionId = targetSlot.id;
+          targetSlot.stage1Draft = s1Lesson;
+          updated = true;
+        }
+      } catch (err) {
+        console.warn(`Failed to parse Stage 1 lesson file ${s1File}:`, err);
+      }
+    }
+
+    // 4b. Sync final assembled lessons (`sec-XX.json` / `.md`)
+    const files = allLessonFiles.filter(
+      (f) => (f.endsWith('.json') || f.endsWith('.md')) && !/\.stage1\.json$/i.test(f)
+    );
 
     for (const file of files) {
       try {
         const rawText = fs.readFileSync(path.join(lessonsDir, file), 'utf-8');
-        let targetSlot: DailyPlanSlot | undefined;
-
-        const baseNoExt = file.replace(/\.(?:json|md)$/i, '');
-        // Match by stable section ID first (e.g. sec-01.json)
-        targetSlot = course.dailyPlan.find((d) => d.id === baseNoExt);
-
-        if (!targetSlot) {
-          const dayMatch =
-            file.match(/(?:sec|day)[-_]?0*(\d+)\.(?:json|md)$/i) ||
-            file.match(/^0*(\d+)\.(?:json|md)$/);
-          const dateMatch = file.match(/^(\d{4}-\d{2}-\d{2})\.(?:json|md)$/);
-
-          if (dayMatch) {
-            const dayNum = Number(dayMatch[1]);
-            targetSlot = course.dailyPlan.find((d) => d.dayIndex === dayNum);
-          } else if (dateMatch) {
-            targetSlot = course.dailyPlan.find((d) => d.date === dateMatch[1]);
-          }
-        }
+        const targetSlot = resolveTargetSlotForFile(file);
 
         if (!targetSlot) continue;
 
@@ -902,7 +1108,13 @@ function syncCourseFolderFromDisk(
 
         if (lesson.markdownBody || lesson.englishPayload) {
           lesson.sectionId = targetSlot.id;
-          targetSlot.lesson = lesson;
+          if (!targetSlot.stage1Draft) {
+            targetSlot.stage1Draft = lesson;
+          }
+          targetSlot.lesson = { ...lesson, generationStage: 'complete' };
+          if (lesson.estimatedMinutes && lesson.estimatedMinutes > 0) {
+            targetSlot.estimatedMinutes = lesson.estimatedMinutes;
+          }
           if (!importedDays.includes(targetSlot.dayIndex)) {
             importedDays.push(targetSlot.dayIndex);
           }
@@ -914,11 +1126,34 @@ function syncCourseFolderFromDisk(
     }
   }
 
+  if (importedDays.length > 0 && course.dailyPlan.length > 0) {
+    course.dailyPlan = allocateSectionsToDays(
+      course.dailyPlan,
+      course.durationDays,
+      course.startDate
+    );
+    course.dailySchedule = buildCourseDailySchedule(
+      course.dailyPlan,
+      course.durationDays,
+      course.startDate
+    );
+  }
+
   return { updated, importedDays, syllabusUpdated, splitPlanUpdated };
 }
 
 interface DatabaseSchema {
   courses: Course[];
+  studyStats: StudyStats;
+  lastBrowsingState?: any;
+}
+
+function emptyStudyStats(): StudyStats {
+  return {
+    totalSeconds: 0,
+    secondsByDate: {},
+    secondsByCourse: {},
+  };
 }
 
 /**
@@ -951,12 +1186,24 @@ function loadDb(): DatabaseSchema {
           knowledgeCatalog = Array.isArray(outlineRaw.knowledgeCatalog)
             ? outlineRaw.knowledgeCatalog
             : [];
-          const daysArr = Array.isArray(outlineRaw.days) ? outlineRaw.days : [];
+          const daysArr =
+            Array.isArray(outlineRaw.sections) && outlineRaw.sections.length > 0
+              ? outlineRaw.sections
+              : Array.isArray(outlineRaw.days)
+                ? outlineRaw.days
+                : [];
           dailyPlan = daysArr.map((d: any, idx: number) => ({
             id: ensureStableSectionId(d.dayIndex || idx + 1, d.id),
             dayIndex: d.dayIndex || idx + 1,
+            scheduledDay:
+              typeof d.scheduledDay === 'number' && d.scheduledDay > 0 ? d.scheduledDay : undefined,
+            estimatedMinutes:
+              typeof d.estimatedMinutes === 'number' && d.estimatedMinutes > 0
+                ? d.estimatedMinutes
+                : undefined,
             date: d.date || addDaysToDateString(courseConfig.startDate || getTodayDateString(), idx),
             regionId: d.regionId,
+            regionIds: Array.isArray(d.regionIds) ? d.regionIds : undefined,
             title: d.title || `第 ${idx + 1} 讲`,
             objective: d.objective || '',
             prerequisites: d.prerequisites || [],
@@ -965,6 +1212,7 @@ function loadDb(): DatabaseSchema {
             keyTopics: d.keyTopics || [],
             assignedWords: d.assignedWords,
             pdfSegment: d.pdfSegment,
+            pdfSegments: Array.isArray(d.pdfSegments) ? d.pdfSegments : undefined,
           }));
         }
 
@@ -986,10 +1234,29 @@ function loadDb(): DatabaseSchema {
     }
   }
 
-  // 2. Also merge any courses from `data/db.json`
+  const loadedStudyStats: StudyStats = emptyStudyStats();
+  let loadedLastBrowsingState: any = undefined;
+
+  // 2. Also merge any courses and studyStats from `data/db.json`
   try {
     if (fs.existsSync(DB_FILE)) {
       const parsed = JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
+      if (parsed?.studyStats && typeof parsed.studyStats === 'object') {
+        loadedStudyStats.totalSeconds = Math.max(0, Number(parsed.studyStats.totalSeconds) || 0);
+        if (parsed.studyStats.secondsByDate && typeof parsed.studyStats.secondsByDate === 'object') {
+          for (const [k, v] of Object.entries(parsed.studyStats.secondsByDate)) {
+            loadedStudyStats.secondsByDate[k] = Math.max(0, Number(v) || 0);
+          }
+        }
+        if (parsed.studyStats.secondsByCourse && typeof parsed.studyStats.secondsByCourse === 'object') {
+          for (const [k, v] of Object.entries(parsed.studyStats.secondsByCourse)) {
+            loadedStudyStats.secondsByCourse[k] = Math.max(0, Number(v) || 0);
+          }
+        }
+      }
+      if (parsed?.lastBrowsingState && typeof parsed.lastBrowsingState === 'object') {
+        loadedLastBrowsingState = parsed.lastBrowsingState;
+      }
       if (parsed && Array.isArray(parsed.courses)) {
         for (const c of parsed.courses as Course[]) {
           if (!c || !c.id) continue;
@@ -1044,11 +1311,38 @@ function loadDb(): DatabaseSchema {
     }
   }
 
-  return { courses };
+  return {
+    courses,
+    studyStats: loadedStudyStats,
+    lastBrowsingState: loadedLastBrowsingState,
+  };
 }
 
 function saveDb(db: DatabaseSchema): void {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), 'utf-8');
+  let existingLastBrowsingState = db.lastBrowsingState;
+  if (existingLastBrowsingState === undefined && fs.existsSync(DB_FILE)) {
+    try {
+      const prev = JSON.parse(fs.readFileSync(DB_FILE, 'utf-8'));
+      if (prev?.lastBrowsingState && typeof prev.lastBrowsingState === 'object') {
+        existingLastBrowsingState = prev.lastBrowsingState;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  fs.writeFileSync(
+    DB_FILE,
+    JSON.stringify(
+      {
+        courses: db.courses,
+        studyStats: db.studyStats || emptyStudyStats(),
+        lastBrowsingState: existingLastBrowsingState,
+      },
+      null,
+      2
+    ),
+    'utf-8'
+  );
 }
 
 function loadCoursePdfAttachments(
@@ -1112,10 +1406,19 @@ function loadCoursePdfAttachments(
   }
 }
 
-async function callLlmJson<T>(params: {
+interface LlmStreamChunkInfo {
+  model: string;
+  accumulatedText: string;
+  thinkingChars: number;
+  chunksReceived: number;
+}
+
+async function callLlmJsonStream<T>(params: {
   systemInstruction: string;
   userPrompt: string;
   pdfAttachments?: Array<{ fileName: string; base64Data: string }>;
+  onStart?: (model: string) => void;
+  onChunk?: (info: LlmStreamChunkInfo) => void;
 }): Promise<T | null> {
   const settings = loadSettings();
   const validAttachments = (params.pdfAttachments || []).filter((a) => Boolean(a?.base64Data));
@@ -1130,8 +1433,10 @@ async function callLlmJson<T>(params: {
     const endpoint = baseUrl.endsWith('/chat/completions')
       ? baseUrl
       : `${baseUrl}/chat/completions`;
+    const modelName = settings.modelName || 'gpt-4o-mini';
 
     try {
+      params.onStart?.(modelName);
       const userContent: any =
         validAttachments.length > 0
           ? [
@@ -1153,12 +1458,13 @@ async function callLlmJson<T>(params: {
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify({
-          model: settings.modelName || 'gpt-4o-mini',
+          model: modelName,
           messages: [
             { role: 'system', content: params.systemInstruction },
             { role: 'user', content: userContent },
           ],
           response_format: { type: 'json_object' },
+          stream: true,
         }),
       });
 
@@ -1171,21 +1477,90 @@ async function callLlmJson<T>(params: {
             Authorization: `Bearer ${apiKey}`,
           },
           body: JSON.stringify({
-            model: settings.modelName || 'gpt-4o-mini',
+            model: modelName,
             messages: [
               { role: 'system', content: params.systemInstruction },
               { role: 'user', content: params.userPrompt },
             ],
             response_format: { type: 'json_object' },
+            stream: true,
           }),
         });
       }
 
       if (response.ok) {
-        const data = (await response.json()) as any;
-        const content = data.choices?.[0]?.message?.content || '';
-        const parsed = extractJsonFromText<T>(content);
-        if (parsed) return parsed;
+        const contentType = response.headers.get('content-type') || '';
+        if (response.body && !contentType.includes('application/json')) {
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let sseBuffer = '';
+          let accumulatedText = '';
+          let thinkingChars = 0;
+          let chunksReceived = 0;
+          let lastEmitAt = 0;
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            sseBuffer += decoder.decode(value, { stream: true });
+
+            let nlIdx: number;
+            while ((nlIdx = sseBuffer.indexOf('\n')) !== -1) {
+              const line = sseBuffer.slice(0, nlIdx).trim();
+              sseBuffer = sseBuffer.slice(nlIdx + 1);
+              if (!line.startsWith('data:')) continue;
+              const payload = line.slice(5).trim();
+              if (!payload || payload === '[DONE]') continue;
+              try {
+                const parsed = JSON.parse(payload);
+                const delta = parsed.choices?.[0]?.delta;
+                if (delta) {
+                  const hadContent = accumulatedText.length > 0;
+                  if (typeof delta.reasoning_content === 'string') {
+                    thinkingChars += delta.reasoning_content.length;
+                    chunksReceived++;
+                  }
+                  if (typeof delta.content === 'string' && delta.content.length > 0) {
+                    accumulatedText += delta.content;
+                    chunksReceived++;
+                  }
+                  const now = Date.now();
+                  if ((!hadContent && accumulatedText.length > 0) || now - lastEmitAt >= 90) {
+                    lastEmitAt = now;
+                    params.onChunk?.({
+                      model: modelName,
+                      accumulatedText,
+                      thinkingChars,
+                      chunksReceived,
+                    });
+                  }
+                }
+              } catch {
+                // ignore partial SSE JSON frames
+              }
+            }
+          }
+
+          params.onChunk?.({
+            model: modelName,
+            accumulatedText,
+            thinkingChars,
+            chunksReceived,
+          });
+          const parsed = extractJsonFromText<T>(accumulatedText);
+          if (parsed) return parsed;
+        } else {
+          const data = (await response.json()) as any;
+          const content = data.choices?.[0]?.message?.content || '';
+          params.onChunk?.({
+            model: modelName,
+            accumulatedText: content,
+            thinkingChars: 0,
+            chunksReceived: 1,
+          });
+          const parsed = extractJsonFromText<T>(content);
+          if (parsed) return parsed;
+        }
       }
     } catch (err) {
       console.warn('OpenAI-compatible request failed, falling back to Gemini:', err);
@@ -1209,6 +1584,8 @@ async function callLlmJson<T>(params: {
           ? settings.modelName
           : 'gemini-3.8-flash';
 
+      params.onStart?.(requestedModel);
+
       const geminiContents =
         validAttachments.length > 0
           ? {
@@ -1224,7 +1601,7 @@ async function callLlmJson<T>(params: {
             }
           : params.userPrompt;
 
-      const response = await ai.models.generateContent({
+      const streamResponse = await ai.models.generateContentStream({
         model: requestedModel,
         contents: geminiContents,
         config: {
@@ -1234,8 +1611,47 @@ async function callLlmJson<T>(params: {
         },
       });
 
-      const text = response.text || '';
-      const parsed = extractJsonFromText<T>(text);
+      let accumulatedText = '';
+      let thinkingChars = 0;
+      let chunksReceived = 0;
+      let lastEmitAt = 0;
+
+      for await (const chunk of streamResponse) {
+        const hadContent = accumulatedText.length > 0;
+        const parts = chunk.candidates?.[0]?.content?.parts;
+        if (Array.isArray(parts)) {
+          for (const p of parts) {
+            if ((p as any)?.thought && typeof (p as any).text === 'string') {
+              thinkingChars += (p as any).text.length;
+            }
+          }
+        }
+        const chunkText = chunk.text || '';
+        if (chunkText) {
+          accumulatedText += chunkText;
+        }
+        chunksReceived++;
+
+        const now = Date.now();
+        if ((!hadContent && accumulatedText.length > 0) || now - lastEmitAt >= 90) {
+          lastEmitAt = now;
+          params.onChunk?.({
+            model: requestedModel,
+            accumulatedText,
+            thinkingChars,
+            chunksReceived,
+          });
+        }
+      }
+
+      params.onChunk?.({
+        model: requestedModel,
+        accumulatedText,
+        thinkingChars,
+        chunksReceived,
+      });
+
+      const parsed = extractJsonFromText<T>(accumulatedText);
       if (parsed) return parsed;
     } catch (err) {
       console.warn('Gemini API call error:', err);
@@ -1243,6 +1659,14 @@ async function callLlmJson<T>(params: {
   }
 
   return null;
+}
+
+async function callLlmJson<T>(params: {
+  systemInstruction: string;
+  userPrompt: string;
+  pdfAttachments?: Array<{ fileName: string; base64Data: string }>;
+}): Promise<T | null> {
+  return callLlmJsonStream<T>(params);
 }
 
 function extractJsonFromText<T>(rawText: string): T | null {
@@ -1289,35 +1713,42 @@ function buildPendingOutlinePlaceholders(params: {
 } {
   const { name, category, goal, startDate, durationDays, wordBuckets = [] } = params;
 
+  if (category !== 'english') {
+    return { knowledgeCatalog: [], dailyPlan: [] };
+  }
+
+  const sectionCount = wordBuckets.length > 0 ? wordBuckets.length : durationDays;
   const slots: DailyPlanSlot[] = [];
-  for (let i = 0; i < durationDays; i++) {
+  for (let i = 0; i < sectionCount; i++) {
     const dayIndex = i + 1;
     const sectionId = ensureStableSectionId(dayIndex);
     const date = addDaysToDateString(startDate, i);
-    const assignedWords = category === 'english' ? wordBuckets[i] || [] : undefined;
+    const assignedWords = wordBuckets[i] || [];
 
     let heading = `第 ${dayIndex} 讲（待第 2 步由 LLM 生成大纲）`;
-    let objective = `围绕“${goal}”规划第 ${dayIndex} 讲：请先在第 1 步确定划分区域并切割 PDF，再于第 2 步由 LLM 生成课程大纲。`;
+    let objective = `围绕“${goal}”规划第 ${dayIndex} 讲：请先在第 2 步生成完整课程大纲。`;
     let keyTopics: string[] = [];
 
-    if (category === 'english' && assignedWords && assignedWords.length > 0) {
+    if (assignedWords.length > 0) {
       const sample = assignedWords
         .slice(0, 3)
         .map((w) => w.word)
         .join(', ');
       heading = `第 ${dayIndex} 讲：英语语境精读与目标词汇 (${sample} 等 ${assignedWords.length} 词)`;
-      objective = `围绕“${goal}”掌握今日随机分配的 ${assignedWords.length} 个核心词汇并完成语境阅读。`;
+      objective = `围绕“${goal}”掌握本节随机分配的 ${assignedWords.length} 个核心词汇并完成语境阅读。`;
       keyTopics = [`目标词汇 (${assignedWords.length} 词)`, '语境精读文章', '长难句与近义词辨析'];
     }
 
     slots.push({
       id: sectionId,
       dayIndex,
+      scheduledDay: dayIndex,
+      estimatedMinutes: undefined,
       date,
       title: heading,
       objective,
       prerequisites: dayIndex === 1 ? ['课程基础先修概念'] : [`第 ${dayIndex - 1} 讲核心内容`],
-      teachingScope: category === 'english' ? `${name} 第 ${dayIndex} 讲` : '待第 2 步关联第 1 步切分区域后确定',
+      teachingScope: `${name} 第 ${dayIndex} 讲`,
       connectionNote:
         dayIndex === 1
           ? '课程开篇第 1 讲，建立核心概念与分析基础'
@@ -1327,7 +1758,10 @@ function buildPendingOutlinePlaceholders(params: {
     });
   }
 
-  return { knowledgeCatalog: [], dailyPlan: slots };
+  return {
+    knowledgeCatalog: [],
+    dailyPlan: allocateSectionsToDays(slots, durationDays, startDate),
+  };
 }
 
 async function generateCourseSyllabus(params: {
@@ -1336,6 +1770,10 @@ async function generateCourseSyllabus(params: {
   generationMode: CourseGenerationMode;
   subjectProfile?: SubjectProfile;
   learnerLevel?: LearnerLevel;
+  learnerBaseline?: LearnerBaselinePreset;
+  customLearnerBaseline?: string;
+  learningDepth?: LearningDepthPreset;
+  customLearningDepth?: string;
   goal: string;
   startDate: string;
   durationDays: number;
@@ -1357,6 +1795,10 @@ async function generateCourseSyllabus(params: {
     generationMode,
     subjectProfile,
     learnerLevel,
+    learnerBaseline,
+    customLearnerBaseline,
+    learningDepth,
+    customLearningDepth,
     goal,
     startDate,
     durationDays,
@@ -1370,11 +1812,16 @@ async function generateCourseSyllabus(params: {
     requireLlm = false,
   } = params;
 
+  const englishSectionCount =
+    category === 'english' && effectiveWords.length > 0
+      ? Math.max(1, Math.ceil(effectiveWords.length / dailyWordCount))
+      : durationDays;
+
   const wordBuckets =
     category === 'english'
       ? allocateEnglishWordsRandomly({
           effectiveWords,
-          durationDays,
+          durationDays: englishSectionCount,
           dailyWordCount,
           existingSlots,
           preserveStartedSlots: existingSlots.length > 0,
@@ -1408,6 +1855,10 @@ async function generateCourseSyllabus(params: {
     category,
     subjectProfile,
     learnerLevel: learnerLevel || settings.defaultLearnerLevel,
+    learnerBaseline: learnerBaseline || settings.defaultLearnerBaseline,
+    customLearnerBaseline: customLearnerBaseline ?? settings.defaultCustomLearnerBaseline,
+    learningDepth: learningDepth || settings.defaultLearningDepth,
+    customLearningDepth: customLearningDepth ?? settings.defaultCustomLearningDepth,
     goal,
     durationDays,
     extraRequirements,
@@ -1419,16 +1870,31 @@ async function generateCourseSyllabus(params: {
 
   const llmResult = await callLlmJson<{
     knowledgeCatalog?: KnowledgeCatalogNode[];
-    days: Array<{
+    sections?: Array<{
       id?: string;
-      dayIndex: number;
+      dayIndex?: number;
       regionId?: string;
+      regionIds?: string[];
       title: string;
       objective: string;
       prerequisites?: string[];
       teachingScope?: string;
       connectionNote?: string;
       keyTopics: string[];
+      estimatedMinutes?: number;
+    }>;
+    days?: Array<{
+      id?: string;
+      dayIndex?: number;
+      regionId?: string;
+      regionIds?: string[];
+      title: string;
+      objective: string;
+      prerequisites?: string[];
+      teachingScope?: string;
+      connectionNote?: string;
+      keyTopics: string[];
+      estimatedMinutes?: number;
     }>;
   }>({
     systemInstruction: settings.syllabusSystemPrompt,
@@ -1436,43 +1902,101 @@ async function generateCourseSyllabus(params: {
     pdfAttachments,
   });
 
-  if (llmResult && Array.isArray(llmResult.days) && llmResult.days.length > 0) {
-    const slots: DailyPlanSlot[] = [];
-    for (let i = 0; i < durationDays; i++) {
-      const llmDay = llmResult.days[i] || llmResult.days[llmResult.days.length - 1];
-      const dayNumber = i + 1;
-      const existing = existingSlots[i];
-      const sectionId = ensureStableSectionId(dayNumber, existing?.id || llmDay?.id);
-      const dateStr = addDaysToDateString(startDate, i);
-      const assignedWords = category === 'english' ? wordBuckets[i] || [] : undefined;
-      const regionId = llmDay?.regionId || existing?.regionId;
-      const matchedSegment = resolveSlotPdfSegment(
-        { id: sectionId, dayIndex: dayNumber, regionId, pdfSegment: existing?.pdfSegment },
+  const rawSections =
+    llmResult && Array.isArray(llmResult.sections) && llmResult.sections.length > 0
+      ? llmResult.sections
+      : llmResult && Array.isArray(llmResult.days) && llmResult.days.length > 0
+        ? llmResult.days
+        : null;
+
+  if (rawSections && rawSections.length > 0) {
+    const rawSlots: DailyPlanSlot[] = [];
+    for (let i = 0; i < rawSections.length; i++) {
+      const llmSec = rawSections[i];
+      const sectionOrder = i + 1;
+      const requestedId = llmSec?.id;
+      const existing =
+        (requestedId && existingSlots.find((s) => s.id === requestedId)) ||
+        existingSlots[i];
+      const sectionId = ensureStableSectionId(sectionOrder, requestedId || existing?.id);
+      const assignedWords =
+        category === 'english' ? wordBuckets[i] || existing?.assignedWords || [] : undefined;
+      const extractedRegions = extractReferencedRegionIds({
+        regionId: llmSec?.regionId || existing?.regionId,
+        regionIds: Array.isArray(llmSec?.regionIds) ? llmSec.regionIds : existing?.regionIds,
+        teachingScope: llmSec?.teachingScope,
+        title: llmSec?.title,
+      });
+      const regionId = extractedRegions[0] || llmSec?.regionId || existing?.regionId;
+      const matchedSegments = resolveSlotPdfSegments(
+        {
+          id: sectionId,
+          dayIndex: sectionOrder,
+          regionId,
+          regionIds: extractedRegions,
+          teachingScope: llmSec?.teachingScope,
+          title: llmSec?.title,
+          pdfSegment: existing?.pdfSegment,
+          pdfSegments: existing?.pdfSegments,
+        },
         pdfSplitPlan
       );
+      const keyTopics =
+        Array.isArray(llmSec?.keyTopics) && llmSec.keyTopics.length > 0
+          ? llmSec.keyTopics
+          : [`${name} 知识点 ${sectionOrder}.1`, `${name} 知识点 ${sectionOrder}.2`];
+      const rawMinutes = Number(llmSec?.estimatedMinutes);
+      const estimatedMinutes =
+        existing?.lesson?.estimatedMinutes && existing.lesson.estimatedMinutes > 0
+          ? existing.lesson.estimatedMinutes
+          : Number.isFinite(rawMinutes) && rawMinutes > 0
+            ? Math.max(10, Math.min(300, Math.round(rawMinutes)))
+            : undefined;
 
-      slots.push({
+      rawSlots.push({
         id: sectionId,
-        dayIndex: dayNumber,
-        date: dateStr,
-        regionId: regionId || matchedSegment?.sectionId,
-        title: llmDay?.title || `第 ${dayNumber} 讲：${name} (${dayNumber}/${durationDays})`,
-        objective: llmDay?.objective || `${goal}（第 ${dayNumber} 阶段）`,
-        prerequisites: Array.isArray(llmDay?.prerequisites) ? llmDay.prerequisites : undefined,
-        teachingScope: llmDay?.teachingScope,
-        connectionNote: llmDay?.connectionNote,
-        keyTopics:
-          Array.isArray(llmDay?.keyTopics) && llmDay.keyTopics.length > 0
-            ? llmDay.keyTopics
-            : [`${name} 知识点 ${dayNumber}.1`, `${name} 知识点 ${dayNumber}.2`],
+        dayIndex: sectionOrder,
+        estimatedMinutes,
+        date: startDate,
+        regionId: regionId || matchedSegments[0]?.sectionId,
+        regionIds:
+          extractedRegions.length > 0
+            ? extractedRegions
+            : matchedSegments.length > 0
+              ? matchedSegments.map((s) => s.sectionId)
+              : undefined,
+        title: llmSec?.title || `第 ${sectionOrder} 节：${name}`,
+        objective: llmSec?.objective || `${goal}（第 ${sectionOrder} 节）`,
+        prerequisites: Array.isArray(llmSec?.prerequisites) ? llmSec.prerequisites : undefined,
+        teachingScope: llmSec?.teachingScope,
+        connectionNote: llmSec?.connectionNote,
+        keyTopics,
         assignedWords,
-        pdfSegment: matchedSegment,
+        pdfSegment: matchedSegments[0],
+        pdfSegments: matchedSegments.length > 0 ? matchedSegments : undefined,
         lesson: existing?.lesson,
       });
     }
+
+    const boundSlots = bindAndEnsureAllPdfRegionsCovered(rawSlots, pdfSplitPlan);
+    const allocatedSlots = allocateSectionsToDays(boundSlots, durationDays, startDate);
     return {
-      knowledgeCatalog: Array.isArray(llmResult.knowledgeCatalog) ? llmResult.knowledgeCatalog : [],
-      dailyPlan: slots,
+      knowledgeCatalog: Array.isArray(llmResult?.knowledgeCatalog)
+        ? llmResult.knowledgeCatalog.map((node: any, idx: number) => ({
+            ...node,
+            id: String(node?.id || `kp-${idx + 1}`),
+            estimatedMinutes:
+              typeof node?.estimatedMinutes === 'number' && node.estimatedMinutes > 0
+                ? Math.round(node.estimatedMinutes)
+                : undefined,
+            sectionId: node?.sectionId
+              ? String(node.sectionId)
+              : typeof node?.assignedDayIndex === 'number' && node.assignedDayIndex > 0
+                ? ensureStableSectionId(node.assignedDayIndex)
+                : undefined,
+          }))
+        : [],
+      dailyPlan: allocatedSlots,
     };
   }
 
@@ -1494,16 +2018,26 @@ async function generateCourseSyllabus(params: {
 
 async function generateDailyLesson(
   course: Course,
-  slot: DailyPlanSlot
+  slot: DailyPlanSlot,
+  onProgress?: (event: GenerationProgressEvent) => void,
+  stageOption: 'all' | 'stage1' | 'stage2' = 'all'
 ): Promise<DailyLessonContent> {
   const settings = loadSettings();
   const isEnglish = course.category === 'english';
   const sectionId = ensureStableSectionId(slot.dayIndex, slot.id);
 
+  onProgress?.({
+    type: 'progress',
+    stage: 'preparing',
+    step: 1,
+    percent: 6,
+    message: `正在装载第 ${slot.dayIndex} 讲大纲目标与教材上下文...`,
+  });
+
   const prevSlot = course.dailyPlan.find((d) => d.dayIndex === slot.dayIndex - 1);
   const nextSlot = course.dailyPlan.find((d) => d.dayIndex === slot.dayIndex + 1);
 
-  // Never inject PDF OCR text; only pass plain-text (non-PDF) supplemental materials
+  // Only pass plain-text (non-PDF) supplemental materials; PDFs are sent as binary attachments
   const materialContext = course.materials
     .filter((m) => !m.isPdf && !m.fileName.toLowerCase().endsWith('.pdf'))
     .map((m) => `【文本资料: ${m.fileName}】\n${(m.extractedText || '').slice(0, 7000)}`)
@@ -1512,6 +2046,75 @@ async function generateDailyLesson(
 
   const slotSegmentId = slot.pdfSegment?.sectionId || slot.regionId || sectionId;
   const slotPdfAttachments = loadCoursePdfAttachments(course, 'slot', slotSegmentId);
+  const totalPdfKb = Math.round(
+    slotPdfAttachments.reduce((acc, att) => acc + (att.base64Data.length * 3) / 4, 0) / 1024
+  );
+  const pdfSummary =
+    slotPdfAttachments.length > 0
+      ? `${slotPdfAttachments.map((a) => a.fileName).join(', ')} (${totalPdfKb} KB)`
+      : '纯文本大纲模式（无 PDF 附件）';
+
+  onProgress?.({
+    type: 'progress',
+    stage: 'preparing',
+    step: 1,
+    percent: 14,
+    pdfSummary,
+    message: `已装载输入材料：${pdfSummary}，准备发起多模态请求...`,
+  });
+
+  const emitChunkProgress = (info: LlmStreamChunkInfo) => {
+    if (!onProgress) return;
+    if (!info.accumulatedText) {
+      onProgress({
+        type: 'progress',
+        stage: 'thinking',
+        step: 2,
+        percent: 18,
+        model: info.model,
+        pdfSummary,
+        charsReceived: 0,
+        thinkingChars: info.thinkingChars,
+        chunksReceived: info.chunksReceived,
+        message:
+          info.thinkingChars > 0
+            ? `模型正在深度思考规划教学结构（已输出推理 ${info.thinkingChars} 字符）...`
+            : `已发送至 ${info.model}，等待首个流式响应...`,
+      });
+      return;
+    }
+
+    const analysis = analyzeStreamedLessonBuffer(info.accumulatedText, isEnglish);
+    onProgress({
+      type: 'progress',
+      stage: 'streaming',
+      step: analysis.step,
+      percent: analysis.percent,
+      model: info.model,
+      pdfSummary,
+      charsReceived: info.accumulatedText.length,
+      thinkingChars: info.thinkingChars,
+      chunksReceived: info.chunksReceived,
+      detectedFields: analysis.detectedFields,
+      liveSnippet: analysis.liveSnippet,
+      message: `${analysis.currentSectionLabel}（已实时接收 ${info.accumulatedText.length} 字符）`,
+    });
+  };
+
+  const emitStartProgress = (model: string) => {
+    onProgress?.({
+      type: 'progress',
+      stage: 'thinking',
+      step: 2,
+      percent: 16,
+      model,
+      pdfSummary,
+      charsReceived: 0,
+      thinkingChars: 0,
+      chunksReceived: 0,
+      message: `已连接模型 ${model}，正在等待首个流式输出 chunk...`,
+    });
+  };
 
   if (isEnglish) {
     const targetWords =
@@ -1535,16 +2138,26 @@ async function generateDailyLesson(
       materialContext,
     });
 
-    const llmLesson = await callLlmJson<Omit<DailyLessonContent, 'dayIndex' | 'date' | 'generatedAt'>>({
+    const llmLesson = await callLlmJsonStream<Omit<DailyLessonContent, 'dayIndex' | 'date' | 'generatedAt'>>({
       systemInstruction: settings.englishSystemPrompt,
       userPrompt: englishUserPrompt,
       pdfAttachments: slotPdfAttachments,
+      onStart: emitStartProgress,
+      onChunk: emitChunkProgress,
     });
 
     if (
       llmLesson &&
       (llmLesson.englishPayload || (llmLesson as any).readingPassage || llmLesson.markdownBody)
     ) {
+      onProgress?.({
+        type: 'progress',
+        stage: 'parsing',
+        step: 4,
+        percent: 94,
+        pdfSummary,
+        message: '流式接收完毕，正在校验英语语境数据与启发式锚点...',
+      });
       const normalized = parseImportedLessonContent(
         JSON.stringify(llmLesson),
         slot,
@@ -1584,7 +2197,67 @@ async function generateDailyLesson(
   }
 
   const effectiveSystemPrompt = getEffectiveTeachingSystemPrompt(course, settings);
-  const courseUserPrompt = buildCourseLessonUserPrompt({
+  const runStage2FromLesson = async (
+    baseStage1Lesson: DailyLessonContent
+  ): Promise<DailyLessonContent> => {
+    const pendingSpecs = extractPendingDiagramSpecs(baseStage1Lesson);
+    if (pendingSpecs.length === 0) {
+      return {
+        ...baseStage1Lesson,
+        sectionId,
+        generationStage: 'complete',
+        sourceMode: 'api',
+      };
+    }
+
+    onProgress?.({
+      type: 'progress',
+      stage: 'diagrams',
+      step: 3,
+      percent: 72,
+      pdfSummary,
+      message: `阶段二：仅依据 ${pendingSpecs.length} 项图示规格生成矢量 SVG（不重写正文）...`,
+    });
+
+    const stage2Prompt = buildLessonStage2DiagramsPrompt({
+      courseName: course.name,
+      slot,
+      diagramSpecs: pendingSpecs,
+    });
+    const llmStage2 = await callLlmJsonStream<any>({
+      systemInstruction:
+        '你是专业的教学矢量 SVG 绘图工程师。严格按输入的图示规格绘制高对比深色背景 SVG，仅输出 diagrams JSON，不得改写或重复输出正文、推导或练习题。',
+      userPrompt: stage2Prompt,
+      onStart: emitStartProgress,
+      onChunk: emitChunkProgress,
+    });
+
+    if (!llmStage2) {
+      throw new Error('阶段二未能生成 SVG 图示，已保留阶段一教学内容。可直接重试阶段二。');
+    }
+
+    const { mergedLesson } = mergeStage2DiagramsIntoStage1(
+      baseStage1Lesson,
+      JSON.stringify(llmStage2),
+      course.customAssets || {}
+    );
+    return {
+      ...mergedLesson,
+      sectionId,
+      generationStage: 'complete',
+      sourceMode: 'api',
+    };
+  };
+
+  if (stageOption === 'stage2') {
+    const existingStage1 = slot.stage1Draft || slot.lesson;
+    if (!existingStage1) {
+      throw new Error('当前小节尚无阶段一教学内容，无法单独执行阶段二图示生成。');
+    }
+    return runStage2FromLesson(existingStage1);
+  }
+
+  const courseStage1Prompt = buildCourseLessonStage1Prompt({
     course,
     slot,
     prevSlot,
@@ -1592,29 +2265,45 @@ async function generateDailyLesson(
     materialContext,
   });
 
-  const llmCourseLesson = await callLlmJson<
+  const llmStage1Lesson = await callLlmJsonStream<
     Omit<DailyLessonContent, 'dayIndex' | 'date' | 'generatedAt'>
   >({
     systemInstruction: effectiveSystemPrompt,
-    userPrompt: courseUserPrompt,
+    userPrompt: courseStage1Prompt,
     pdfAttachments: slotPdfAttachments,
+    onStart: emitStartProgress,
+    onChunk: emitChunkProgress,
   });
 
-  if (llmCourseLesson && llmCourseLesson.markdownBody) {
-    const normalized = parseImportedLessonContent(
-      JSON.stringify(llmCourseLesson),
-      slot,
-      'api',
-      course.customAssets || {}
-    ).lesson;
-    return {
-      ...normalized,
-      sectionId,
-      sourceMode: 'api',
-    };
+  if (!llmStage1Lesson || !llmStage1Lesson.markdownBody) {
+    throw new Error('未能从 API 获取阶段一课件数据。若未配置 API Key，可切换为 Agent 或 Chat 模式导入。');
   }
 
-  throw new Error('未能从 API 获取课件数据。若未配置 API Key，可切换为 Agent 课件模式或 Chat 课件模式导入。');
+  onProgress?.({
+    type: 'progress',
+    stage: 'parsing',
+    step: 3,
+    percent: 62,
+    pdfSummary,
+    message: '阶段一教学内容生成完成，正在保存中间产物并检查图示规格...',
+  });
+
+  const normalizedStage1 = parseImportedLessonContent(
+    JSON.stringify(llmStage1Lesson),
+    slot,
+    'api',
+    course.customAssets || {},
+    { stageMode: 'stage1' }
+  ).lesson;
+  normalizedStage1.sectionId = sectionId;
+  normalizedStage1.sourceMode = 'api';
+  slot.stage1Draft = normalizedStage1;
+
+  if (stageOption === 'stage1') {
+    return normalizedStage1;
+  }
+
+  return runStage2FromLesson(normalizedStage1);
 }
 
 function formatPublicSettings(settings: StoredSettings) {
@@ -1628,7 +2317,12 @@ function formatPublicSettings(settings: StoredSettings) {
     hasCustomApiKey: Boolean(settings.customApiKey),
     hasBuiltinGeminiKey,
     defaultLearnerLevel: settings.defaultLearnerLevel,
+    defaultLearnerBaseline: settings.defaultLearnerBaseline,
+    defaultCustomLearnerBaseline: settings.defaultCustomLearnerBaseline,
+    defaultLearningDepth: settings.defaultLearningDepth,
+    defaultCustomLearningDepth: settings.defaultCustomLearningDepth,
     showAdvancedWorkflowDetails: Boolean(settings.showAdvancedWorkflowDetails),
+    showContentCategoryBadges: Boolean(settings.showContentCategoryBadges),
     promptModules: settings.promptModules,
     syllabusSystemPrompt: settings.syllabusSystemPrompt,
     courseSystemPrompt: settings.courseSystemPrompt,
@@ -1639,7 +2333,7 @@ function formatPublicSettings(settings: StoredSettings) {
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '60mb' }));
+  app.use(express.json({ limit: '100mb' }));
 
   // 1. Get application state (auto-syncs any local `courses/<课程名称>/` folders)
   app.get('/api/state', async (_req, res) => {
@@ -1662,15 +2356,151 @@ async function startServer() {
       courses: db.courses,
       settings: formatPublicSettings(settings),
       promptPresets: getPromptPresetsFromSkill(),
+      studyStats: db.studyStats,
+      lastBrowsingState: db.lastBrowsingState || null,
     });
   });
 
+  // 1a. Save last browsing position (view + scroll offset) to disk so reopening the app restores exact position
+  app.put('/api/browsing-state', (req, res) => {
+    const raw = req.body;
+    if (!raw || typeof raw !== 'object') {
+      res.status(400).json({ error: '无效的浏览状态数据' });
+      return;
+    }
+    const db = loadDb();
+    db.lastBrowsingState = {
+      view: raw.view === 'lesson' || raw.view === 'daily' ? raw.view : 'timeline',
+      selectedCourseFilter:
+        typeof raw.selectedCourseFilter === 'string' ? raw.selectedCourseFilter : 'all',
+      focusedDate: typeof raw.focusedDate === 'string' ? raw.focusedDate : null,
+      activeLessonRef:
+        raw.activeLessonRef &&
+        typeof raw.activeLessonRef === 'object' &&
+        typeof raw.activeLessonRef.courseId === 'string' &&
+        Number.isFinite(Number(raw.activeLessonRef.dayIndex))
+          ? {
+              courseId: raw.activeLessonRef.courseId,
+              dayIndex: Math.max(1, Math.round(Number(raw.activeLessonRef.dayIndex))),
+            }
+          : null,
+      scrollY: Math.max(0, Math.round(Number(raw.scrollY) || 0)),
+      scrollMap:
+        raw.scrollMap && typeof raw.scrollMap === 'object' ? raw.scrollMap : {},
+      updatedAt:
+        typeof raw.updatedAt === 'string' ? raw.updatedAt : new Date().toISOString(),
+    };
+    saveDb(db);
+    res.json({ ok: true, lastBrowsingState: db.lastBrowsingState });
+  });
+
+  // 1b. Accumulate real active study time spent inside lessons
+  app.post('/api/stats/study-time', (req, res) => {
+    const { date, courseId, deltaSeconds } = req.body || {};
+    const delta = Math.max(0, Math.min(3600, Math.round(Number(deltaSeconds) || 0)));
+    const dateKey =
+      typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date)
+        ? date
+        : getTodayDateString();
+    const db = loadDb();
+    if (!db.studyStats) {
+      db.studyStats = emptyStudyStats();
+    }
+    if (delta > 0) {
+      db.studyStats.totalSeconds = (db.studyStats.totalSeconds || 0) + delta;
+      db.studyStats.secondsByDate[dateKey] =
+        (db.studyStats.secondsByDate[dateKey] || 0) + delta;
+      if (typeof courseId === 'string' && courseId.trim()) {
+        db.studyStats.secondsByCourse[courseId] =
+          (db.studyStats.secondsByCourse[courseId] || 0) + delta;
+      }
+      saveDb(db);
+    }
+    res.json({ studyStats: db.studyStats });
+  });
+
+  // 1c. Chunked raw binary PDF upload endpoint (handles large 100MB+ PDFs cleanly without JSON base64 bloat)
+  app.post(
+    '/api/uploads/pdf-chunk',
+    express.raw({ type: 'application/octet-stream', limit: '20mb' }),
+    async (req, res) => {
+      try {
+        const rawUploadId = String(req.query.uploadId || '').replace(/[^a-zA-Z0-9_-]/g, '');
+        const rawFileName = String(req.query.fileName || 'document.pdf');
+        const safeFileName = rawFileName.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+        const chunkIndex = Number(req.query.chunkIndex ?? 0);
+        const totalChunks = Math.max(1, Number(req.query.totalChunks ?? 1));
+
+        if (!rawUploadId) {
+          res.status(400).json({ error: '缺少 uploadId 参数' });
+          return;
+        }
+        if (!Buffer.isBuffer(req.body)) {
+          res.status(400).json({ error: '上传分块必须为二进制流 (application/octet-stream)' });
+          return;
+        }
+
+        const partPath = path.join(TMP_UPLOADS_DIR, `${rawUploadId}.part`);
+        const finalPath = path.join(TMP_UPLOADS_DIR, `${rawUploadId}.pdf`);
+
+        if (chunkIndex === 0) {
+          fs.writeFileSync(partPath, req.body);
+        } else {
+          fs.appendFileSync(partPath, req.body);
+        }
+
+        if (chunkIndex + 1 < totalChunks) {
+          res.json({
+            ok: true,
+            completed: false,
+            uploadId: rawUploadId,
+            chunkIndex,
+            totalChunks,
+          });
+          return;
+        }
+
+        if (fs.existsSync(finalPath)) {
+          fs.unlinkSync(finalPath);
+        }
+        fs.renameSync(partPath, finalPath);
+
+        const stats = fs.statSync(finalPath);
+        const analyzed = await analyzePdfFile(finalPath, safeFileName);
+
+        res.json({
+          ok: true,
+          completed: true,
+          tempUploadId: rawUploadId,
+          fileName: safeFileName,
+          fileSize: stats.size,
+          meta: analyzed.meta,
+        });
+      } catch (err: any) {
+        res.status(500).json({ error: err?.message || 'PDF 分块上传或解析物理页码失败' });
+      }
+    }
+  );
+
   // 2. Compose prompt dynamically from skill files
   app.post('/api/compose-prompt', (req, res) => {
-    const { subjectProfile, learnerLevel, promptModules, customSupplement } = req.body || {};
+    const {
+      subjectProfile,
+      learnerLevel,
+      learnerBaseline,
+      customLearnerBaseline,
+      learningDepth,
+      customLearningDepth,
+      promptModules,
+      customSupplement,
+    } = req.body || {};
     const composed = composeCoursewareSystemPrompt({
       subjectProfile,
       learnerLevel,
+      learnerBaseline,
+      customLearnerBaseline,
+      learningDepth,
+      customLearningDepth,
       modules: promptModules,
       customSupplement,
     });
@@ -1688,13 +2518,41 @@ async function startServer() {
       newApiKey,
       clearApiKey,
       defaultLearnerLevel,
+      defaultLearnerBaseline,
+      defaultCustomLearnerBaseline,
+      defaultLearningDepth,
+      defaultCustomLearningDepth,
       showAdvancedWorkflowDetails,
+      showContentCategoryBadges,
       promptModules,
       syllabusSystemPrompt,
       courseSystemPrompt,
       englishSystemPrompt,
       customTeachingSupplement,
     } = req.body || {};
+
+    const nextBaseline: LearnerBaselinePreset =
+      defaultLearnerBaseline === 'zero_base' ||
+      defaultLearnerBaseline === 'partial_base' ||
+      defaultLearnerBaseline === 'solid_base' ||
+      defaultLearnerBaseline === 'custom'
+        ? defaultLearnerBaseline
+        : current.defaultLearnerBaseline;
+    const nextDepth: LearningDepthPreset =
+      defaultLearningDepth === 'understand_basics' ||
+      defaultLearningDepth === 'master_textbook' ||
+      defaultLearningDepth === 'deep_rigorous' ||
+      defaultLearningDepth === 'custom'
+        ? defaultLearningDepth
+        : current.defaultLearningDepth;
+    const nextLegacyLevel: LearnerLevel =
+      defaultLearnerLevel === 'beginner' ||
+      defaultLearnerLevel === 'intermediate' ||
+      defaultLearnerLevel === 'advanced'
+        ? defaultLearnerLevel
+        : defaultLearnerBaseline || defaultLearningDepth
+          ? deriveLegacyLearnerLevel(nextBaseline, nextDepth)
+          : current.defaultLearnerLevel;
 
     const updated: StoredSettings = {
       providerMode:
@@ -1706,16 +2564,25 @@ async function startServer() {
         : typeof newApiKey === 'string' && newApiKey.trim() !== ''
           ? newApiKey.trim()
           : current.customApiKey,
-      defaultLearnerLevel:
-        defaultLearnerLevel === 'beginner' ||
-        defaultLearnerLevel === 'intermediate' ||
-        defaultLearnerLevel === 'advanced'
-          ? defaultLearnerLevel
-          : current.defaultLearnerLevel,
+      defaultLearnerLevel: nextLegacyLevel,
+      defaultLearnerBaseline: nextBaseline,
+      defaultCustomLearnerBaseline:
+        typeof defaultCustomLearnerBaseline === 'string'
+          ? defaultCustomLearnerBaseline.trim()
+          : current.defaultCustomLearnerBaseline,
+      defaultLearningDepth: nextDepth,
+      defaultCustomLearningDepth:
+        typeof defaultCustomLearningDepth === 'string'
+          ? defaultCustomLearningDepth.trim()
+          : current.defaultCustomLearningDepth,
       showAdvancedWorkflowDetails:
         typeof showAdvancedWorkflowDetails === 'boolean'
           ? showAdvancedWorkflowDetails
           : current.showAdvancedWorkflowDetails,
+      showContentCategoryBadges:
+        typeof showContentCategoryBadges === 'boolean'
+          ? showContentCategoryBadges
+          : current.showContentCategoryBadges,
       promptModules: {
         ...current.promptModules,
         ...(promptModules || {}),
@@ -1778,6 +2645,10 @@ async function startServer() {
         generationMode = 'api',
         subjectProfile,
         learnerLevel,
+        learnerBaseline,
+        customLearnerBaseline = '',
+        learningDepth,
+        customLearningDepth = '',
         goal,
         startDate = getTodayDateString(),
         durationDays = 15,
@@ -1795,6 +2666,7 @@ async function startServer() {
         return;
       }
 
+      const settings = loadSettings();
       const mode: CourseGenerationMode =
         generationMode === 'agent' || generationMode === 'chat' ? generationMode : 'api';
       const days = Math.max(1, Math.min(180, Number(durationDays) || 15));
@@ -1803,6 +2675,28 @@ async function startServer() {
       const trimmedExtra = String(extraRequirements || '').trim();
       const resolvedProfile: SubjectProfile =
         subjectProfile || inferSubjectProfile(category, trimmedName, trimmedExtra);
+      const resolvedBaseline: LearnerBaselinePreset =
+        learnerBaseline === 'zero_base' ||
+        learnerBaseline === 'partial_base' ||
+        learnerBaseline === 'solid_base' ||
+        learnerBaseline === 'custom'
+          ? learnerBaseline
+          : settings.defaultLearnerBaseline || 'partial_base';
+      const resolvedCustomBaseline = String(customLearnerBaseline || '').trim();
+      const resolvedDepth: LearningDepthPreset =
+        learningDepth === 'understand_basics' ||
+        learningDepth === 'master_textbook' ||
+        learningDepth === 'deep_rigorous' ||
+        learningDepth === 'custom'
+          ? learningDepth
+          : settings.defaultLearningDepth || 'master_textbook';
+      const resolvedCustomDepth = String(customLearningDepth || '').trim();
+      const resolvedLearnerLevel: LearnerLevel =
+        learnerLevel === 'beginner' ||
+        learnerLevel === 'intermediate' ||
+        learnerLevel === 'advanced'
+          ? learnerLevel
+          : deriveLegacyLearnerLevel(resolvedBaseline, resolvedDepth);
       const rawMaterials: UploadedMaterial[] = Array.isArray(materials) ? materials : [];
       const hasPdfMaterials = rawMaterials.some(
         (m) => Boolean(m?.isPdf) || (m?.fileName || '').toLowerCase().endsWith('.pdf')
@@ -1813,11 +2707,16 @@ async function startServer() {
           ? Math.max(1, Math.min(200, Number(englishConfig?.dailyWordCount) || 20))
           : 20;
 
+      const englishSectionCount =
+        category === 'english' && (englishConfig?.effectiveWords || []).length > 0
+          ? Math.max(1, Math.ceil((englishConfig?.effectiveWords || []).length / dailyWordCount))
+          : days;
+
       const wordBuckets =
         category === 'english'
           ? allocateEnglishWordsRandomly({
               effectiveWords: englishConfig?.effectiveWords || [],
-              durationDays: days,
+              durationDays: englishSectionCount,
               dailyWordCount,
             }).buckets
           : [];
@@ -1844,7 +2743,11 @@ async function startServer() {
         category,
         generationMode: mode,
         subjectProfile: resolvedProfile,
-        learnerLevel: learnerLevel || 'intermediate',
+        learnerLevel: resolvedLearnerLevel,
+        learnerBaseline: resolvedBaseline,
+        customLearnerBaseline: resolvedCustomBaseline || undefined,
+        learningDepth: resolvedDepth,
+        customLearningDepth: resolvedCustomDepth || undefined,
         goal: trimmedGoal,
         startDate,
         durationDays: days,
@@ -1870,7 +2773,6 @@ async function startServer() {
         createdAt: new Date().toISOString(),
       };
 
-      const settings = loadSettings();
       // Persist raw files into `courses/<课程名称>/sources/` and extract clean PDF metadata/bookmarks via pdfjs-dist
       await persistCourseToFolder(newCourse, settings);
 
@@ -1878,12 +2780,11 @@ async function startServer() {
       const pdfMetas = loadCoursePdfMetas(newCourse);
 
       if (pdfMetas.length > 0) {
-        // Default offset is 0; never auto-infer pageOffset from OCR text guesses
         newCourse.pdfPageOffset = 0;
         const defaultSource = pdfMetas[0].fileName || 'textbook.pdf';
         const totalPages = pdfMetas[0].totalPages || 500;
 
-        // Step 1: If API mode & PDF present, send actual PDF + optional OCR reference to LLM
+        // Step 1: If API mode & PDF present, send actual PDF directly to multimodal LLM
         if (mode === 'api') {
           try {
             const splitPrompts = buildPdfSplitPrompts({
@@ -1941,6 +2842,10 @@ async function startServer() {
           generationMode: mode,
           subjectProfile: resolvedProfile,
           learnerLevel: newCourse.learnerLevel,
+          learnerBaseline: newCourse.learnerBaseline,
+          customLearnerBaseline: newCourse.customLearnerBaseline,
+          learningDepth: newCourse.learningDepth,
+          customLearningDepth: newCourse.customLearningDepth,
           goal: trimmedGoal,
           startDate,
           durationDays: days,
@@ -1972,7 +2877,7 @@ async function startServer() {
   app.put('/api/courses/:courseId/outline', async (req, res) => {
     try {
       const { courseId } = req.params;
-      const { dailyPlan, startDate, confirmOutline } = req.body || {};
+      const { dailyPlan, startDate, durationDays, confirmOutline } = req.body || {};
       const db = loadDb();
       const course = db.courses.find((c) => c.id === courseId);
       if (!course) {
@@ -1982,6 +2887,13 @@ async function startServer() {
 
       if (typeof startDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(startDate)) {
         course.startDate = startDate;
+      }
+      if (
+        durationDays !== undefined &&
+        Number.isFinite(Number(durationDays)) &&
+        Number(durationDays) >= 1
+      ) {
+        course.durationDays = Math.max(1, Math.min(180, Math.round(Number(durationDays))));
       }
 
       if (Array.isArray(dailyPlan) && dailyPlan.length > 0) {
@@ -1998,42 +2910,79 @@ async function startServer() {
           const prev =
             (item.id && existingById.get(item.id)) || existingByDay.get(item.dayIndex || dayIndex);
           const stableId = ensureStableSectionId(dayIndex, item.id || prev?.id);
-          const date = item.date || addDaysToDateString(course.startDate, idx);
-          const nextRegionId =
-            item.regionId !== undefined ? item.regionId || undefined : prev?.regionId;
-          const matchedSeg =
-            resolveSlotPdfSegment(
-              { id: stableId, dayIndex, regionId: nextRegionId, pdfSegment: item.pdfSegment || prev?.pdfSegment },
-              course.pdfSplitPlan
-            ) || item.pdfSegment || prev?.pdfSegment;
+          const nextTitle = String(item.title || prev?.title || `第 ${dayIndex} 节`).trim();
+          const nextTeachingScope = String(item.teachingScope ?? prev?.teachingScope ?? '').trim();
+          const extractedRegions = extractReferencedRegionIds({
+            regionId: item.regionId !== undefined ? item.regionId || undefined : prev?.regionId,
+            regionIds: Array.isArray(item.regionIds) ? item.regionIds : prev?.regionIds,
+            teachingScope: nextTeachingScope,
+            title: nextTitle,
+          });
+          const nextRegionId = extractedRegions[0] || undefined;
+          const matchedSegs = resolveSlotPdfSegments(
+            {
+              id: stableId,
+              dayIndex,
+              regionId: nextRegionId,
+              regionIds: extractedRegions,
+              teachingScope: nextTeachingScope,
+              title: nextTitle,
+              pdfSegment: item.pdfSegment || prev?.pdfSegment,
+              pdfSegments: item.pdfSegments || prev?.pdfSegments,
+            },
+            course.pdfSplitPlan
+          );
+          const keyTopics = Array.isArray(item.keyTopics)
+            ? item.keyTopics.map(String).filter(Boolean)
+            : prev?.keyTopics || [];
+          const parsedMinutes = Number(item.estimatedMinutes);
+          const estimatedMinutes =
+            prev?.lesson?.estimatedMinutes && prev.lesson.estimatedMinutes > 0
+              ? prev.lesson.estimatedMinutes
+              : Number.isFinite(parsedMinutes) && parsedMinutes > 0
+                ? Math.max(10, Math.min(300, Math.round(parsedMinutes)))
+                : prev?.lesson && prev?.estimatedMinutes && prev.estimatedMinutes > 0
+                  ? prev.estimatedMinutes
+                  : undefined;
 
           return {
             id: stableId,
             dayIndex,
-            date,
+            estimatedMinutes,
+            date: item.date || prev?.date || addDaysToDateString(course.startDate, idx),
             regionId: nextRegionId,
-            title: String(item.title || prev?.title || `第 ${dayIndex} 讲`).trim(),
+            regionIds: extractedRegions.length > 0 ? extractedRegions : undefined,
+            title: nextTitle,
             objective: String(item.objective ?? prev?.objective ?? '').trim(),
             prerequisites: Array.isArray(item.prerequisites)
               ? item.prerequisites.map(String).filter(Boolean)
               : prev?.prerequisites || [],
-            teachingScope: String(item.teachingScope ?? prev?.teachingScope ?? '').trim(),
+            teachingScope: nextTeachingScope,
             connectionNote: String(item.connectionNote ?? prev?.connectionNote ?? '').trim(),
-            keyTopics: Array.isArray(item.keyTopics)
-              ? item.keyTopics.map(String).filter(Boolean)
-              : prev?.keyTopics || [],
+            keyTopics,
             assignedWords: Array.isArray(item.assignedWords)
               ? item.assignedWords
               : prev?.assignedWords,
-            pdfSegment: matchedSeg,
+            pdfSegment: matchedSegs[0] || item.pdfSegment || prev?.pdfSegment,
+            pdfSegments: matchedSegs.length > 0 ? matchedSegs : item.pdfSegments || prev?.pdfSegments,
             // Never delete already-generated lessons when editing outline!
             lesson: prev?.lesson,
           };
         });
 
-        course.dailyPlan = updatedSlots;
-        course.durationDays = updatedSlots.length;
+        // Guarantee 100% PDF region coverage then deterministically allocate days
+        const boundSlots = bindAndEnsureAllPdfRegionsCovered(updatedSlots, course.pdfSplitPlan);
+        course.dailyPlan = allocateSectionsToDays(boundSlots, course.durationDays, course.startDate);
+      } else {
+        const boundSlots = bindAndEnsureAllPdfRegionsCovered(course.dailyPlan, course.pdfSplitPlan);
+        course.dailyPlan = allocateSectionsToDays(boundSlots, course.durationDays, course.startDate);
       }
+
+      course.dailySchedule = buildCourseDailySchedule(
+        course.dailyPlan,
+        course.durationDays,
+        course.startDate
+      );
 
       if (confirmOutline) {
         course.outlineConfirmed = true;
@@ -2047,6 +2996,69 @@ async function startServer() {
       res.json({ course });
     } catch (err: any) {
       res.status(500).json({ error: err?.message || '保存课程目录失败' });
+    }
+  });
+
+  // 6a-2. Deterministic schedule reallocation (change study days / start date / section minutes without touching lessons)
+  app.post('/api/courses/:courseId/schedule/reallocate', async (req, res) => {
+    try {
+      const { courseId } = req.params;
+      const { durationDays, startDate, sectionMinutes } = req.body || {};
+      const db = loadDb();
+      const course = db.courses.find((c) => c.id === courseId);
+      if (!course) {
+        res.status(404).json({ error: '未找到该课程' });
+        return;
+      }
+
+      if (
+        durationDays !== undefined &&
+        Number.isFinite(Number(durationDays)) &&
+        Number(durationDays) >= 1
+      ) {
+        course.durationDays = Math.max(1, Math.min(180, Math.round(Number(durationDays))));
+      }
+      if (typeof startDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(startDate)) {
+        course.startDate = startDate;
+      }
+      if (sectionMinutes && typeof sectionMinutes === 'object') {
+        course.dailyPlan = course.dailyPlan.map((slot) => {
+          const overrideMin = Number((sectionMinutes as Record<string, unknown>)[slot.id]);
+          if (Number.isFinite(overrideMin) && overrideMin > 0) {
+            const clamped = Math.max(10, Math.min(300, Math.round(overrideMin)));
+            return {
+              ...slot,
+              estimatedMinutes: clamped,
+              lesson: slot.lesson
+                ? {
+                    ...slot.lesson,
+                    estimatedMinutes: clamped,
+                  }
+                : undefined,
+            };
+          }
+          return slot;
+        });
+      }
+
+      course.dailyPlan = allocateSectionsToDays(
+        course.dailyPlan,
+        course.durationDays,
+        course.startDate
+      );
+      course.dailySchedule = buildCourseDailySchedule(
+        course.dailyPlan,
+        course.durationDays,
+        course.startDate
+      );
+
+      const settings = loadSettings();
+      await persistCourseToFolder(course, settings);
+      saveDb(db);
+
+      res.json({ course });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || '重新分配学习日程失败' });
     }
   });
 
@@ -2068,6 +3080,10 @@ async function startServer() {
         generationMode: 'api',
         subjectProfile: course.subjectProfile,
         learnerLevel: course.learnerLevel,
+        learnerBaseline: course.learnerBaseline,
+        customLearnerBaseline: course.customLearnerBaseline,
+        learningDepth: course.learningDepth,
+        customLearningDepth: course.customLearningDepth,
         goal: course.goal,
         startDate: course.startDate,
         durationDays: course.durationDays,
@@ -2104,7 +3120,7 @@ async function startServer() {
       return;
     }
 
-    const { relCourseDir } = getCourseDirectory(course);
+    const { absCourseDir, relCourseDir } = getCourseDirectory(course);
     const pdfMetas = loadCoursePdfMetas(course);
     if ((!course.pdfSplitPlan || course.pdfSplitPlan.length === 0) && pdfMetas.length > 0) {
       course.pdfSplitPlan = buildHeuristicPdfSplitPlan({
@@ -2146,7 +3162,7 @@ async function startServer() {
         course.pdfPageOffset = pageOffset;
       }
 
-      const { relCourseDir } = getCourseDirectory(course);
+      const { absCourseDir, relCourseDir } = getCourseDirectory(course);
       const pdfMetas = loadCoursePdfMetas(course);
       const primaryPdf = pdfMetas[0];
       const defaultSource =
@@ -2279,17 +3295,19 @@ async function startServer() {
       }
 
       course.pdfSplitPlan = nextPlan;
-      for (const slot of course.dailyPlan) {
-        if (slot.regionId && !nextSectionIds.has(slot.regionId)) {
-          slot.regionId = undefined;
-          slot.pdfSegment = undefined;
-          continue;
-        }
-        const seg = resolveSlotPdfSegment(slot, course.pdfSplitPlan);
-        if (seg) {
-          slot.pdfSegment = seg;
-        }
-      }
+      course.dailyPlan = course.dailyPlan.map((slot) => {
+        const filteredIds = (slot.regionIds || (slot.regionId ? [slot.regionId] : [])).filter((id) =>
+          nextSectionIds.has(id)
+        );
+        return {
+          ...slot,
+          regionId: filteredIds[0],
+          regionIds: filteredIds.length > 0 ? filteredIds : undefined,
+          pdfSegment: undefined,
+          pdfSegments: undefined,
+        };
+      });
+      course.dailyPlan = bindAndEnsureAllPdfRegionsCovered(course.dailyPlan, course.pdfSplitPlan);
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
       saveDb(db);
@@ -2343,15 +3361,7 @@ async function startServer() {
       });
 
       course.pdfSplitPlan = executedPlan;
-      for (const slot of course.dailyPlan) {
-        const seg = resolveSlotPdfSegment(slot, executedPlan);
-        if (seg) {
-          slot.pdfSegment = seg;
-          if (!slot.regionId) {
-            slot.regionId = seg.sectionId;
-          }
-        }
-      }
+      course.dailyPlan = bindAndEnsureAllPdfRegionsCovered(course.dailyPlan, executedPlan);
 
       await persistCourseToFolder(course, settings);
       saveDb(db);
@@ -2420,7 +3430,7 @@ async function startServer() {
 
       const { buckets, coverageStats } = allocateEnglishWordsRandomly({
         effectiveWords: course.englishConfig.effectiveWords || [],
-        durationDays: course.durationDays,
+        durationDays: Math.max(1, course.dailyPlan.length || course.durationDays),
         dailyWordCount: nextDailyCount,
         existingSlots: course.dailyPlan,
         masteredWords: course.masteredWords || [],
@@ -2512,6 +3522,7 @@ async function startServer() {
       materialFilePaths,
       completedCount,
       totalDays: course.durationDays,
+      totalSections: course.dailyPlan.length,
     });
   });
 
@@ -2569,20 +3580,10 @@ async function startServer() {
       return;
     }
     const slot = course.dailyPlan.find((d) => d.dayIndex === dayNum);
-    if (!slot) {
-      res.status(404).json({ error: '未找到指定日期的学习计划' });
-      return;
-    }
-
     const settings = loadSettings();
     const teachingSystemPrompt = getEffectiveTeachingSystemPrompt(course, settings);
-    const lessonPrompt = buildChatLessonPrompt({
-      course,
-      slot,
-      teachingSystemPrompt,
-    });
     const syllabusPrompt = buildChatSyllabusPrompt({ course });
-    const { relCourseDir } = getCourseDirectory(course);
+    const { absCourseDir, relCourseDir } = getCourseDirectory(course);
     const pdfMetas = loadCoursePdfMetas(course);
     const splitPrompts = buildPdfSplitPrompts({
       course,
@@ -2595,26 +3596,152 @@ async function startServer() {
       .map((m) => `【${m.fileName}】\n${m.extractedText}`)
       .join('\n\n');
 
+    if (!slot) {
+      if (course.dailyPlan.length === 0 && dayNum === 1) {
+        res.json({
+          lessonPrompt: '',
+          syllabusPrompt,
+          chatSplitPrompt: splitPrompts.chatSplitPrompt,
+          sectionId: 'sec-01',
+          dayIndex: 1,
+          date: course.startDate,
+          title: '',
+          pdfSegment: undefined,
+          sectionExtractedText: nonPdfExtractedText,
+          sourcePdfFiles: pdfMetas.map((pm) => pm.fileName),
+        });
+        return;
+      }
+      res.status(404).json({ error: '未找到指定小节的学习计划' });
+      return;
+    }
+
+    const slotSegs = resolveSlotPdfSegments(slot, course.pdfSplitPlan);
+    const enrichedSlot = {
+      ...slot,
+      pdfSegment: slotSegs[0] || slot.pdfSegment,
+      pdfSegments: slotSegs.length > 0 ? slotSegs : slot.pdfSegments,
+    };
+    const stage1Prompt = buildChatLessonStage1Prompt({
+      course,
+      slot: enrichedSlot,
+      teachingSystemPrompt,
+    });
+    const lessonPrompt = buildChatLessonPrompt({
+      course,
+      slot: enrichedSlot,
+      teachingSystemPrompt,
+    });
+
+    const secId = ensureStableSectionId(slot.dayIndex, slot.id);
+    const promptsDir = path.join(absCourseDir, 'prompts');
+    const secPromptDir = path.join(promptsDir, secId);
+    fs.mkdirSync(promptsDir, { recursive: true });
+    fs.mkdirSync(secPromptDir, { recursive: true });
+
+    const promptMdRelPath = `prompts/${secId}/prompt.md`;
+    fs.writeFileSync(path.join(secPromptDir, 'prompt.md'), lessonPrompt, 'utf-8');
+    fs.writeFileSync(path.join(promptsDir, `${secId}-prompt.md`), stage1Prompt, 'utf-8');
+
+    const stage1PromptMdRelPath = `prompts/${secId}/stage1-prompt.md`;
+    fs.writeFileSync(path.join(secPromptDir, 'stage1-prompt.md'), stage1Prompt, 'utf-8');
+    fs.writeFileSync(path.join(promptsDir, `${secId}-stage1-prompt.md`), stage1Prompt, 'utf-8');
+
+    const stageBaseLesson = slot.stage1Draft || slot.lesson;
+    const pendingDiagramSpecs = extractPendingDiagramSpecs(stageBaseLesson);
+    const allStageDiagramSpecs =
+      pendingDiagramSpecs.length > 0
+        ? pendingDiagramSpecs
+        : (stageBaseLesson?.diagrams || []).map((d, idx) => ({
+            id: d.id || `diag-${idx + 1}`,
+            title: d.title || `图示 ${idx + 1}`,
+            stageLabel: d.stageLabel,
+            topologySpec: d.topologySpec || d.caption || d.title || '',
+            caption: d.caption || '',
+          }));
+
+    const stage2Prompt =
+      allStageDiagramSpecs.length > 0
+        ? buildLessonStage2DiagramsPrompt({
+            courseName: course.name,
+            slot: enrichedSlot,
+            diagramSpecs: allStageDiagramSpecs,
+          })
+        : '';
+    let stage2PromptMdRelPath = '';
+    if (stage2Prompt) {
+      stage2PromptMdRelPath = `prompts/${secId}/stage2-prompt.md`;
+      fs.writeFileSync(path.join(secPromptDir, 'stage2-prompt.md'), stage2Prompt, 'utf-8');
+      fs.writeFileSync(path.join(promptsDir, `${secId}-stage2-prompt.md`), stage2Prompt, 'utf-8');
+    }
+
+    const agentStage1Prompt = buildAgentSectionStagePrompt({
+      course,
+      slot: enrichedSlot,
+      workspaceDir: relCourseDir,
+      stage: 'stage1',
+      teachingSystemPrompt,
+    });
+    const agentStage1PromptMdRelPath = `prompts/${secId}/agent-stage1-prompt.md`;
+    fs.writeFileSync(path.join(secPromptDir, 'agent-stage1-prompt.md'), agentStage1Prompt, 'utf-8');
+
+    const agentStage2Prompt =
+      allStageDiagramSpecs.length > 0
+        ? buildAgentSectionStagePrompt({
+            course,
+            slot: enrichedSlot,
+            workspaceDir: relCourseDir,
+            stage: 'stage2',
+            teachingSystemPrompt,
+            diagramSpecs: allStageDiagramSpecs,
+          })
+        : '';
+    let agentStage2PromptMdRelPath = '';
+    if (agentStage2Prompt) {
+      agentStage2PromptMdRelPath = `prompts/${secId}/agent-stage2-prompt.md`;
+      fs.writeFileSync(path.join(secPromptDir, 'agent-stage2-prompt.md'), agentStage2Prompt, 'utf-8');
+    }
+
     res.json({
       lessonPrompt,
+      stage1Prompt,
+      stage2Prompt,
+      agentStage1Prompt,
+      agentStage2Prompt,
+      promptMdRelPath,
+      stage1PromptMdRelPath,
+      stage2PromptMdRelPath,
+      agentStage1PromptMdRelPath,
+      agentStage2PromptMdRelPath,
+      pendingDiagramSpecs,
+      allStageDiagramSpecs,
+      hasStage1Draft: Boolean(slot.stage1Draft),
+      hasFinalLesson: Boolean(slot.lesson),
       syllabusPrompt,
       chatSplitPrompt: splitPrompts.chatSplitPrompt,
       sectionId: slot.id,
       dayIndex: slot.dayIndex,
       date: slot.date,
       title: slot.title,
-      pdfSegment: slot.pdfSegment,
+      pdfSegment: slotSegs[0] || slot.pdfSegment,
+      pdfSegments: slotSegs,
       sectionExtractedText: nonPdfExtractedText,
       sourcePdfFiles: pdfMetas.map((pm) => pm.fileName),
     });
   });
 
-  // 13. Import single-lesson content from Chat Mode (or file import) with supplemental assets
+  // 13. Import single-lesson content (supports single-shot, Stage 1 draft, and Stage 2 SVG merge)
   app.post('/api/courses/:courseId/days/:dayIndex/import', async (req, res) => {
     try {
       const { courseId, dayIndex } = req.params;
       const dayNum = Number(dayIndex);
-      const { rawContent, lessonData, uploadedAssets = {}, sourceMode = 'chat' } = req.body || {};
+      const {
+        rawContent,
+        lessonData,
+        uploadedAssets = {},
+        sourceMode = 'chat',
+        importStage = 'complete',
+      } = req.body || {};
 
       const db = loadDb();
       const course = db.courses.find((c) => c.id === courseId);
@@ -2637,6 +3764,54 @@ async function startServer() {
         }
       }
 
+      const effectiveSourceMode = sourceMode === 'agent' ? 'agent' : 'chat';
+
+      if (importStage === 'stage2_merge') {
+        const baseLesson =
+          (lessonData && typeof lessonData === 'object' ? (lessonData as DailyLessonContent) : null) ||
+          slot.stage1Draft ||
+          slot.lesson;
+        if (!baseLesson) {
+          res.status(400).json({ error: '当前小节尚未保存阶段一教学内容，请先完成并导入阶段一结果。' });
+          return;
+        }
+        const mergeRes = mergeStage2DiagramsIntoStage1(
+          baseLesson,
+          String(rawContent || ''),
+          course.customAssets
+        );
+        const mergedFinal: DailyLessonContent = {
+          ...mergeRes.mergedLesson,
+          sectionId: slot.id,
+          dayIndex: slot.dayIndex,
+          date: slot.date,
+          sourceMode: effectiveSourceMode,
+          generationStage: 'complete',
+        };
+        if (!slot.stage1Draft) {
+          slot.stage1Draft = baseLesson;
+        }
+        slot.lesson = sanitizeLessonCitations(mergedFinal);
+        slot.title = slot.lesson.title || slot.title;
+        if (slot.lesson.estimatedMinutes && slot.lesson.estimatedMinutes > 0) {
+          slot.estimatedMinutes = slot.lesson.estimatedMinutes;
+        }
+        const settings = loadSettings();
+        await persistCourseToFolder(course, settings);
+        saveDb(db);
+        res.json({
+          course,
+          lesson: slot.lesson,
+          stage1Draft: slot.stage1Draft,
+          mergeInfo: {
+            matchedCount: mergeRes.matchedCount,
+            addedCount: mergeRes.addedCount,
+            pendingRemainingCount: mergeRes.pendingRemaining.length,
+          },
+        });
+        return;
+      }
+
       let finalLesson: DailyLessonContent;
       if (lessonData && typeof lessonData === 'object') {
         finalLesson = resolveLessonAssetReferences(
@@ -2645,7 +3820,7 @@ async function startServer() {
             sectionId: slot.id,
             dayIndex: slot.dayIndex,
             date: slot.date,
-            sourceMode: sourceMode === 'agent' ? 'agent' : 'chat',
+            sourceMode: effectiveSourceMode,
             generatedAt: new Date().toISOString(),
           }),
           course.customAssets
@@ -2654,19 +3829,44 @@ async function startServer() {
         const parsed = parseImportedLessonContent(
           String(rawContent || ''),
           slot,
-          sourceMode === 'agent' ? 'agent' : 'chat',
-          course.customAssets
+          effectiveSourceMode,
+          course.customAssets,
+          { stageMode: importStage === 'stage1' ? 'stage1' : 'auto' }
         );
         finalLesson = parsed.lesson;
       }
 
-      slot.lesson = sanitizeLessonCitations(finalLesson);
+      const cleanedLesson = sanitizeLessonCitations(finalLesson);
+
+      if (importStage === 'stage1') {
+        cleanedLesson.generationStage = 'stage1_content';
+        slot.stage1Draft = cleanedLesson;
+        const pendingSpecs = extractPendingDiagramSpecs(cleanedLesson);
+        const settings = loadSettings();
+        await persistCourseToFolder(course, settings);
+        saveDb(db);
+        res.json({
+          course,
+          stage1Draft: slot.stage1Draft,
+          pendingDiagramSpecs: pendingSpecs,
+        });
+        return;
+      }
+
+      cleanedLesson.generationStage = 'complete';
+      if (!slot.stage1Draft) {
+        slot.stage1Draft = cleanedLesson;
+      }
+      slot.lesson = cleanedLesson;
       slot.title = slot.lesson.title || slot.title;
+      if (slot.lesson.estimatedMinutes && slot.lesson.estimatedMinutes > 0) {
+        slot.estimatedMinutes = slot.lesson.estimatedMinutes;
+      }
 
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
       saveDb(db);
-      res.json({ course, lesson: finalLesson });
+      res.json({ course, lesson: slot.lesson, stage1Draft: slot.stage1Draft });
     } catch (err: any) {
       res.status(400).json({ error: err?.message || '解析导入课件失败' });
     }
@@ -2693,10 +3893,10 @@ async function startServer() {
       if (parsed.knowledgeCatalog.length > 0) {
         course.knowledgeCatalog = parsed.knowledgeCatalog;
       }
-      course.dailyPlan = parsed.dailyPlan.map((slot) => ({
-        ...slot,
-        pdfSegment: resolveSlotPdfSegment(slot, course.pdfSplitPlan) || slot.pdfSegment,
-      }));
+      course.dailyPlan = bindAndEnsureAllPdfRegionsCovered(
+        parsed.dailyPlan,
+        course.pdfSplitPlan
+      );
       if (confirmOutline) {
         course.outlineConfirmed = true;
         course.outlineConfirmedAt = new Date().toISOString();
@@ -2808,8 +4008,21 @@ async function startServer() {
     res.json({ ok: true, deletedFolder: deleteFolder });
   });
 
-  // 17. Generate or regenerate the lesson for a specific dayIndex via API Mode
+  // 17. Generate or regenerate the lesson for a specific dayIndex via API Mode (supports real NDJSON stream when ?stream=1)
   app.post('/api/courses/:courseId/days/:dayIndex/generate', async (req, res) => {
+    const wantsStream =
+      req.query.stream === '1' ||
+      String(req.headers.accept || '').includes('application/x-ndjson');
+
+    const writeStreamEvent = (ev: GenerationProgressEvent) => {
+      if (!wantsStream) return;
+      try {
+        res.write(`${JSON.stringify(ev)}\n`);
+      } catch {
+        // client disconnected
+      }
+    };
+
     try {
       const { courseId, dayIndex } = req.params;
       const dayNum = Number(dayIndex);
@@ -2825,35 +4038,154 @@ async function startServer() {
         return;
       }
 
-      const lesson = await generateDailyLesson(course, slot);
-      slot.lesson = lesson;
+      if (wantsStream) {
+        res.status(200);
+        res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders?.();
+      }
+
+      const reqStageRaw = String(req.body?.stage || req.query.stage || 'all');
+      const requestedStage: 'all' | 'stage1' | 'stage2' =
+        reqStageRaw === 'stage1' || reqStageRaw === 'stage2' ? reqStageRaw : 'all';
+
+      let lesson: DailyLessonContent;
+      try {
+        lesson = await generateDailyLesson(course, slot, writeStreamEvent, requestedStage);
+      } catch (genErr) {
+        // If Stage 1 succeeded before Stage 2 failed, persist Stage 1 draft so Stage 2 can retry independently
+        if (slot.stage1Draft) {
+          try {
+            const settings = loadSettings();
+            await persistCourseToFolder(course, settings);
+            saveDb(db);
+          } catch {
+            // ignore secondary save failure
+          }
+        }
+        throw genErr;
+      }
+
+      let pendingDiagramsCount = 0;
+      if (requestedStage === 'stage1') {
+        slot.stage1Draft = lesson;
+        pendingDiagramsCount = extractPendingDiagramSpecs(lesson).length;
+        if (pendingDiagramsCount === 0) {
+          lesson.generationStage = 'complete';
+          slot.lesson = lesson;
+          if (lesson.estimatedMinutes && lesson.estimatedMinutes > 0) {
+            slot.estimatedMinutes = lesson.estimatedMinutes;
+          }
+          writeStreamEvent({
+            type: 'progress',
+            stage: 'saving',
+            step: 4,
+            percent: 98,
+            message: `本节无需额外 SVG 配图，已保存阶段一与完整课件 lessons/${slot.id}.json...`,
+          });
+        } else {
+          writeStreamEvent({
+            type: 'progress',
+            stage: 'saving',
+            step: 4,
+            percent: 98,
+            message: `正在保存阶段一中间产物 lessons/${slot.id}.stage1.json（待绘 ${pendingDiagramsCount} 张 SVG）...`,
+          });
+        }
+      } else {
+        slot.lesson = lesson;
+        pendingDiagramsCount = extractPendingDiagramSpecs(lesson).length;
+        if (lesson.estimatedMinutes && lesson.estimatedMinutes > 0) {
+          slot.estimatedMinutes = lesson.estimatedMinutes;
+        }
+        writeStreamEvent({
+          type: 'progress',
+          stage: 'saving',
+          step: 4,
+          percent: 98,
+          message: `正在将课件与练习写入本地 lessons/${slot.id}.json...`,
+        });
+      }
+
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
       saveDb(db);
 
-      res.json({ course, lesson });
+      if (wantsStream) {
+        writeStreamEvent({
+          type: 'done',
+          stage: 'done',
+          step: 4,
+          percent: 100,
+          message:
+            requestedStage === 'stage1'
+              ? pendingDiagramsCount > 0
+                ? `第 ${dayNum} 讲阶段一内容已保存，可继续生成图示`
+                : `第 ${dayNum} 讲无需额外配图，已完成全部保存`
+              : `第 ${dayNum} 讲课件生成完成并已持久化保存`,
+          course,
+          lesson: requestedStage === 'stage1' ? slot.lesson : lesson,
+          stage1Draft: slot.stage1Draft,
+          pendingDiagramsCount,
+        });
+        res.end();
+      } else {
+        res.json({
+          course,
+          lesson: requestedStage === 'stage1' ? slot.lesson : lesson,
+          stage1Draft: slot.stage1Draft,
+          pendingDiagramsCount,
+        });
+      }
     } catch (err: any) {
       console.error('Error generating daily lesson:', err);
-      res.status(500).json({ error: err?.message || '生成课件失败' });
+      const errMsg = err?.message || '生成课件失败';
+      if (wantsStream) {
+        if (!res.headersSent) {
+          res.status(500).json({ error: errMsg });
+        } else {
+          writeStreamEvent({
+            type: 'error',
+            stage: 'error',
+            step: 1,
+            percent: 0,
+            message: errMsg,
+            error: errMsg,
+          });
+          res.end();
+        }
+      } else {
+        res.status(500).json({ error: errMsg });
+      }
     }
   });
 
-  // 18. Save offline-graded exercise submission
+  // 18. Save offline-graded exercise submission (prefer sectionId key when supplied so multi-section days stay isolated)
   app.post('/api/courses/:courseId/exercises', async (req, res) => {
     const { courseId } = req.params;
-    const { date, userAnswers, score, total } = req.body || {};
+    const { sectionId, date, userAnswers, score, total } = req.body || {};
     const db = loadDb();
     const course = db.courses.find((c) => c.id === courseId);
     if (!course) {
       res.status(404).json({ error: '未找到该课程' });
       return;
     }
-    course.exerciseSubmissions[date] = {
+    const cleanSectionId = typeof sectionId === 'string' && sectionId.trim() ? sectionId.trim() : undefined;
+    const storageKey = cleanSectionId || date;
+    if (!storageKey) {
+      res.status(400).json({ error: '缺少 sectionId 或 date 参数' });
+      return;
+    }
+    const record = {
+      sectionId: cleanSectionId,
+      date: typeof date === 'string' ? date : undefined,
       userAnswers: userAnswers || {},
       score: Number(score) || 0,
       total: Number(total) || 0,
       submittedAt: new Date().toISOString(),
     };
+    course.exerciseSubmissions[storageKey] = record;
     const settings = loadSettings();
     await persistCourseToFolder(course, settings);
     saveDb(db);
@@ -2863,20 +4195,26 @@ async function startServer() {
   // 19. Save user's reverse-explanation self-check notes
   app.post('/api/courses/:courseId/reverse-checks', async (req, res) => {
     const { courseId } = req.params;
-    const { date, checkId, userExplanation } = req.body || {};
+    const { sectionId, date, checkId, userExplanation } = req.body || {};
     const db = loadDb();
     const course = db.courses.find((c) => c.id === courseId);
     if (!course) {
       res.status(404).json({ error: '未找到该课程' });
       return;
     }
+    const cleanSectionId = typeof sectionId === 'string' && sectionId.trim() ? sectionId.trim() : undefined;
+    const storageKey = cleanSectionId || date;
+    if (!storageKey) {
+      res.status(400).json({ error: '缺少 sectionId 或 date 参数' });
+      return;
+    }
     if (!course.reverseCheckNotes) {
       course.reverseCheckNotes = {};
     }
-    if (!course.reverseCheckNotes[date]) {
-      course.reverseCheckNotes[date] = {};
+    if (!course.reverseCheckNotes[storageKey]) {
+      course.reverseCheckNotes[storageKey] = {};
     }
-    course.reverseCheckNotes[date][checkId] = String(userExplanation || '');
+    course.reverseCheckNotes[storageKey][checkId] = String(userExplanation || '');
     const settings = loadSettings();
     await persistCourseToFolder(course, settings);
     saveDb(db);
@@ -3217,14 +4555,24 @@ async function startServer() {
         return;
       }
 
-      const { folderName } = getCourseDirectory(course);
+      const { folderName, absCourseDir } = getCourseDirectory(course);
       const secId = ensureStableSectionId(slot.dayIndex, slot.id);
       await callPythonJson(
         `/api/py/courses/files?folder=${encodeURIComponent(folderName)}&path=${encodeURIComponent(`lessons/${secId}.json`)}`,
         { method: 'DELETE' }
       ).catch(() => null);
 
+      for (const candidate of [
+        path.join(absCourseDir, 'lessons', `${secId}.json`),
+        path.join(absCourseDir, 'lessons', `day-${String(slot.dayIndex).padStart(2, '0')}.json`),
+      ]) {
+        if (fs.existsSync(candidate)) {
+          fs.unlinkSync(candidate);
+        }
+      }
+
       slot.lesson = undefined;
+      slot.estimatedMinutes = undefined;
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
       saveDb(db);
@@ -3383,6 +4731,18 @@ async function startServer() {
       res.status(pyRes.status).json(pyRes.data);
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || '测试接口连通性失败' });
+    }
+  });
+
+  // Ensure any /api/* error (including PayloadTooLargeError / JSON parse errors) always returns JSON, never HTML
+  app.use('/api', (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    const status = Number(err?.status || err?.statusCode) || 500;
+    const message =
+      status === 413
+        ? '请求体体积过大（HTTP 413）。请通过课程资料分块上传组件上传大型 PDF，切勿内联传输超大二进制数据。'
+        : err?.message || '服务端 API 请求处理失败';
+    if (!res.headersSent) {
+      res.status(status).json({ error: message });
     }
   });
 

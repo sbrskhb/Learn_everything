@@ -9,7 +9,6 @@ import {
   ListChecks,
   MessageSquare,
   Plus,
-  RefreshCw,
 } from 'lucide-react';
 import type { Course, CourseGenerationMode, StudyStats } from '../types';
 import type { OutlineWorkbenchStep } from './CourseOutlineModal';
@@ -17,25 +16,19 @@ import {
   addDaysToDateString,
   formatChineseDateLabel,
   formatStudyDuration,
+  getEvaluatedSectionMinutes,
+  getSlotExerciseSubmission,
   getTodayDateString,
 } from '../utils/learningLogic';
 import { renderInlineMathWithLatex } from '../utils/markdownMath';
-import type { GenerationProgressEvent } from '../utils/streamProgress';
 
 interface DailyFocusViewProps {
   date: string;
   courses: Course[];
   studyStats: StudyStats;
-  generatingSlotKey: string | null;
-  generatingSlotProgress: GenerationProgressEvent | null;
   onChangeDate: (nextDate: string) => void;
   onBack: (e?: React.MouseEvent) => void;
   onOpenLesson: (courseId: string, dayIndex: number, e?: React.MouseEvent) => void;
-  onGenerateSlot: (
-    e: React.MouseEvent,
-    course: Course,
-    dayIndex: number
-  ) => void;
   onOpenOutlineModal: (courseId: string, step: OutlineWorkbenchStep) => void;
   onOpenAddCourse: () => void;
 }
@@ -50,12 +43,9 @@ export const DailyFocusView: React.FC<DailyFocusViewProps> = ({
   date,
   courses,
   studyStats,
-  generatingSlotKey,
-  generatingSlotProgress,
   onChangeDate,
   onBack,
   onOpenLesson,
-  onGenerateSlot,
   onOpenOutlineModal,
   onOpenAddCourse,
 }) => {
@@ -111,7 +101,7 @@ export const DailyFocusView: React.FC<DailyFocusViewProps> = ({
     let correct = 0;
     let total = 0;
     for (const { course, slot } of dayItems) {
-      const sub = course.exerciseSubmissions?.[slot.date];
+      const sub = getSlotExerciseSubmission(course, slot);
       if (sub && sub.total > 0) {
         total += sub.total;
         correct += sub.score;
@@ -145,7 +135,7 @@ export const DailyFocusView: React.FC<DailyFocusViewProps> = ({
         animate={
           focusingLessonKey
             ? { filter: 'blur(9px)', opacity: 0.22, scale: 0.99 }
-            : { filter: 'blur(0px)', opacity: 1, scale: 1 }
+            : { filter: 'blur(0px)', opacity: 1, scale: 1, transitionEnd: { filter: 'none', transform: 'none' } }
         }
         transition={{ duration: 0.16, ease: [0.22, 1, 0.36, 1] }}
         className="sticky top-0 z-30 bg-black/95 backdrop-blur-sm border-b border-neutral-900 px-6 py-4"
@@ -202,7 +192,12 @@ export const DailyFocusView: React.FC<DailyFocusViewProps> = ({
           <motion.div
             key={date}
             initial={{ opacity: 0, scale: 0.975, filter: 'blur(5px)' }}
-            animate={{ opacity: 1, scale: 1, filter: 'blur(0px)' }}
+            animate={{
+              opacity: 1,
+              scale: 1,
+              filter: 'blur(0px)',
+              transitionEnd: { filter: 'none', transform: 'none' },
+            }}
             exit={{ opacity: 0, scale: 1.02, filter: 'blur(5px)' }}
             transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
             style={{ transformOrigin: '50% 25%' }}
@@ -244,6 +239,24 @@ export const DailyFocusView: React.FC<DailyFocusViewProps> = ({
               <div className="text-[11px] text-neutral-500">当日课程</div>
               <div className="font-mono text-sm font-semibold text-white mt-0.5 tabular-nums">
                 {dayItems.length} 讲
+                {dayItems.length > 0 && (() => {
+                  const evaluatedTotal = dayItems.reduce(
+                    (sum, item) => sum + (getEvaluatedSectionMinutes(item.slot) || 0),
+                    0
+                  );
+                  const unassessed = dayItems.filter(
+                    (item) => getEvaluatedSectionMinutes(item.slot) === undefined
+                  ).length;
+                  return (
+                    <span className="text-xs font-normal text-neutral-400 ml-1.5">
+                      (
+                      {evaluatedTotal > 0
+                        ? `预计 ${evaluatedTotal} 分钟${unassessed > 0 ? `，另有 ${unassessed} 节待评估` : ''}`
+                        : '待生成后评估学时'}
+                      )
+                    </span>
+                  );
+                })()}
               </div>
             </div>
             <div>
@@ -304,8 +317,7 @@ export const DailyFocusView: React.FC<DailyFocusViewProps> = ({
           <section className="space-y-4" aria-label="当日全部排课列表">
             {dayItems.map(({ course, slot }, idx) => {
               const hasLesson = Boolean(slot.lesson);
-              const isGeneratingThis = generatingSlotKey === `${course.id}-${slot.dayIndex}`;
-              const submission = course.exerciseSubmissions?.[slot.date];
+              const submission = getSlotExerciseSubmission(course, slot);
               const mode: CourseGenerationMode = course.generationMode || 'api';
               const hasPdf = course.materials?.some(
                 (m) => m.isPdf || m.fileName.toLowerCase().endsWith('.pdf')
@@ -331,7 +343,8 @@ export const DailyFocusView: React.FC<DailyFocusViewProps> = ({
                     duration: focusingLessonKey ? 0.16 : 0.18,
                     ease: [0.16, 1, 0.3, 1],
                   }}
-                  className={`glow-border border rounded bg-neutral-950/60 p-5 space-y-4 transition-colors ${
+                  onClick={(e) => handleTriggerLessonOpen(course.id, slot.dayIndex, e)}
+                  className={`glow-border border rounded bg-neutral-950/60 p-5 space-y-4 transition-colors cursor-pointer group ${
                     isFocusedItem
                       ? 'border-sky-400/70 shadow-[0_0_32px_-12px_rgba(56,189,248,0.4)]'
                       : 'border-neutral-800 hover:border-neutral-600'
@@ -347,7 +360,14 @@ export const DailyFocusView: React.FC<DailyFocusViewProps> = ({
                         <span>{slot.id}</span>
                         <span aria-hidden="true">·</span>
                         <span>
-                          第 {slot.dayIndex}/{course.durationDays} 天
+                          {(() => {
+                            const slotMinutes = getEvaluatedSectionMinutes(slot);
+                            return `第 ${slot.scheduledDay || slot.dayIndex}/${course.durationDays} 天 · ${
+                              slotMinutes !== undefined
+                                ? `预计 ${slotMinutes} 分钟`
+                                : '待生成后评估学时'
+                            }`;
+                          })()}
                         </span>
                         <span aria-hidden="true">·</span>
                         <span>{MODE_LABELS[mode]}</span>
@@ -374,8 +394,7 @@ export const DailyFocusView: React.FC<DailyFocusViewProps> = ({
                       </div>
 
                       <h2
-                        onClick={(e) => handleTriggerLessonOpen(course.id, slot.dayIndex, e)}
-                        className="font-display text-lg font-semibold text-white hover:text-sky-300 cursor-pointer transition-colors"
+                        className="font-display text-lg font-semibold text-white group-hover:text-sky-300 transition-colors"
                         dangerouslySetInnerHTML={{
                           __html: renderInlineMathWithLatex(slot.title),
                         }}
@@ -415,7 +434,8 @@ export const DailyFocusView: React.FC<DailyFocusViewProps> = ({
                     <div className="flex flex-wrap items-center gap-2 shrink-0">
                       <button
                         type="button"
-                        onClick={() =>
+                        onClick={(e) => {
+                          e.stopPropagation();
                           onOpenOutlineModal(
                             course.id,
                             course.outlineConfirmed
@@ -423,8 +443,8 @@ export const DailyFocusView: React.FC<DailyFocusViewProps> = ({
                               : hasPdf || course.category === 'english'
                                 ? 'split_vocab'
                                 : 'outline'
-                          )
-                        }
+                          );
+                        }}
                         className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors"
                       >
                         <ListChecks className="w-3.5 h-3.5" />
@@ -433,25 +453,10 @@ export const DailyFocusView: React.FC<DailyFocusViewProps> = ({
 
                       <button
                         type="button"
-                        onClick={(e) => onGenerateSlot(e, course, slot.dayIndex)}
-                        disabled={isGeneratingThis}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors disabled:opacity-50"
-                      >
-                        <RefreshCw
-                          className={`w-3.5 h-3.5 ${isGeneratingThis ? 'animate-spin' : ''}`}
-                        />
-                        <span>
-                          {isGeneratingThis
-                            ? `生成中 ${generatingSlotProgress?.percent ?? 0}%`
-                            : hasLesson
-                              ? 'API 重新生成'
-                              : 'API 生成课件'}
-                        </span>
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={(e) => handleTriggerLessonOpen(course.id, slot.dayIndex, e)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleTriggerLessonOpen(course.id, slot.dayIndex, e);
+                        }}
                         className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors"
                       >
                         {hasLesson ? (

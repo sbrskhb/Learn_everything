@@ -8,6 +8,10 @@
     color-scheme: dark;
   }
 
+  html {
+    font-size: 17.5px;
+  }
+
   body {
     background-color: #000000;
     color: #f5f5f5;
@@ -20,16 +24,100 @@
     font-variant-numeric: tabular-nums;
   }
 
+  .font-display {
+    font-family: "Syne", "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    letter-spacing: -0.025em;
+  }
+
   .font-serif-reading {
     font-family: "Source Serif 4", Georgia, "Songti SC", serif;
+  }
+}
+
+/* Futuristic minimalist obsidian surfaces & subtle compositor motion */
+.obsidian-surface {
+  background: linear-gradient(180deg, rgba(16, 19, 24, 0.94) 0%, rgba(6, 8, 11, 0.96) 100%);
+}
+
+.obsidian-grid-bg {
+  background-image:
+    linear-gradient(to right, rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
+  background-size: 36px 36px;
+}
+
+@keyframes subtleLineGlow {
+  0%, 100% {
+    opacity: 0.35;
+    transform: translateX(-8%);
+  }
+  50% {
+    opacity: 0.75;
+    transform: translateX(8%);
+  }
+}
+
+.futuristic-scanline {
+  animation: subtleLineGlow 5s ease-in-out infinite;
+  will-change: transform, opacity;
+}
+
+/* Proximity cursor border glow (illuminates borders near the mouse cursor) */
+@layer components {
+  .glow-border {
+    position: relative;
+  }
+
+  .glow-border::after {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    padding: 1.25px;
+    background: radial-gradient(
+      210px circle at var(--gx, -999px) var(--gy, -999px),
+      rgba(125, 211, 252, 0.52),
+      rgba(255, 255, 255, 0.2) 38%,
+      transparent 72%
+    );
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    opacity: var(--go, 0);
+    transition: opacity 0.2s ease;
+    pointer-events: none;
+    z-index: 2;
+  }
+
+  .glow-border.overflow-hidden::after {
+    inset: 0;
+  }
+
+  /* Cylindrical drum timeline scroll stage & hover clarity recovery */
+  .cylinder-timeline-stage {
+    perspective: 1400px;
+    transform-style: preserve-3d;
+  }
+
+  .cylinder-row-inner {
+    transform-origin: center center;
+    backface-visibility: hidden;
+    will-change: transform, opacity, filter;
+  }
+
+  .cylinder-row-outer:hover .cylinder-row-inner,
+  .cylinder-row-outer:focus-within .cylinder-row-inner {
+    opacity: 1 !important;
+    filter: none !important;
+    transition: opacity 150ms ease-out, filter 150ms ease-out;
   }
 }
 
 /* Markdown & KaTeX reading typography on pure black background */
 .lesson-prose {
   color: #e5e5e5;
-  line-height: 1.8;
-  font-size: 1rem;
+  line-height: 1.82;
+  font-size: 1.03rem;
 }
 
 .lesson-prose h1,
@@ -120,6 +208,103 @@
   margin: 1rem 0;
 }
 
+.lesson-prose blockquote.lesson-callout {
+  border-left-width: 3px;
+  color: #e5e5e5;
+  padding: 0.875rem 1.125rem;
+}
+
+.lesson-prose blockquote.lesson-callout p {
+  color: #e5e5e5;
+}
+
+.lesson-callout-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.45rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.lesson-callout-badge {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  border-radius: 0.25rem;
+  font-size: 0.7rem;
+  border: 1px solid currentColor;
+}
+
+.lesson-prose blockquote.lesson-callout-textbook {
+  border-color: #1e3a5f;
+  border-left-color: #60a5fa;
+  background-color: rgba(15, 23, 42, 0.72);
+}
+
+.lesson-prose blockquote.lesson-callout-textbook .lesson-callout-header {
+  color: #93c5fd;
+}
+
+.lesson-prose blockquote.lesson-callout-prereq {
+  border-color: #451a03;
+  border-left-color: #fbbf24;
+  background-color: rgba(28, 20, 8, 0.72);
+}
+
+.lesson-prose blockquote.lesson-callout-prereq .lesson-callout-header {
+  color: #fcd34d;
+}
+
+.lesson-prose blockquote.lesson-callout-intuition {
+  border-color: #064e3b;
+  border-left-color: #34d399;
+  background-color: rgba(6, 28, 22, 0.72);
+}
+
+.lesson-prose blockquote.lesson-callout-intuition .lesson-callout-header {
+  color: #6ee7b7;
+}
+
+.lesson-prose blockquote.lesson-callout-extension {
+  border-color: #3b0764;
+  border-left-color: #c084fc;
+  background-color: rgba(24, 12, 38, 0.72);
+}
+
+.lesson-prose blockquote.lesson-callout-extension .lesson-callout-header {
+  color: #d8b4fe;
+}
+
+.lesson-hide-category-badges .lesson-callout-badge,
+.lesson-hide-category-badges .lesson-callout-header-badge-only {
+  display: none !important;
+}
+
+.lesson-hide-category-badges .lesson-prose blockquote.lesson-callout {
+  border: none;
+  background: transparent;
+  padding: 0;
+  margin: 0.75rem 0;
+  font-style: normal;
+  color: #d4d4d4;
+}
+
+.lesson-hide-category-badges .lesson-prose blockquote.lesson-callout .lesson-callout-header {
+  color: #fafafa;
+  font-family: inherit;
+  font-size: 0.95rem;
+  letter-spacing: normal;
+  text-transform: none;
+  margin-bottom: 0.35rem;
+}
+
+.lesson-hide-category-badges .lesson-prose blockquote.lesson-callout p {
+  color: #d4d4d4;
+}
+
 .lesson-prose table {
   width: 100%;
   border-collapse: collapse;
@@ -141,10 +326,18 @@
 }
 
 .lesson-prose img,
-.lesson-prose svg {
+.lesson-prose svg:not(.katex svg) {
   max-width: 100%;
   height: auto;
   margin: 1.25rem auto;
+  display: block;
+}
+
+/* Preserve KaTeX internal stretchy/radical <svg> layout rules from katex.min.css */
+.lesson-prose .katex svg {
+  max-width: none;
+  margin: 0;
+  height: inherit;
   display: block;
 }
 
@@ -171,4 +364,19 @@
   overflow-y: hidden;
   padding: 0.75rem 0;
   margin: 1rem 0;
+}
+
+/* Interactive KaTeX symbols explained in preceding context (layout-neutral styling) */
+.katex [data-latex-symbol] {
+  cursor: pointer;
+  border-bottom: 1px dotted rgba(56, 189, 248, 0.55);
+  border-radius: 2px;
+  transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.katex [data-latex-symbol]:hover,
+.katex [data-latex-symbol].latex-symbol-active {
+  color: #7dd3fc;
+  border-bottom-color: rgba(125, 211, 252, 0.95);
+  background-color: rgba(56, 189, 248, 0.12);
 }
