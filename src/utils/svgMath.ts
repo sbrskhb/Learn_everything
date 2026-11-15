@@ -311,12 +311,13 @@ export function enhanceDiagramSvg(svgCode: string): string {
     const y = getNumericAttr(attrs, 'y') ?? 0;
     const w = getNumericAttr(attrs, 'width') ?? 0;
     const h = getNumericAttr(attrs, 'height') ?? 0;
-    if (w > vbW * 0.4 && h >= 28) {
+    if (w > vbW * 0.2 && h >= 26) {
       rects.push({ x, y, w, h, attrs, fullMatch: rMatch[0] });
     }
   }
 
   const rectExtraMap = new Map<string, number>();
+  const rectExpandWidthMap = new Map<string, { x: number; w: number }>();
 
   output = output.replace(/<text\b([^>]*)>([\s\S]*?)<\/text>/gi, (full, attrs: string, inner: string) => {
     // Skip if already formatted with baseline-shift
@@ -351,19 +352,27 @@ export function enhanceDiagramSvg(svgCode: string): string {
     // Check if single-line text overflows container/viewBox width
     if (hasViewBox && textX !== null && textY !== null) {
       const normalizedFlat = normalizeSvgLatexCommands(plainText);
-      const estW = estimateTextWidthUnits(normalizedFlat, fontSize);
+      const isBold =
+        /font-weight\s*=\s*["']?(?:bold|[6-9]00)/i.test(attrs) ||
+        /font-weight\s*:\s*(?:bold|[6-9]00)/i.test(attrs);
+      const estW = estimateTextWidthUnits(normalizedFlat, fontSize) * (isBold ? 1.08 : 1);
       const enclosingRect = rects.find(
         (r) => textX >= r.x && textX <= r.x + r.w && textY >= r.y && textY <= r.y + r.h + 8
       );
+      const leftBoundary = enclosingRect ? enclosingRect.x + 14 : vbX + 14;
       const rightBoundary = enclosingRect ? enclosingRect.x + enclosingRect.w - 14 : vbX + vbW - 14;
       const availableWidth =
         anchor === 'middle'
-          ? Math.min(textX - vbX, rightBoundary - textX) * 2 - 12
+          ? Math.min(textX - leftBoundary, rightBoundary - textX) * 2
           : anchor === 'end'
-            ? textX - vbX - 14
+            ? textX - leftBoundary
             : rightBoundary - textX;
 
-      if (availableWidth > fontSize * 6 && estW > availableWidth + 4 && normalizedFlat.length > 22) {
+      if (
+        availableWidth > fontSize * 5 &&
+        estW > availableWidth + 2 &&
+        (enclosingRect ? normalizedFlat.length > 12 : normalizedFlat.length > 22)
+      ) {
         const lines = wrapLongTextLines(plainText, availableWidth, fontSize);
         if (lines.length > 1) {
           const lineStep = Math.round(fontSize * 1.45);
@@ -392,6 +401,21 @@ export function enhanceDiagramSvg(svgCode: string): string {
             })
             .join('');
           return `<text${attrs}>${wrappedTspans}</text>`;
+        } else if (enclosingRect && estW > availableWidth + 2) {
+          // Single-line formula/label that couldn't wrap cleanly: widen enclosing rect symmetrically
+          const neededW = Math.min(vbW - 16, Math.ceil(estW + 28));
+          if (neededW > enclosingRect.w) {
+            const centerX = enclosingRect.x + enclosingRect.w / 2;
+            const newX = Math.max(vbX + 8, Math.min(vbX + vbW - 8 - neededW, Math.round(centerX - neededW / 2)));
+            rectExpandWidthMap.set(enclosingRect.fullMatch, { x: newX, w: neededW });
+          }
+        }
+      } else if (enclosingRect && estW > enclosingRect.w - 20) {
+        const neededW = Math.min(vbW - 16, Math.ceil(estW + 28));
+        if (neededW > enclosingRect.w) {
+          const centerX = enclosingRect.x + enclosingRect.w / 2;
+          const newX = Math.max(vbX + 8, Math.min(vbX + vbW - 8 - neededW, Math.round(centerX - neededW / 2)));
+          rectExpandWidthMap.set(enclosingRect.fullMatch, { x: newX, w: neededW });
         }
       }
     }
@@ -399,19 +423,31 @@ export function enhanceDiagramSvg(svgCode: string): string {
     return `<text${attrs}>${formatSvgTextContentToTspans(inner)}</text>`;
   });
 
-  // Expand enclosing rects whose text wrapped onto extra lines
-  for (const [origRect, extraH] of rectExtraMap.entries()) {
-    if (extraH <= 0) continue;
-    const hMatch = origRect.match(/height\s*=\s*(?:"([^"]+)"|'([^']+)')/i);
-    if (hMatch) {
-      const oldH = parseFloat(hMatch[1] ?? hMatch[2] ?? '0');
-      if (Number.isFinite(oldH)) {
-        const updatedRect = origRect.replace(
-          /height\s*=\s*(?:"[^"]+"|'[^']+')/i,
-          `height="${Math.ceil(oldH + extraH)}"`
-        );
-        output = output.replace(origRect, updatedRect);
+  // Expand enclosing rects whose text wrapped onto extra lines or overflowed horizontally
+  const allAffectedRects = new Set<string>([...rectExtraMap.keys(), ...rectExpandWidthMap.keys()]);
+  for (const origRect of allAffectedRects) {
+    const extraH = rectExtraMap.get(origRect) || 0;
+    const expandW = rectExpandWidthMap.get(origRect);
+    let updatedRect = origRect;
+    if (extraH > 0) {
+      const hMatch = updatedRect.match(/height\s*=\s*(?:"([^"]+)"|'([^']+)')/i);
+      if (hMatch) {
+        const oldH = parseFloat(hMatch[1] ?? hMatch[2] ?? '0');
+        if (Number.isFinite(oldH)) {
+          updatedRect = updatedRect.replace(
+            /height\s*=\s*(?:"[^"]+"|'[^']+')/i,
+            `height="${Math.ceil(oldH + extraH)}"`
+          );
+        }
       }
+    }
+    if (expandW) {
+      updatedRect = updatedRect
+        .replace(/\bx\s*=\s*(?:"[^"]+"|'[^']+')/i, `x="${expandW.x}"`)
+        .replace(/\bwidth\s*=\s*(?:"[^"]+"|'[^']+')/i, `width="${expandW.w}"`);
+    }
+    if (updatedRect !== origRect) {
+      output = output.replace(origRect, updatedRect);
     }
   }
 

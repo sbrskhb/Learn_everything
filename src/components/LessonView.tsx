@@ -62,7 +62,10 @@ import {
   resolveSlotPdfSegments,
 } from '../utils/learningLogic';
 import {
+  detectPastedCoursewareInputKind,
   detectUnresolvedImageRefs,
+  extractPendingDiagramSpecs,
+  mergeStage2DiagramsIntoStage1,
   parseImportedLessonContent,
   resolveLessonAssetReferences,
   stripAiCitationArtifacts,
@@ -80,7 +83,10 @@ import {
   lookupSymbolInIndex,
   type ResolvedLessonSymbol,
 } from '../utils/latexSymbols';
-import { copyCourseFileToClipboard } from '../utils/clipboardFile';
+import {
+  copyCourseFileToClipboard,
+  copyPromptMarkdownFileToClipboard,
+} from '../utils/clipboardFile';
 import { generateLessonWithProgressStream } from '../utils/streamLessonClient';
 import type { GenerationProgressEvent } from '../utils/streamProgress';
 
@@ -141,8 +147,12 @@ export const LessonView: React.FC<LessonViewProps> = ({
     course.generationMode === 'agent' ? 'agent' : 'chat'
   );
   const [chatLessonPrompt, setChatLessonPrompt] = useState<string>('');
+  const [chatStage1Prompt, setChatStage1Prompt] = useState<string>('');
+  const [chatStage2Prompt, setChatStage2Prompt] = useState<string>('');
   const [isLoadingChatPrompt, setIsLoadingChatPrompt] = useState(false);
   const [copiedPrompt, setCopiedPrompt] = useState(false);
+  const [copiedMdKey, setCopiedMdKey] = useState<string | null>(null);
+  const [showChatManualPaste, setShowChatManualPaste] = useState(false);
 
   // Inline Agent Mode states (same level as Chat Mode, no modal popup required)
   const [agentPromptText, setAgentPromptText] = useState<string>('');
@@ -220,7 +230,6 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
   // Automatic render audit & repair prompt UI states
   const [copiedImportRepairPrompt, setCopiedImportRepairPrompt] = useState(false);
-  const [showImportRepairPromptPreview, setShowImportRepairPromptPreview] = useState(false);
   const [copiedActiveRepairPrompt, setCopiedActiveRepairPrompt] = useState(false);
   const [copiedStageKey, setCopiedStageKey] = useState<LessonGenerationStage | null>(null);
   const [stageRepairPreview, setStageRepairPreview] = useState<{
@@ -330,6 +339,8 @@ export const LessonView: React.FC<LessonViewProps> = ({
     setQuickRepairInput('');
     setQuickRepairNotice(null);
     setImportReplaceHint(null);
+    setShowChatManualPaste(false);
+    setCopiedMdKey(null);
     const sub = getSlotExerciseSubmission(course, slot);
     setUserAnswers(sub?.userAnswers || {});
     setIsSubmitted(Boolean(sub));
@@ -454,6 +465,8 @@ export const LessonView: React.FC<LessonViewProps> = ({
       .then((res) => res.json())
       .then((data) => {
         if (data.lessonPrompt) setChatLessonPrompt(data.lessonPrompt);
+        setChatStage1Prompt(data.stage1Prompt || data.lessonPrompt || '');
+        setChatStage2Prompt(data.stage2Prompt || '');
         if (data.agentStage1Prompt) setAgentStage1Prompt(data.agentStage1Prompt);
         if (data.agentStage2Prompt) {
           setAgentStage2Prompt(data.agentStage2Prompt);
@@ -489,14 +502,53 @@ export const LessonView: React.FC<LessonViewProps> = ({
       });
   }, [course.id, slot.dayIndex]);
 
+  const isStage2PendingChat = Boolean(slot.stage1Draft && !slot.lesson && chatStage2Prompt);
+  const effectiveChatStepPrompt = isStage2PendingChat
+    ? chatStage2Prompt
+    : chatStage1Prompt || chatLessonPrompt;
+
+  const handleCopyMdPromptFile = async (
+    feedbackKey: string,
+    fileName: string,
+    content: string
+  ) => {
+    if (!content) return;
+    setImportError(null);
+    try {
+      const result = await copyPromptMarkdownFileToClipboard(course.id, fileName, content);
+      setCopiedMdKey(feedbackKey);
+      window.setTimeout(
+        () => setCopiedMdKey((prev) => (prev === feedbackKey ? null : prev)),
+        2500
+      );
+      if (result.copiedToOsClipboard) {
+        setImportReplaceHint(
+          `已将 ${result.fileName || fileName} 作为文件复制到系统剪贴板，可直接 Ctrl+V 发送给 AI。`
+        );
+      } else {
+        setImportReplaceHint(
+          result.reason || `当前环境已触发下载 ${result.fileName || fileName}。`
+        );
+      }
+    } catch (err: any) {
+      setImportError(err?.message || '复制 .md 提示词文件失败');
+    }
+  };
+
   const handleQuickCopySectionPrompt = async () => {
     try {
-      let promptToCopy = chatLessonPrompt;
+      let promptToCopy = effectiveChatStepPrompt;
       if (!promptToCopy) {
         const res = await fetch(`/api/courses/${course.id}/days/${slot.dayIndex}/chat-prompt`);
         const data = await res.json();
-        promptToCopy = data.lessonPrompt || '';
-        if (promptToCopy) setChatLessonPrompt(promptToCopy);
+        promptToCopy =
+          (slot.stage1Draft && !slot.lesson && data.stage2Prompt) ||
+          data.stage1Prompt ||
+          data.lessonPrompt ||
+          '';
+        if (data.lessonPrompt) setChatLessonPrompt(data.lessonPrompt);
+        if (data.stage1Prompt) setChatStage1Prompt(data.stage1Prompt);
+        if (data.stage2Prompt) setChatStage2Prompt(data.stage2Prompt);
       }
       if (promptToCopy) {
         await navigator.clipboard.writeText(promptToCopy);
@@ -578,10 +630,46 @@ export const LessonView: React.FC<LessonViewProps> = ({
     [course.customAssets, pendingAssets]
   );
 
-  const importAuditResult = useMemo(
-    () => auditRawCoursewareInput(rawImportInput, slot, combinedAssets),
-    [rawImportInput, slot, combinedAssets]
-  );
+  const importAuditResult = useMemo(() => {
+    const trimmed = rawImportInput.trim();
+    if (!trimmed) return null;
+    const baseForPatch = slot.stage1Draft || slot.lesson || previewLesson || null;
+    const kind = detectPastedCoursewareInputKind(trimmed, {
+      hasStage1Draft: Boolean(slot.stage1Draft && !slot.lesson),
+      hasBaseLesson: Boolean(baseForPatch),
+    });
+    if (kind === 'stage2' && slot.stage1Draft) {
+      try {
+        const merged = mergeStage2DiagramsIntoStage1(slot.stage1Draft, trimmed, combinedAssets);
+        return {
+          report: auditCoursewareRendering(merged.mergedLesson, combinedAssets, {
+            stage: 'complete',
+          }),
+          parsedLesson: merged.mergedLesson,
+        };
+      } catch {
+        // fallback below
+      }
+    }
+    if (kind === 'patch' && baseForPatch) {
+      try {
+        const patched = applyCoursewareRepairPatch(baseForPatch, trimmed, slot, combinedAssets);
+        const stillStage1 =
+          !slot.lesson && extractPendingDiagramSpecs(patched.mergedLesson).length > 0;
+        return {
+          report: auditCoursewareRendering(patched.mergedLesson, combinedAssets, {
+            stage: stillStage1 ? 'stage1' : 'complete',
+          }),
+          parsedLesson: patched.mergedLesson,
+        };
+      } catch {
+        // fallback below
+      }
+    }
+    return auditRawCoursewareInput(trimmed, slot, combinedAssets, {
+      stage: kind === 'stage1' ? 'stage1' : 'complete',
+    });
+  }, [rawImportInput, slot, previewLesson, combinedAssets]);
 
   const quickRepairAuditResult = useMemo(() => {
     const trimmed = quickRepairInput.trim();
@@ -1188,18 +1276,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
     }
   };
 
-  const handleDownloadAgentPromptInline = () => {
-    if (!effectiveAgentInlinePrompt) return;
-    const blob = new Blob([effectiveAgentInlinePrompt], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${course.folderName || course.name}_${slot.id}_agent-${agentInlineStage}-prompt.md`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  };
+
 
   const handleSyncAgentDirectoryInline = async () => {
     setIsSyncingAgent(true);
@@ -1307,10 +1384,16 @@ export const LessonView: React.FC<LessonViewProps> = ({
     }
   };
 
-  const handleCopyChatPrompt = async () => {
-    if (!chatLessonPrompt) return;
+  const handleCopyChatPrompt = async (stageOverride?: 'stage1' | 'stage2') => {
+    const textToCopy =
+      stageOverride === 'stage1'
+        ? chatStage1Prompt || chatLessonPrompt
+        : stageOverride === 'stage2'
+        ? chatStage2Prompt
+        : effectiveChatStepPrompt;
+    if (!textToCopy) return;
     try {
-      await navigator.clipboard.writeText(chatLessonPrompt);
+      await navigator.clipboard.writeText(textToCopy);
       setCopiedPrompt(true);
       setTimeout(() => setCopiedPrompt(false), 2000);
     } catch {
@@ -1318,29 +1401,145 @@ export const LessonView: React.FC<LessonViewProps> = ({
     }
   };
 
-  const handleDownloadChatPrompt = () => {
-    if (!chatLessonPrompt) return;
-    const blob = new Blob([chatLessonPrompt], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${course.name}_day-${String(slot.dayIndex).padStart(2, '0')}_CHAT_PROMPT.md`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+  const handleProcessChatImportText = async (
+    rawTextInput: string,
+    autoSaveIfClean = true
+  ) => {
+    const trimmed = rawTextInput.trim();
+    if (!trimmed) {
+      setImportError('粘贴的 AI 输出内容为空，请先复制 AI 回复。');
+      return;
+    }
+    setImportError(null);
+    setImportSuccessMsg(null);
+    setImportReplaceHint(null);
+
+    try {
+      const hasStage1 = Boolean(slot.stage1Draft && !slot.lesson);
+      const baseForPatch = previewLesson || slot.stage1Draft || slot.lesson || null;
+      const kind = detectPastedCoursewareInputKind(trimmed, {
+        hasStage1Draft: hasStage1,
+        hasBaseLesson: Boolean(baseForPatch),
+      });
+
+      let targetLesson: DailyLessonContent | null = null;
+      let issuesCount = 0;
+      let importStageToSave: 'stage1' | 'stage2_merge' | 'complete' = 'complete';
+      let note = '';
+
+      if (kind === 'stage2') {
+        if (!slot.stage1Draft) {
+          setRawImportInput(trimmed);
+          setImportError('检测到阶段二 SVG 输出，但本节尚未保存阶段一底稿，请先导入阶段一内容。');
+          return;
+        }
+        const merged = mergeStage2DiagramsIntoStage1(slot.stage1Draft, trimmed, combinedAssets);
+        const report = auditCoursewareRendering(merged.mergedLesson, combinedAssets, {
+          stage: 'complete',
+        });
+        targetLesson = merged.mergedLesson;
+        issuesCount = report.issues.length;
+        importStageToSave = 'stage2_merge';
+        note = `自动识别为阶段二 SVG · 组装 ${merged.matchedCount + merged.addedCount} 张图示`;
+      } else if (kind === 'patch' && baseForPatch) {
+        const patched = applyCoursewareRepairPatch(baseForPatch, trimmed, slot, combinedAssets);
+        const isStage1Remaining =
+          !slot.lesson && extractPendingDiagramSpecs(patched.mergedLesson).length > 0;
+        const report = auditCoursewareRendering(patched.mergedLesson, combinedAssets, {
+          stage: isStage1Remaining ? 'stage1' : 'complete',
+        });
+        targetLesson = patched.mergedLesson;
+        issuesCount = report.issues.length;
+        importStageToSave = isStage1Remaining ? 'stage1' : 'complete';
+        note = patched.appliedSummary;
+      } else {
+        const check = auditRawCoursewareInput(trimmed, slot, combinedAssets, {
+          stage: kind === 'stage1' ? 'stage1' : 'complete',
+        });
+        if (check) {
+          targetLesson = check.parsedLesson;
+          issuesCount = check.report.issues.length;
+        } else {
+          const parsedFallback = parseImportedLessonContent(trimmed, slot, 'chat', combinedAssets, {
+            stageMode: kind === 'stage1' ? 'stage1' : 'auto',
+          });
+          targetLesson = parsedFallback.lesson;
+        }
+        if (
+          targetLesson &&
+          kind === 'stage1' &&
+          extractPendingDiagramSpecs(targetLesson).length > 0
+        ) {
+          importStageToSave = 'stage1';
+          note = '自动识别为阶段一正文与图示规格';
+        }
+      }
+
+      if (targetLesson) {
+        setPreviewLesson(targetLesson);
+        setUnresolvedImages(detectUnresolvedImageRefs(targetLesson.markdownBody || '', combinedAssets));
+      }
+
+      if (issuesCount > 0 || !targetLesson) {
+        setRawImportInput(trimmed);
+        setImportReplaceHint(
+          targetLesson
+            ? `检测到 ${issuesCount} 处可局部修复的问题，可复制下方增量修复提示词（或 .md 文件），修复后再次点击粘贴。`
+            : '检测到 JSON 语法错误，请复制下方修复提示词（或 .md 文件）让 AI 修复后再粘贴。'
+        );
+        return;
+      }
+
+      if (!autoSaveIfClean) {
+        setRawImportInput(trimmed);
+        return;
+      }
+
+      setIsSavingImport(true);
+      const res = await fetch(`/api/courses/${course.id}/days/${slot.dayIndex}/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          rawContent: trimmed,
+          lessonData: targetLesson,
+          uploadedAssets: pendingAssets,
+          sourceMode: 'chat',
+          importStage: importStageToSave,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || '导入保存本节课件失败');
+      }
+      setRawImportInput('');
+      setShowChatManualPaste(false);
+      onCourseUpdated(data.course);
+      if (importStageToSave === 'stage1') {
+        setPreviewLesson(null);
+        setImportSuccessMsg(
+          `已自动识别并保存阶段一成果，请继续复制上方「阶段二 SVG」提示词或 .md 文件发给 AI（无需重传 PDF）。`
+        );
+      } else {
+        setPreviewLesson(null);
+        setIsChatWorkbenchOpen(false);
+        setImportSuccessMsg(
+          note ? `已自动识别并保存本节课件（${note}）。` : '本节课件已保存并同步到本地文件夹。'
+        );
+      }
+    } catch (err: any) {
+      setRawImportInput(trimmed);
+      setImportError(err?.message || '自动识别或导入失败，请检查内容格式');
+    } finally {
+      setIsSavingImport(false);
+    }
   };
 
   const handleImportFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     try {
-      const text = await file.text();
-      setRawImportInput(text);
-      setImportError(null);
-      const parsed = parseImportedLessonContent(text, slot, 'chat', combinedAssets);
-      setPreviewLesson(parsed.lesson);
-      setUnresolvedImages(parsed.unresolvedImageRefs);
+      const fileText = await file.text();
+      await handleProcessChatImportText(fileText, true);
     } catch (err: any) {
       setImportError(err?.message || '读取导入文件失败');
     } finally {
@@ -1509,7 +1708,6 @@ export const LessonView: React.FC<LessonViewProps> = ({
   };
 
   const handlePasteClipboardToQuickRepair = async () => {
-    setShowQuickRepairBox(true);
     setQuickRepairNotice(null);
     try {
       if (!navigator.clipboard?.readText) {
@@ -1517,9 +1715,10 @@ export const LessonView: React.FC<LessonViewProps> = ({
       }
       const clipText = (await navigator.clipboard.readText()).trim();
       if (!clipText) {
+        setShowQuickRepairBox(true);
         setQuickRepairNotice({
           ok: false,
-          message: '剪贴板当前为空，请先复制 AI 返回的增量补丁或修复内容，再点击或在下方输入框直接 Ctrl+V。',
+          message: '剪贴板当前为空，请先复制 AI 返回的增量补丁或修复内容后再试。',
         });
         window.setTimeout(() => quickRepairBoxRef.current?.focus(), 40);
         return;
@@ -1533,9 +1732,10 @@ export const LessonView: React.FC<LessonViewProps> = ({
             await handleApplyQuickRepair(clipText);
             return;
           }
+          setShowQuickRepairBox(true);
           setQuickRepairNotice({
             ok: false,
-            message: `${patched.appliedSummary}，但仍余 ${postAudit.errorCount} 处问题，请核对下方提示或点击“立即应用补丁并保存”。`,
+            message: `${patched.appliedSummary}，但仍余 ${postAudit.errorCount} 处问题，请核对下方提示或再次粘贴修复。`,
           });
           return;
         } catch {
@@ -1545,16 +1745,20 @@ export const LessonView: React.FC<LessonViewProps> = ({
       const check = auditRawCoursewareInput(clipText, slot, combinedAssets);
       if (check && check.parsedLesson && check.report.errorCount === 0) {
         await handleApplyQuickRepair(clipText);
-      } else if (check && check.report.issues.length > 0) {
-        setQuickRepairNotice({
-          ok: false,
-          message: `已粘贴剪贴板内容，但仍检测到 ${check.report.errorCount} 处问题，请核对下方提示或手动修改后再应用。`,
-        });
+      } else {
+        setShowQuickRepairBox(true);
+        if (check && check.report.issues.length > 0) {
+          setQuickRepairNotice({
+            ok: false,
+            message: `已读取剪贴板内容，但仍检测到 ${check.report.errorCount} 处问题，请核对下方提示后重新修复。`,
+          });
+        }
       }
     } catch {
+      setShowQuickRepairBox(true);
       setQuickRepairNotice({
         ok: false,
-        message: '浏览器未授予自动读取剪贴板权限，请直接在下方输入框按 Ctrl+V / Cmd+V 粘贴后点击“立即应用补丁并保存”。',
+        message: '浏览器未授予自动读取剪贴板权限，请在下方临时粘贴框按 Ctrl+V / Cmd+V 粘贴后点击应用。',
       });
       window.setTimeout(() => quickRepairBoxRef.current?.focus(), 40);
     }
@@ -1562,24 +1766,20 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
   const handlePasteClipboardToImportBox = async () => {
     setImportReplaceHint(null);
+    setImportError(null);
     try {
       if (!navigator.clipboard?.readText) {
         throw new Error('no-clipboard-read');
       }
       const clipText = (await navigator.clipboard.readText()).trim();
       if (!clipText) {
-        setImportReplaceHint('剪贴板为空，请先复制 AI 修复后的内容，再粘贴到上方输入框。');
-        chatImportBoxRef.current?.focus();
+        setImportError('剪贴板当前为空，请先复制外部 AI 生成或修复的内容后再点击。');
         return;
       }
-      setRawImportInput(clipText);
-      setImportError(null);
-      setPreviewLesson(null);
-      setImportReplaceHint('已从剪贴板替换上方输入内容并自动完成重检。');
+      await handleProcessChatImportText(clipText, true);
     } catch {
-      setRawImportInput('');
-      setPreviewLesson(null);
-      setImportReplaceHint('已清空上方输入框并聚焦，请直接按 Ctrl+V / Cmd+V 粘贴 AI 修复后的内容。');
+      setShowChatManualPaste(true);
+      setImportReplaceHint('浏览器未开放自动读取剪贴板权限，请在下方临时粘贴框按 Ctrl+V 后点击“识别并导入”。');
       window.setTimeout(() => chatImportBoxRef.current?.focus(), 30);
     }
   };
@@ -2358,7 +2558,34 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     ) : (
                       <>
                         <Copy className="w-3.5 h-3.5" />
-                        <span>复制本节生成提示词</span>
+                        <span>
+                          {isStage2PendingChat ? '复制阶段二 SVG 提示词' : '复制本节生成提示词'}
+                        </span>
+                      </>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleCopyMdPromptFile(
+                        'quick-prompt-md',
+                        `${slot.id}-${isStage2PendingChat ? 'stage2' : 'stage1'}-prompt.md`,
+                        effectiveChatStepPrompt
+                      )
+                    }
+                    disabled={!effectiveChatStepPrompt}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-200 hover:text-white rounded transition-colors whitespace-nowrap disabled:opacity-45"
+                    title="将提示词保存为 .md 文件并复制到系统剪贴板"
+                  >
+                    {copiedMdKey === 'quick-prompt-md' ? (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>已复制 .md</span>
+                      </>
+                    ) : (
+                      <>
+                        <FileText className="w-3.5 h-3.5" />
+                        <span>复制提示词 .md</span>
                       </>
                     )}
                   </button>
@@ -2740,27 +2967,30 @@ export const LessonView: React.FC<LessonViewProps> = ({
                       </button>
                       <button
                         type="button"
-                        onClick={handleDownloadAgentPromptInline}
+                        onClick={() =>
+                          handleCopyMdPromptFile(
+                            `agent-inline-${agentInlineStage}-md`,
+                            `${slot.id}-agent-${agentInlineStage}-prompt.md`,
+                            effectiveAgentInlinePrompt
+                          )
+                        }
                         disabled={(isLoadingAgentPrompt && isLoadingChatPrompt) || !effectiveAgentInlinePrompt}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-300 rounded transition-colors whitespace-nowrap"
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap disabled:opacity-45"
                       >
-                        <Download className="w-3.5 h-3.5" />
-                        <span>导出 (.md)</span>
+                        {copiedMdKey === `agent-inline-${agentInlineStage}-md` ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            <span>已复制 .md</span>
+                          </>
+                        ) : (
+                          <>
+                            <FileText className="w-3.5 h-3.5" />
+                            <span>复制 .md 文件</span>
+                          </>
+                        )}
                       </button>
                     </div>
                   </div>
-
-                  <textarea
-                    id="agent-inline-prompt-box"
-                    readOnly
-                    rows={7}
-                    value={
-                      isLoadingChatPrompt && !effectiveAgentInlinePrompt
-                        ? '正在生成本节独立 Agent 执行提示词...'
-                        : effectiveAgentInlinePrompt
-                    }
-                    className="w-full bg-black border border-neutral-800 rounded p-3 text-xs font-mono text-neutral-300 leading-relaxed focus:outline-none"
-                  />
                 </div>
 
                 <div className="space-y-3 pt-2 border-t border-neutral-900">
@@ -2888,73 +3118,123 @@ export const LessonView: React.FC<LessonViewProps> = ({
                           </a>
                         </>
                       ) : null}
-                      <button
-                        type="button"
-                        onClick={handleCopyChatPrompt}
-                        disabled={isLoadingChatPrompt}
-                        className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors whitespace-nowrap"
-                      >
-                        {copiedPrompt ? (
-                          <>
-                            <Check className="w-3.5 h-3.5" />
-                            <span>已复制提示词</span>
-                          </>
-                        ) : (
-                          <>
-                            <Copy className="w-3.5 h-3.5" />
-                            <span>一键复制提示词</span>
-                          </>
-                        )}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleDownloadChatPrompt}
-                        disabled={isLoadingChatPrompt}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-300 rounded transition-colors whitespace-nowrap"
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                        <span>导出 (.md)</span>
-                      </button>
+                      {isStage2PendingChat ? (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => handleCopyChatPrompt('stage2')}
+                            disabled={isLoadingChatPrompt}
+                            className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors whitespace-nowrap"
+                          >
+                            {copiedPrompt ? (
+                              <>
+                                <Check className="w-3.5 h-3.5" />
+                                <span>已复制阶段二提示词</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" />
+                                <span>复制阶段二 SVG 提示词</span>
+                              </>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleCopyMdPromptFile(
+                                'chat-stage2-md',
+                                `${slot.id}-stage2-prompt.md`,
+                                chatStage2Prompt
+                              )
+                            }
+                            disabled={isLoadingChatPrompt || !chatStage2Prompt}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
+                          >
+                            {copiedMdKey === 'chat-stage2-md' ? (
+                              <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            ) : (
+                              <FileText className="w-3.5 h-3.5" />
+                            )}
+                            <span>{copiedMdKey === 'chat-stage2-md' ? '已复制 .md' : '复制阶段二 .md'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleCopyChatPrompt('stage1')}
+                            disabled={isLoadingChatPrompt}
+                            className="inline-flex items-center gap-1 px-2 py-1 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-400 hover:text-neutral-200 rounded transition-colors whitespace-nowrap"
+                          >
+                            <span>重复制阶段一</span>
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => handleCopyChatPrompt('stage1')}
+                            disabled={isLoadingChatPrompt}
+                            className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors whitespace-nowrap"
+                          >
+                            {copiedPrompt ? (
+                              <>
+                                <Check className="w-3.5 h-3.5" />
+                                <span>已复制提示词</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" />
+                                <span>复制阶段一提示词</span>
+                              </>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleCopyMdPromptFile(
+                                'chat-stage1-md',
+                                `${slot.id}-stage1-prompt.md`,
+                                chatStage1Prompt || chatLessonPrompt
+                              )
+                            }
+                            disabled={isLoadingChatPrompt || !(chatStage1Prompt || chatLessonPrompt)}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
+                          >
+                            {copiedMdKey === 'chat-stage1-md' ? (
+                              <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            ) : (
+                              <FileText className="w-3.5 h-3.5" />
+                            )}
+                            <span>{copiedMdKey === 'chat-stage1-md' ? '已复制 .md' : '复制阶段一 .md'}</span>
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
-
-                  <textarea
-                    id="chat-prompt-box"
-                    readOnly
-                    rows={7}
-                    value={
-                      isLoadingChatPrompt
-                        ? '正在生成针对本节的完整提示词...'
-                        : chatLessonPrompt
-                    }
-                    className="w-full bg-black border border-neutral-800 rounded p-3 text-xs font-mono text-neutral-300 leading-relaxed focus:outline-none"
-                  />
                 </div>
 
-                {/* 步骤 2：粘贴 AI 输出或通过文件导入 */}
-                <div className="space-y-2 pt-2 border-t border-neutral-900">
+                {/* 步骤 2：一键粘贴 AI 输出（自动识别阶段一 / 阶段二 / 修复补丁） */}
+                <div className="space-y-2.5 pt-2 border-t border-neutral-900">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <label
-                      htmlFor="chat-import-box"
-                      className="text-xs font-medium text-neutral-300"
-                    >
-                      第二步：将外部 AI 生成的回复粘贴到下方（支持完整 JSON 代码块或含 LaTeX / SVG 的 Markdown），或通过文件导入
-                    </label>
+                    <span className="text-xs font-medium text-neutral-300">
+                      第二步：{isStage2PendingChat
+                        ? '阶段一已就绪，点击下方按钮粘贴阶段二 SVG 输出并自动组装完成：'
+                        : '点击粘贴 AI 输出（自动识别阶段一 / 阶段二 / 修复补丁 / 完整课件）：'}
+                    </span>
 
                     <div className="flex flex-wrap items-center gap-2">
                       <button
                         type="button"
                         data-testid="chat-step2-clipboard-paste-btn"
                         onClick={handlePasteClipboardToImportBox}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 hover:text-white rounded transition-colors whitespace-nowrap"
+                        disabled={isSavingImport}
+                        className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium bg-sky-400 text-black hover:bg-sky-300 rounded transition-colors whitespace-nowrap disabled:opacity-50"
                       >
-                        <Copy className="w-3.5 h-3.5" />
-                        <span>从剪贴板一键粘贴</span>
+                        <Check className="w-3.5 h-3.5" />
+                        <span>{isSavingImport ? '识别保存中...' : '粘贴 AI 输出并自动识别导入'}</span>
                       </button>
 
                       <label className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded cursor-pointer transition-colors whitespace-nowrap">
                         <Upload className="w-3.5 h-3.5" />
-                        <span>从文件导入 (.json / .md / .txt)</span>
+                        <span>导入文件 (.json/.md)</span>
                         <input
                           type="file"
                           accept=".json,.md,.txt"
@@ -2965,7 +3245,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
                       <label className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded cursor-pointer transition-colors whitespace-nowrap">
                         <ImagePlus className="w-3.5 h-3.5" />
-                        <span>补充上传课件图片</span>
+                        <span>补充图片</span>
                         <input
                           type="file"
                           accept="image/*"
@@ -2977,18 +3257,42 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     </div>
                   </div>
 
-                  <textarea
-                    ref={chatImportBoxRef}
-                    id="chat-import-box"
-                    rows={7}
-                    value={rawImportInput}
-                    onChange={(e) => {
-                      setRawImportInput(e.target.value);
-                      if (importReplaceHint) setImportReplaceHint(null);
-                    }}
-                    placeholder="在此粘贴外部 AI 输出的课件内容（支持 ```json ... ``` 代码块或完整 Markdown 讲义）..."
-                    className="w-full bg-black border border-neutral-800 rounded p-3 text-xs font-mono text-neutral-200 leading-relaxed focus:outline-none focus:border-neutral-500"
-                  />
+                  {showChatManualPaste && (
+                    <div className="bg-neutral-950 border border-neutral-800 rounded p-2.5 space-y-2">
+                      <div className="flex items-center justify-between text-[11px] text-neutral-400">
+                        <span>临时粘贴框（按 Ctrl+V 粘贴后点击识别导入）：</span>
+                        <button
+                          type="button"
+                          onClick={() => setShowChatManualPaste(false)}
+                          className="text-neutral-500 hover:text-neutral-300"
+                        >
+                          收起
+                        </button>
+                      </div>
+                      <textarea
+                        ref={chatImportBoxRef}
+                        id="chat-import-box"
+                        rows={5}
+                        value={rawImportInput}
+                        onChange={(e) => {
+                          setRawImportInput(e.target.value);
+                          if (importReplaceHint) setImportReplaceHint(null);
+                        }}
+                        placeholder="按 Ctrl+V 粘贴外部 AI 输出的阶段一 JSON / 阶段二 SVG / 补丁 / Markdown..."
+                        className="w-full bg-black border border-neutral-800 rounded p-2.5 text-xs font-mono text-neutral-200 leading-relaxed focus:outline-none focus:border-sky-500"
+                      />
+                      <div className="flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => handleProcessChatImportText(rawImportInput, true)}
+                          disabled={isSavingImport || !rawImportInput.trim()}
+                          className="px-3 py-1 text-xs font-medium bg-sky-400 text-black hover:bg-sky-300 rounded disabled:opacity-50"
+                        >
+                          识别并导入
+                        </button>
+                      </div>
+                    </div>
+                  )}
 
                   {/* 自动渲染与图示引用自检面板（输入课件内容后实时检测失败部分并生成修改提示词） */}
                   {importAuditResult && (
@@ -3021,17 +3325,6 @@ export const LessonView: React.FC<LessonViewProps> = ({
                           <div className="flex flex-wrap items-center gap-2">
                             <button
                               type="button"
-                              onClick={() =>
-                                setShowImportRepairPromptPreview((v) => !v)
-                              }
-                              className="px-2.5 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors"
-                            >
-                              {showImportRepairPromptPreview
-                                ? '收起增量补丁提示词'
-                                : '查看增量补丁提示词'}
-                            </button>
-                            <button
-                              type="button"
                               onClick={async () => {
                                 try {
                                   await navigator.clipboard.writeText(
@@ -3040,7 +3333,11 @@ export const LessonView: React.FC<LessonViewProps> = ({
                                   setCopiedImportRepairPrompt(true);
                                   setTimeout(() => setCopiedImportRepairPrompt(false), 2000);
                                 } catch {
-                                  setShowImportRepairPromptPreview(true);
+                                  await handleCopyMdPromptFile(
+                                    'import-repair-md',
+                                    `${slot.id}-repair-prompt.md`,
+                                    importAuditResult.report.repairPrompt
+                                  );
                                 }
                               }}
                               className="inline-flex items-center gap-1.5 px-3 py-1 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors"
@@ -3053,9 +3350,27 @@ export const LessonView: React.FC<LessonViewProps> = ({
                               ) : (
                                 <>
                                   <Copy className="w-3.5 h-3.5" />
-                                  <span>复制增量补丁提示词（无需重生成全文）</span>
+                                  <span>复制增量补丁提示词</span>
                                 </>
                               )}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleCopyMdPromptFile(
+                                  'import-repair-md',
+                                  `${slot.id}-repair-prompt.md`,
+                                  importAuditResult.report.repairPrompt
+                                )
+                              }
+                              className="inline-flex items-center gap-1.5 px-2.5 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors"
+                            >
+                              {copiedMdKey === 'import-repair-md' ? (
+                                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                              ) : (
+                                <FileText className="w-3.5 h-3.5" />
+                              )}
+                              <span>{copiedMdKey === 'import-repair-md' ? '已复制修复 .md' : '复制修复 .md'}</span>
                             </button>
                             <button
                               type="button"
@@ -3063,22 +3378,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                               onClick={handlePasteClipboardToImportBox}
                               className="px-2.5 py-1 border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 hover:text-white rounded transition-colors"
                             >
-                              从剪贴板一键替换并重检
-                            </button>
-                            <button
-                              type="button"
-                              data-testid="import-clear-focus-btn"
-                              onClick={() => {
-                                setRawImportInput('');
-                                setPreviewLesson(null);
-                                setImportReplaceHint(
-                                  '已清空上方输入框，请直接按 Ctrl+V / Cmd+V 粘贴 AI 修复后的内容。'
-                                );
-                                window.setTimeout(() => chatImportBoxRef.current?.focus(), 20);
-                              }}
-                              className="px-2.5 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-300 hover:text-white rounded transition-colors"
-                            >
-                              清空并聚焦粘贴
+                              重新从剪贴板粘贴
                             </button>
                           </div>
                         ) : (
@@ -3129,19 +3429,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                             ))}
                           </ul>
 
-                          {showImportRepairPromptPreview && (
-                            <div className="space-y-1 pt-1">
-                              <div className="text-[11px] text-neutral-400">
-                                可直接复制以下提示词发给 AI 修复上述错误（只改报错片段，保留其余正确内容）：
-                              </div>
-                              <textarea
-                                readOnly
-                                rows={7}
-                                value={importAuditResult.report.repairPrompt}
-                                className="w-full bg-black border border-neutral-800 rounded p-2.5 text-[11px] font-mono text-neutral-200 leading-relaxed focus:outline-none"
-                              />
-                            </div>
-                          )}
+
                         </>
                       )}
                     </div>
@@ -3297,7 +3585,11 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors"
                   >
                     <ListChecks className="w-3.5 h-3.5" />
-                    <span>打开课程工作台 (API 分步生成 / 切分)</span>
+                    <span>
+                      {currentMode === 'api'
+                        ? '打开课程工作台 (API 分步生成 / 切分)'
+                        : '打开课程工作台'}
+                    </span>
                   </button>
                 )}
 
@@ -3453,13 +3745,16 @@ export const LessonView: React.FC<LessonViewProps> = ({
                       <button
                         type="button"
                         onClick={async () => {
-                          setShowQuickRepairBox(true);
                           try {
                             await navigator.clipboard.writeText(activeLessonAudit.repairPrompt);
                             setCopiedActiveRepairPrompt(true);
                             setTimeout(() => setCopiedActiveRepairPrompt(false), 2000);
                           } catch {
-                            setShowActiveAuditDetails(true);
+                            await handleCopyMdPromptFile(
+                              'active-repair-md',
+                              `${slot.id}-repair-prompt.md`,
+                              activeLessonAudit.repairPrompt
+                            );
                           }
                         }}
                         className="inline-flex items-center gap-1.5 px-3 py-1 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors"
@@ -3467,32 +3762,41 @@ export const LessonView: React.FC<LessonViewProps> = ({
                         {copiedActiveRepairPrompt ? (
                           <>
                             <Check className="w-3.5 h-3.5 text-emerald-600" />
-                            <span>已复制增量补丁提示词（下方直接粘贴补丁）</span>
+                            <span>已复制增量补丁提示词</span>
                           </>
                         ) : (
                           <>
                             <Copy className="w-3.5 h-3.5" />
-                            <span>复制增量补丁提示词（仅修复错误部分）</span>
+                            <span>复制增量修复提示词</span>
                           </>
                         )}
                       </button>
                       <button
                         type="button"
-                        data-testid="toggle-quick-repair-btn"
-                        onClick={() => {
-                          const next = !showQuickRepairBox;
-                          setShowQuickRepairBox(next);
-                          if (next) {
-                            window.setTimeout(() => quickRepairBoxRef.current?.focus(), 40);
-                          }
-                        }}
-                        className={`px-2.5 py-1 border rounded transition-colors ${
-                          showQuickRepairBox
-                            ? 'border-sky-500/80 bg-sky-950/50 text-sky-200'
-                            : 'border-sky-800/80 hover:border-sky-500 text-sky-300 hover:text-white'
-                        }`}
+                        onClick={() =>
+                          handleCopyMdPromptFile(
+                            'active-repair-md',
+                            `${slot.id}-repair-prompt.md`,
+                            activeLessonAudit.repairPrompt
+                          )
+                        }
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors"
                       >
-                        {showQuickRepairBox ? '收起增量补丁粘贴框' : '粘贴增量修复补丁'}
+                        {copiedMdKey === 'active-repair-md' ? (
+                          <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        ) : (
+                          <FileText className="w-3.5 h-3.5" />
+                        )}
+                        <span>{copiedMdKey === 'active-repair-md' ? '已复制 .md' : '复制修复 .md'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        data-testid="toggle-quick-repair-btn"
+                        onClick={handlePasteClipboardToQuickRepair}
+                        disabled={isApplyingQuickRepair}
+                        className="px-2.5 py-1 border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 hover:text-white rounded transition-colors disabled:opacity-50"
+                      >
+                        {isApplyingQuickRepair ? '合并修复中...' : '粘贴增量修复补丁'}
                       </button>
                       <button
                         type="button"
@@ -3670,23 +3974,26 @@ export const LessonView: React.FC<LessonViewProps> = ({
                               {copiedStageKey === stage ? `✓ 已复制${label}` : label}
                             </button>
                           ))}
-                          {stageRepairPreview && (
-                            <button
-                              type="button"
-                              onClick={() => setStageRepairPreview(null)}
-                              className="px-2 py-0.5 rounded border border-neutral-800 text-[11px] text-neutral-400 hover:text-white"
-                            >
-                              查看综合补丁
-                            </button>
-                          )}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleCopyMdPromptFile(
+                                'active-stage-repair-md',
+                                `${slot.id}-${stageRepairPreview?.stage || 'repair'}-prompt.md`,
+                                stageRepairPreview?.prompt || activeLessonAudit.repairPrompt
+                              )
+                            }
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-neutral-700 hover:border-neutral-500 text-[11px] text-neutral-200 hover:text-white"
+                          >
+                            <FileText className="w-3 h-3" />
+                            <span>
+                              {copiedMdKey === 'active-stage-repair-md'
+                                ? '已复制 .md'
+                                : '复制修复 .md 文件'}
+                            </span>
+                          </button>
                         </div>
                       </div>
-                      <textarea
-                        readOnly
-                        rows={7}
-                        value={stageRepairPreview?.prompt || activeLessonAudit.repairPrompt}
-                        className="w-full bg-black border border-neutral-800 rounded p-2.5 text-[11px] font-mono text-neutral-200 leading-relaxed focus:outline-none"
-                      />
                     </div>
                   )}
                 </section>

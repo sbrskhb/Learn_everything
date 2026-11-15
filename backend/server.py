@@ -18,6 +18,7 @@ import mimetypes
 import os
 import platform
 import re
+import tempfile
 import shutil
 import signal
 import stat
@@ -489,11 +490,20 @@ def _copy_windows_file_clipboard_powershell(abs_path: str) -> None:
 
 def copy_file_to_os_clipboard(folder_name: str, rel_path: str) -> dict[str, Any]:
     course_dir = resolve_course_dir(folder_name)
+    norm_input = rel_path.replace("\\", "/").lstrip("/")
     target = resolve_course_file(course_dir, rel_path)
+    norm_rel = target.relative_to(course_dir).as_posix()
+
+    if (not target.exists() or not target.is_file()) and norm_input.startswith("segments/"):
+        temp_base = (Path(tempfile.gettempdir()) / "learn_everything_segments" / folder_name).resolve()
+        sub_rel = norm_input[len("segments/"):]
+        temp_candidate = (temp_base / sub_rel).resolve()
+        if temp_candidate.is_relative_to(temp_base) and temp_candidate.exists() and temp_candidate.is_file():
+            target = temp_candidate
+
     if not target.exists() or not target.is_file():
         raise FileNotFoundError(f"文件不存在: {rel_path}")
 
-    norm_rel = target.relative_to(course_dir).as_posix()
     abs_str = str(target)
     sys_name = platform.system()
 

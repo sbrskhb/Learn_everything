@@ -4,7 +4,9 @@ import {
   Archive,
   ArrowUp,
   ArrowUpRight,
+  BookOpen,
   Calendar,
+  Clock,
   FolderCog,
   FolderOpen,
   FolderSync,
@@ -13,6 +15,7 @@ import {
   Settings as SettingsIcon,
   Trash2,
   Upload,
+  X,
 } from 'lucide-react';
 import type {
   AppSettings,
@@ -149,6 +152,8 @@ export default function App() {
     step: OutlineWorkbenchStep;
   } | null>(null);
   const [deleteTargetCourseId, setDeleteTargetCourseId] = useState<string | null>(null);
+  const [scheduleCourseId, setScheduleCourseId] = useState<string | null>(null);
+  const [isAllCoursesModalOpen, setIsAllCoursesModalOpen] = useState(false);
 
   const [activeLessonRef, setActiveLessonRef] = useState<{
     courseId: string;
@@ -421,6 +426,30 @@ export default function App() {
     () => courses.find((c) => c.id === deleteTargetCourseId) || null,
     [courses, deleteTargetCourseId]
   );
+
+  const scheduleCourse = useMemo(
+    () => courses.find((c) => c.id === scheduleCourseId) || null,
+    [courses, scheduleCourseId]
+  );
+
+  const scheduleCourseDays = useMemo(() => {
+    if (!scheduleCourse) return [];
+    const byDate = new Map<string, typeof scheduleCourse.dailyPlan>();
+    for (const slot of scheduleCourse.dailyPlan) {
+      const key = slot.date || scheduleCourse.startDate || todayStr;
+      const list = byDate.get(key) || [];
+      list.push(slot);
+      byDate.set(key, list);
+    }
+    return Array.from(byDate.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, slots], idx) => ({
+        dayNumber: idx + 1,
+        date,
+        isToday: date === todayStr,
+        slots: [...slots].sort((a, b) => a.dayIndex - b.dayIndex),
+      }));
+  }, [scheduleCourse, todayStr]);
 
   const handleCourseCreated = (newCourse: Course) => {
     setCourses((prev) => [newCourse, ...prev]);
@@ -929,28 +958,36 @@ export default function App() {
 
                 <nav
                   aria-label="课程筛选"
-                  className="hidden md:flex items-center gap-5 text-xs text-neutral-400 overflow-x-auto"
+                  className="hidden md:flex items-center gap-3 text-xs text-neutral-400 overflow-x-auto"
                 >
                   <button
                     type="button"
-                    onClick={() => setSelectedCourseFilter('all')}
-                    className={`transition-colors whitespace-nowrap shrink-0 ${
-                      selectedCourseFilter === 'all'
-                        ? 'text-white underline underline-offset-4'
-                        : 'hover:text-neutral-200'
-                    }`}
+                    data-testid="view-all-courses-btn"
+                    onClick={() => setIsAllCoursesModalOpen(true)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-neutral-800 hover:border-sky-500/60 bg-neutral-950 text-neutral-200 hover:text-white font-medium transition-colors whitespace-nowrap shrink-0"
                   >
-                    全部日期安排 ({courses.length})
+                    <BookOpen className="w-3.5 h-3.5 text-sky-400" />
+                    <span>查看全部课程 ({courses.length})</span>
                   </button>
+                  {selectedCourseFilter !== 'all' && (
+                    <button
+                      type="button"
+                      onClick={() => setSelectedCourseFilter('all')}
+                      className="px-2.5 py-1.5 rounded-md border border-sky-500/40 bg-sky-950/30 text-sky-300 hover:text-white transition-colors whitespace-nowrap shrink-0"
+                    >
+                      显示全部日期
+                    </button>
+                  )}
                   {courses.map((c) => (
                     <button
                       key={c.id}
                       type="button"
-                      onClick={() => setSelectedCourseFilter(c.id)}
-                      className={`transition-colors whitespace-nowrap shrink-0 truncate max-w-[160px] ${
+                      onClick={() => setScheduleCourseId(c.id)}
+                      title={`点击按天查看《${c.name}》日程`}
+                      className={`px-2 py-1 rounded transition-colors whitespace-nowrap shrink-0 truncate max-w-[160px] ${
                         selectedCourseFilter === c.id
-                          ? 'text-white underline underline-offset-4'
-                          : 'hover:text-neutral-200'
+                          ? 'text-white bg-neutral-900 border border-neutral-700'
+                          : 'hover:text-neutral-200 hover:bg-neutral-900/60'
                       }`}
                     >
                       {c.name}
@@ -1042,17 +1079,27 @@ export default function App() {
             aria-label="已添加课程列表"
             className="mb-8 pb-6 border-b border-neutral-900 space-y-3"
           >
-            <div className="flex items-center justify-between">
-              <h2 className="text-xs font-medium text-neutral-500">
-                当前课程 ({courses.length})
-              </h2>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-3">
+                <h2 className="text-sm font-semibold text-neutral-200">
+                  当前课程 ({courses.length})
+                </h2>
+                <button
+                  type="button"
+                  onClick={() => setIsAllCoursesModalOpen(true)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-neutral-700 hover:border-sky-500/60 bg-neutral-950 text-neutral-200 hover:text-white rounded-md transition-colors"
+                >
+                  <BookOpen className="w-3.5 h-3.5 text-sky-400" />
+                  <span>查看全部课程</span>
+                </button>
+              </div>
               {selectedCourseFilter !== 'all' && (
                 <button
                   type="button"
                   onClick={() => setSelectedCourseFilter('all')}
-                  className="text-xs text-neutral-400 hover:text-white underline underline-offset-4"
+                  className="text-xs text-sky-400 hover:text-sky-300 underline underline-offset-4"
                 >
-                  显示全部课程
+                  取消单课筛选，显示全部日程
                 </button>
               )}
             </div>
@@ -1110,16 +1157,16 @@ export default function App() {
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div
-                        className="space-y-1 cursor-pointer flex-1 min-w-0"
-                        onClick={() =>
-                          setSelectedCourseFilter((prev) =>
-                            prev === course.id ? 'all' : course.id
-                          )
-                        }
+                        className="space-y-1 cursor-pointer flex-1 min-w-0 group"
+                        onClick={() => setScheduleCourseId(course.id)}
+                        title={`点击按天查看《${course.name}》学习日程`}
                       >
                         <div className="flex flex-wrap items-center gap-2 text-xs text-neutral-400 font-mono">
-                          <span className="text-white font-sans font-medium text-sm truncate">
+                          <span className="text-white group-hover:text-sky-300 font-sans font-medium text-sm truncate transition-colors">
                             {course.name}
+                          </span>
+                          <span className="text-[11px] text-sky-400/80 opacity-80 group-hover:opacity-100">
+                            按天日程 →
                           </span>
                           <span aria-hidden="true">·</span>
                           <span>{course.durationDays} 天计划</span>
@@ -1350,7 +1397,9 @@ export default function App() {
                         </span>
                         <ArrowUpRight className="w-3.5 h-3.5 opacity-55 group-hover:opacity-100 text-sky-400 transition-opacity" />
                       </div>
-                      {entry.isToday && (idx > 0 || courses.length > 0) && (
+                      {entry.isToday &&
+                        idx > 0 &&
+                        timeline.slice(0, idx).some((d) => d.items.length > 0) && (
                         <span className="hidden md:inline-flex items-center gap-1 text-[11px] font-mono text-neutral-600 pt-0.5">
                           <ArrowUp className="w-3 h-3" />
                           <span>向上滚动查看先前课程</span>
@@ -1586,6 +1635,407 @@ export default function App() {
           isOpen={isBrandShowcaseOpen}
           onClose={() => setIsBrandShowcaseOpen(false)}
         />
+
+        {/* 全部课程总览模态框（更大、更清晰的卡片与操作入口） */}
+        {isAllCoursesModalOpen && (
+          <div
+            className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 sm:p-6"
+            onClick={() => setIsAllCoursesModalOpen(false)}
+          >
+            <div
+              className="w-full max-w-5xl max-h-[86vh] bg-[#07090d] border border-neutral-800 rounded-xl shadow-2xl flex flex-col overflow-hidden"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="px-6 py-4 border-b border-neutral-900 flex items-center justify-between gap-4">
+                <div className="space-y-0.5">
+                  <h2 className="text-base font-semibold text-white flex items-center gap-2">
+                    <BookOpen className="w-4 h-4 text-sky-400" />
+                    <span>全部课程总览 ({courses.length})</span>
+                  </h2>
+                  <p className="text-xs text-neutral-400">
+                    点击任意课程即可按天查看完整学习日程，或筛选主时间轴与进入工作台
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsAllCoursesModalOpen(false);
+                      setIsAddCourseOpen(true);
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded-md transition-colors"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>添加课程</span>
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="关闭全部课程总览"
+                    onClick={() => setIsAllCoursesModalOpen(false)}
+                    className="p-1.5 text-neutral-400 hover:text-white rounded-md hover:bg-neutral-900 transition-colors"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-6">
+                {courses.length === 0 ? (
+                  <div className="py-16 text-center space-y-3">
+                    <p className="text-sm text-neutral-300">当前还没有任何课程</p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsAllCoursesModalOpen(false);
+                        setIsAddCourseOpen(true);
+                      }}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded-md"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>添加第一门课程</span>
+                    </button>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {courses.map((course) => {
+                      const totalSections = course.dailyPlan.length;
+                      const generatedCount = course.dailyPlan.filter((d) => Boolean(d.lesson)).length;
+                      const completedCount = course.dailyPlan.filter((d) =>
+                        Boolean(getSlotExerciseSubmission(course, d))
+                      ).length;
+                      const completedPct =
+                        totalSections > 0 ? Math.round((completedCount / totalSections) * 100) : 0;
+                      const readyPct =
+                        totalSections > 0 ? Math.round((generatedCount / totalSections) * 100) : 0;
+                      const dates = course.dailyPlan.map((d) => d.date).filter(Boolean).sort();
+                      const dateRange =
+                        dates.length > 0
+                          ? `${dates[0]} ~ ${dates[dates.length - 1]}`
+                          : `${course.startDate} 起（${course.durationDays} 天）`;
+
+                      return (
+                        <div
+                          key={course.id}
+                          onClick={() => {
+                            setIsAllCoursesModalOpen(false);
+                            setScheduleCourseId(course.id);
+                          }}
+                          className="group cursor-pointer border border-neutral-800 hover:border-sky-500/60 bg-black/70 hover:bg-neutral-950 rounded-xl p-5 space-y-4 transition-all"
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="space-y-1 min-w-0">
+                              <h3 className="text-base font-semibold text-white group-hover:text-sky-300 truncate transition-colors">
+                                {course.name}
+                              </h3>
+                              <p className="text-xs text-neutral-400 line-clamp-2">{course.goal}</p>
+                            </div>
+                            <span className="shrink-0 text-[11px] font-mono px-2 py-0.5 rounded border border-neutral-800 bg-neutral-950 text-neutral-300">
+                              {course.durationDays} 天计划
+                            </span>
+                          </div>
+
+                          <div className="space-y-2 text-xs font-mono text-neutral-400">
+                            <div className="flex items-center justify-between">
+                              <span>日程范围：{dateRange}</span>
+                              <span>
+                                已学完 {completedCount}/{totalSections} · 已就绪 {generatedCount}/{totalSections}
+                              </span>
+                            </div>
+                            <div className="h-1.5 w-full bg-neutral-900 rounded-full overflow-hidden flex">
+                              <div
+                                className="h-full bg-emerald-400 transition-all"
+                                style={{ width: `${completedPct}%` }}
+                                title={`已学完 ${completedPct}%`}
+                              />
+                              <div
+                                className="h-full bg-sky-500/50 transition-all"
+                                style={{ width: `${Math.max(0, readyPct - completedPct)}%` }}
+                                title={`已就绪未学完 ${Math.max(0, readyPct - completedPct)}%`}
+                              />
+                            </div>
+                          </div>
+
+                          <div
+                            className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-neutral-900"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setIsAllCoursesModalOpen(false);
+                                setScheduleCourseId(course.id);
+                              }}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-sky-500/15 border border-sky-500/40 hover:border-sky-400 text-sky-200 rounded-md transition-colors"
+                            >
+                              <Calendar className="w-3.5 h-3.5" />
+                              <span>按天查看日程</span>
+                            </button>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setSelectedCourseFilter(course.id);
+                                  setIsAllCoursesModalOpen(false);
+                                }}
+                                className="px-2.5 py-1.5 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded-md transition-colors"
+                              >
+                                筛选时间轴
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setIsAllCoursesModalOpen(false);
+                                  setOutlineModalState({
+                                    courseId: course.id,
+                                    step: course.outlineConfirmed ? 'lessons' : 'outline',
+                                  });
+                                }}
+                                className="px-2.5 py-1.5 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded-md transition-colors"
+                              >
+                                课程工作台
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 单门课程按天查看日程模态框 */}
+        {scheduleCourse && (
+          <div
+            className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 sm:p-6"
+            onClick={() => setScheduleCourseId(null)}
+          >
+            <div
+              data-testid="course-schedule-modal"
+              className="w-full max-w-4xl max-h-[88vh] bg-[#07090d] border border-neutral-800 rounded-xl shadow-2xl flex flex-col overflow-hidden"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="px-6 py-4 border-b border-neutral-900 flex flex-wrap items-start justify-between gap-4">
+                <div className="space-y-1 min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="text-base font-semibold text-white truncate">
+                      {scheduleCourse.name} · 按天日程
+                    </h2>
+                    <span className="text-[11px] font-mono px-2 py-0.5 rounded border border-sky-500/40 bg-sky-950/30 text-sky-300">
+                      {scheduleCourse.durationDays} 天计划 · {scheduleCourse.dailyPlan.length} 节
+                    </span>
+                  </div>
+                  <p className="text-xs text-neutral-400 truncate">{scheduleCourse.goal}</p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedCourseFilter(scheduleCourse.id);
+                      setScheduleCourseId(null);
+                    }}
+                    className="px-3 py-1.5 text-xs border border-neutral-700 hover:border-sky-500/60 text-neutral-200 hover:text-white rounded-md transition-colors"
+                  >
+                    只看此课时间轴
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const targetId = scheduleCourse.id;
+                      const targetStep: OutlineWorkbenchStep = scheduleCourse.outlineConfirmed
+                        ? 'lessons'
+                        : 'outline';
+                      setScheduleCourseId(null);
+                      setOutlineModalState({ courseId: targetId, step: targetStep });
+                    }}
+                    className="px-3 py-1.5 text-xs bg-white text-black hover:bg-neutral-200 font-medium rounded-md transition-colors"
+                  >
+                    打开课程工作台
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="关闭课程日程"
+                    onClick={() => setScheduleCourseId(null)}
+                    className="p-1.5 text-neutral-400 hover:text-white rounded-md hover:bg-neutral-900 transition-colors"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              {courses.length > 1 && (
+                <div className="px-6 py-2.5 border-b border-neutral-900/80 flex items-center gap-2 overflow-x-auto bg-black/40">
+                  <span className="text-[11px] text-neutral-500 shrink-0">切换课程：</span>
+                  {courses.map((c) => (
+                    <button
+                      key={c.id}
+                      type="button"
+                      onClick={() => setScheduleCourseId(c.id)}
+                      className={`px-2.5 py-1 text-xs rounded-md border transition-colors whitespace-nowrap shrink-0 ${
+                        c.id === scheduleCourse.id
+                          ? 'border-sky-500/60 bg-sky-950/30 text-sky-200'
+                          : 'border-neutral-800 text-neutral-400 hover:text-white hover:border-neutral-600'
+                      }`}
+                    >
+                      {c.name}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <div className="flex-1 overflow-y-auto p-6 space-y-4">
+                {scheduleCourseDays.length === 0 ? (
+                  <div className="py-12 text-center space-y-3 border border-dashed border-neutral-800 rounded-lg">
+                    <p className="text-sm text-neutral-300">尚未确认目录与按天排期</p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const targetId = scheduleCourse.id;
+                        setScheduleCourseId(null);
+                        setOutlineModalState({ courseId: targetId, step: 'outline' });
+                      }}
+                      className="px-3.5 py-1.5 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded-md"
+                    >
+                      前往生成并确认大纲
+                    </button>
+                  </div>
+                ) : (
+                  scheduleCourseDays.map((dayGroup) => {
+                    const { monthDay, weekday } = formatChineseDateLabel(dayGroup.date);
+                    const totalMins = dayGroup.slots.reduce(
+                      (acc, s) => acc + (getEvaluatedSectionMinutes(s) || 0),
+                      0
+                    );
+                    const doneCount = dayGroup.slots.filter((s) =>
+                      Boolean(getSlotExerciseSubmission(scheduleCourse, s))
+                    ).length;
+
+                    return (
+                      <div
+                        key={dayGroup.date}
+                        className={`rounded-lg border p-4 space-y-3 ${
+                          dayGroup.isToday
+                            ? 'border-sky-500/50 bg-sky-950/15'
+                            : 'border-neutral-900 bg-black/50'
+                        }`}
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center gap-2.5">
+                            <span className="font-mono text-xs px-2 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-neutral-300">
+                              第 {dayGroup.dayNumber} 天
+                            </span>
+                            <span className="text-sm font-semibold text-white">
+                              {monthDay} · {weekday}
+                            </span>
+                            <span className="text-xs font-mono text-neutral-500">
+                              {dayGroup.date}
+                            </span>
+                            {dayGroup.isToday && (
+                              <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-sky-500/15 border border-sky-500/40 text-sky-300">
+                                今日
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-3 text-xs font-mono text-neutral-400">
+                            {totalMins > 0 && (
+                              <span className="inline-flex items-center gap-1">
+                                <Clock className="w-3 h-3 text-neutral-500" />
+                                {totalMins} 分钟
+                              </span>
+                            )}
+                            <span>
+                              完成 {doneCount}/{dayGroup.slots.length} 节
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="space-y-2">
+                          {dayGroup.slots.map((slot) => {
+                            const hasLesson = Boolean(slot.lesson);
+                            const isDone = Boolean(getSlotExerciseSubmission(scheduleCourse, slot));
+                            const mins = getEvaluatedSectionMinutes(slot);
+                            return (
+                              <div
+                                key={`${slot.id}-${slot.dayIndex}`}
+                                className="flex flex-wrap items-center justify-between gap-3 px-3.5 py-2.5 rounded-md border border-neutral-900 bg-neutral-950/60 hover:border-neutral-700 transition-colors"
+                              >
+                                <div className="space-y-0.5 min-w-0 flex-1">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="text-[11px] font-mono text-neutral-500">
+                                      {slot.id || `sec-${String(slot.dayIndex).padStart(2, '0')}`}
+                                    </span>
+                                    <span className="text-xs sm:text-sm font-medium text-neutral-100 truncate">
+                                      {slot.title}
+                                    </span>
+                                    {isDone ? (
+                                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-950/60 border border-emerald-700/60 text-emerald-300">
+                                        已学完
+                                      </span>
+                                    ) : hasLesson ? (
+                                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-sky-950/50 border border-sky-700/50 text-sky-300">
+                                        课件就绪
+                                      </span>
+                                    ) : slot.stage1Draft ? (
+                                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-950/40 border border-amber-700/50 text-amber-300">
+                                        阶段一已存
+                                      </span>
+                                    ) : (
+                                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-neutral-900 border border-neutral-800 text-neutral-500">
+                                        待生成
+                                      </span>
+                                    )}
+                                    {mins !== undefined && (
+                                      <span className="text-[11px] font-mono text-neutral-500">
+                                        约 {mins} 分钟
+                                      </span>
+                                    )}
+                                  </div>
+                                  {slot.objective && (
+                                    <p className="text-xs text-neutral-500 truncate">
+                                      {slot.objective}
+                                    </p>
+                                  )}
+                                </div>
+
+                                {hasLesson ? (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      const cid = scheduleCourse.id;
+                                      setScheduleCourseId(null);
+                                      navigateToLesson(cid, slot.dayIndex, e, true);
+                                    }}
+                                    className="px-3 py-1 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors shrink-0"
+                                  >
+                                    进入学习
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const cid = scheduleCourse.id;
+                                      setScheduleCourseId(null);
+                                      setOutlineModalState({ courseId: cid, step: 'lessons' });
+                                    }}
+                                    className="px-3 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-300 hover:text-white rounded transition-colors shrink-0"
+                                  >
+                                    去生成课件
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </MotionConfig>
   );

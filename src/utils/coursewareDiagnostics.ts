@@ -5,8 +5,10 @@ import { ensureStableSectionId } from './learningLogic';
 import {
   detectUnresolvedImageRefs,
   parseImportedLessonContent,
+  repairUnescapedLatexInJsonString,
   resolveLessonAssetReferences,
   stripAiCitationArtifacts,
+  tryParseJsonWithLatexRepair,
 } from './coursewareParser';
 import {
   normalizeBareMathForMarkdown,
@@ -271,10 +273,17 @@ function collectMissingDiagRefsInText(params: {
   }
 }
 
+export interface RepairPromptExtraContext {
+  salvagedFields?: string[];
+  isTailTruncation?: boolean;
+  errorOffset?: number;
+}
+
 export function buildCoursewareRepairPrompt(
   lessonTitle: string,
   issues: CoursewareDiagnosticIssue[],
-  availableDiagramIds: string[]
+  availableDiagramIds: string[],
+  extraContext?: RepairPromptExtraContext
 ): string {
   if (!issues || issues.length === 0) return '';
 
@@ -304,11 +313,38 @@ export function buildCoursewareRepairPrompt(
     availableDiagramIds.length > 0 ? availableDiagramIds.join('、') : '（当前尚未生成任何 SVG 图示）';
 
   if (isFatalJsonError) {
+    const salvaged = extraContext?.salvagedFields || [];
+    if (salvaged.length > 0) {
+      const hasMarkdownSalvaged = salvaged.includes('markdownBody');
+      return `你前面生成的课件《${lessonTitle || '本节课件'}》在局部位置发生 JSON 语法损坏或长度截断，但系统已成功抢救以下完整字段（**切勿重复生成它们**）：
+- 已完整抢救保留的字段：\`${salvaged.join('`、`')}\`
+
+### 唯一需要处理的故障点
+${issueLines.join('\n\n')}
+
+### 请仅输出增量修复/续写 JSON 补丁（无需重新生成整节课件！）
+${
+  hasMarkdownSalvaged
+    ? '- `markdownBody` 正文已完整保留：若故障在 `diagrams`、`exercises`、`heuristicQuestions` 或 `reverseChecks` 中，只需输出被截断/损坏的那部分字段 JSON；若仅正文内部某一行有错，使用 `textReplacements` 局部替换即可。'
+    : '- 请仅补齐上述缺失或被截断字段的合法 JSON。'
+}
+- 注意 JSON 字符串内 LaTeX 反斜杠双写 \`\\\\\`，双引号写 \`\\"\`，禁止在字符串值中出现未转义换行。
+\`\`\`json
+{
+  "textReplacements": [
+    { "find": "若有需要替换的出错原文", "replace": "修正后的内容" }
+  ],
+  "exercisesToUpsert": [],
+  "diagramsToUpsert": []
+}
+\`\`\``;
+    }
+
     return `你前面生成的课件《${lessonTitle || '本节课件'}》存在 JSON 语法损坏或输出截断：
 
 ${issueLines.join('\n\n')}
 
-请修复上述 JSON 语法/转义问题（注意 JSON 字符串内的 LaTeX 反斜杠必须双写为 \`\\\\\`，如 \`\\\\frac\`、\`\\\\text\`、\`\\\\Delta\`），输出完整合法的 \`\`\`json ... \`\`\` 代码块。`;
+请仅对照上述精准报错位置修复 JSON 语法/转义/截断问题（注意 JSON 字符串内的 LaTeX 反斜杠双写为 \`\\\\\`，内嵌双引号转义为 \`\\"\`），输出完整合法的 \`\`\`json ... \`\`\` 代码块。`;
   }
 
   const patchSchemaParts: string[] = [];
@@ -800,9 +836,149 @@ export function auditCoursewareRendering(
 }
 
 /**
+ * Recover already-complete top-level JSON fields from a partially broken or truncated lesson JSON string
+ * so the user doesn't lose 90% of a generated lesson when only one tail field or quote broke.
+ */
+export function salvagePartialLessonFromBrokenJson(
+  candidateJson: string,
+  slot: Pick<
+    DailyPlanSlot,
+    | 'id'
+    | 'dayIndex'
+    | 'date'
+    | 'title'
+    | 'objective'
+    | 'keyTopics'
+    | 'prerequisites'
+    | 'teachingScope'
+    | 'connectionNote'
+  >,
+  existingAssets: Record<string, string> = {}
+): {
+  salvagedLesson: DailyLessonContent | null;
+  salvagedFields: string[];
+} {
+  const salvagedObj: Record<string, any> = {};
+  const salvagedFields: string[] = [];
+
+  const targetKeys = [
+    'generationStage',
+    'title',
+    'summary',
+    'keyPoints',
+    'teachingContext',
+    'markdownBody',
+    'symbolGlossary',
+    'diagrams',
+    'heuristicQuestions',
+    'exercises',
+    'reverseChecks',
+    'estimatedMinutes',
+  ];
+
+  const keyRegex = new RegExp(`"(${targetKeys.join('|')})"\\s*:\\s*`, 'g');
+  let m: RegExpExecArray | null;
+
+  const extractBalancedJsonValue = (startIdx: number): string | null => {
+    let idx = startIdx;
+    while (idx < candidateJson.length && /\s/.test(candidateJson[idx])) idx++;
+    if (idx >= candidateJson.length) return null;
+
+    const firstCh = candidateJson[idx];
+    if (firstCh === '"') {
+      let i = idx + 1;
+      let escaped = false;
+      while (i < candidateJson.length) {
+        const c = candidateJson[i];
+        if (escaped) {
+          escaped = false;
+        } else if (c === '\\') {
+          escaped = true;
+        } else if (c === '"') {
+          return candidateJson.slice(idx, i + 1);
+        }
+        i++;
+      }
+      return null;
+    }
+
+    if (firstCh === '{' || firstCh === '[') {
+      const stack: string[] = [firstCh === '{' ? '}' : ']'];
+      let i = idx + 1;
+      let inStr = false;
+      let escaped = false;
+      while (i < candidateJson.length) {
+        const c = candidateJson[i];
+        if (inStr) {
+          if (escaped) escaped = false;
+          else if (c === '\\') escaped = true;
+          else if (c === '"') inStr = false;
+        } else if (c === '"') {
+          inStr = true;
+        } else if (c === '{') {
+          stack.push('}');
+        } else if (c === '[') {
+          stack.push(']');
+        } else if (c === '}' || c === ']') {
+          const expected = stack.pop();
+          if (c !== expected) return null;
+          if (stack.length === 0) return candidateJson.slice(idx, i + 1);
+        }
+        i++;
+      }
+      return null;
+    }
+
+    const primMatch = candidateJson.slice(idx).match(/^(?:-?\d+(?:\.\d+)?|true|false|null)/);
+    return primMatch ? primMatch[0] : null;
+  };
+
+  while ((m = keyRegex.exec(candidateJson)) !== null) {
+    const key = m[1];
+    if (key in salvagedObj) continue;
+    const rawVal = extractBalancedJsonValue(m.index + m[0].length);
+    if (!rawVal) continue;
+    try {
+      const parsedVal = JSON.parse(repairUnescapedLatexInJsonString(rawVal));
+      salvagedObj[key] = parsedVal;
+      salvagedFields.push(key);
+    } catch {
+      // ignore unsalvageable field
+    }
+  }
+
+  const markdownLen =
+    typeof salvagedObj.markdownBody === 'string' ? salvagedObj.markdownBody.trim().length : 0;
+  const hasArrayContent =
+    (Array.isArray(salvagedObj.diagrams) && salvagedObj.diagrams.length > 0) ||
+    (Array.isArray(salvagedObj.exercises) && salvagedObj.exercises.length > 0) ||
+    (Array.isArray(salvagedObj.heuristicQuestions) && salvagedObj.heuristicQuestions.length > 0);
+
+  if (
+    salvagedFields.length === 0 ||
+    (!hasArrayContent && markdownLen < 80 && salvagedFields.length < 3)
+  ) {
+    return { salvagedLesson: null, salvagedFields };
+  }
+
+  try {
+    const { lesson } = parseImportedLessonContent(
+      JSON.stringify(salvagedObj),
+      slot,
+      'chat',
+      existingAssets,
+      { stageMode: salvagedObj.generationStage === 'stage1_content' ? 'stage1' : 'auto' }
+    );
+    return { salvagedLesson: lesson, salvagedFields };
+  } catch {
+    return { salvagedLesson: null, salvagedFields };
+  }
+}
+
+/**
  * Audit raw pasted/uploaded text right after input in the Chat/Edit workbench.
- * Catches broken/truncated JSON before silently falling back to raw Markdown,
- * then parses the lesson and performs full formula + diagram + SVG diagnostics.
+ * Automatically repairs single-backslash LaTeX commands before parsing, catches broken/truncated JSON
+ * with exact error position diagnostics & partial field salvage, then runs full formula/SVG diagnostics.
  */
 export function auditRawCoursewareInput(
   rawInput: string,
@@ -844,33 +1020,69 @@ export function auditRawCoursewareInput(
       }
     }
 
+    const sanitizedCandidate = repairUnescapedLatexInJsonString(candidateJson);
     try {
-      JSON.parse(candidateJson);
+      JSON.parse(sanitizedCandidate);
     } catch (jsonErr: any) {
       const msg = String(jsonErr?.message || 'Invalid JSON');
-      const tailSnippet = candidateJson.length > 180 ? candidateJson.slice(-140) : candidateJson;
+      const posMatch = msg.match(/position\s+(\d+)/i);
+      const errPos = posMatch ? Math.min(sanitizedCandidate.length, Number(posMatch[1])) : -1;
+      const isTailTruncation =
+        errPos === -1 ||
+        errPos >= sanitizedCandidate.length - 180 ||
+        /unexpected end|unterminated string/i.test(msg);
+
+      const errorWindow =
+        errPos >= 0
+          ? `${sanitizedCandidate.slice(Math.max(0, errPos - 90), errPos)}[❌]${sanitizedCandidate.slice(errPos, Math.min(sanitizedCandidate.length, errPos + 90))}`
+          : sanitizedCandidate.length > 200
+            ? sanitizedCandidate.slice(-180)
+            : sanitizedCandidate;
+
+      const { salvagedLesson, salvagedFields } = salvagePartialLessonFromBrokenJson(
+        sanitizedCandidate,
+        slot,
+        existingAssets
+      );
+
       const issues: CoursewareDiagnosticIssue[] = [
         {
           id: 'json-syntax-1',
           severity: 'error',
           category: 'json_syntax_error',
-          categoryLabel: '课件 JSON 语法损坏或输出截断',
-          locationLabel: '输入文本整体结构',
-          rawSnippet: truncateSnippet(tailSnippet),
-          detail: `JSON.parse 失败：${msg}。常见原因：AI 输出被长度截断缺少末尾括号，或 LaTeX 中的 "\\" 未双写为 "\\\\"（如 \\frac、\\text 写成了单斜杠导致非法 JSON 转义）。`,
+          categoryLabel: isTailTruncation ? '课件 JSON 输出截断或缺少末尾括号' : '课件 JSON 局部语法错误',
+          locationLabel:
+            errPos >= 0
+              ? `字符偏移 ${errPos} / ${sanitizedCandidate.length}`
+              : '输入文本整体结构',
+          rawSnippet: truncateSnippet(errorWindow, 220),
+          detail: `JSON.parse 失败：${msg}。${
+            salvagedFields.length > 0
+              ? `已自动抢救保留 ${salvagedFields.length} 个完整字段（${salvagedFields.join('、')}），无需整节重生成。`
+              : '常见原因：AI 输出被长度截断缺少末尾括号，或字符串内出现了未转义的双引号/反斜杠。'
+          }`,
           fixInstruction:
-            '请补全被截断的 JSON 末尾结构，或将所有 JSON 字符串值中的 LaTeX 反斜杠双写为 "\\\\"（如 "\\\\frac"、"\\\\text"），重新输出完整合法 JSON。',
+            salvagedFields.length > 0
+              ? '请仅针对报错/缺失字段输出增量修复或续写补丁 JSON，无需重新输出已抢救字段。'
+              : '请补全被截断的 JSON 末尾结构，或修正报错偏移处的引号与反斜杠转义。',
         },
       ];
       return {
-        parsedLesson: null,
+        parsedLesson: salvagedLesson,
         report: {
           hasErrors: true,
           errorCount: 1,
           warningCount: 0,
           issues,
-          repairPrompt: buildCoursewareRepairPrompt(slot.title, issues, []),
-          summaryText: '检测到输入的 JSON 存在语法错误或被截断，暂无法解析为结构化课件。',
+          repairPrompt: buildCoursewareRepairPrompt(slot.title, issues, [], {
+            salvagedFields,
+            isTailTruncation,
+            errorOffset: errPos >= 0 ? errPos : undefined,
+          }),
+          summaryText:
+            salvagedFields.length > 0
+              ? `检测到 JSON 局部损坏/截断，已自动抢救 ${salvagedFields.join('、')}，可仅生成增量补丁修复剩余部分。`
+              : '检测到输入的 JSON 存在语法错误或被截断，已精准定位报错位置。',
         },
       };
     }
@@ -947,33 +1159,24 @@ export function applyCoursewareRepairPatch(
 
   // 1. Check if input is a JSON object
   if (candidateJsonStr.startsWith('{')) {
-    let parsedObj: any = null;
-    const preEscaped = candidateJsonStr.replace(
-      /(?<!\\)\\(frac|text|tau|theta|times|to|tilde|beta|begin|bar|right|rho|Delta|Omega|mu|alpha|gamma|delta|epsilon|lambda|pi|sigma|phi|omega|sqrt|left|cdot|approx|neq|leq|geq|infty|int|sum|prod|partial|nabla|vec|hat|dot|quad|qquad|;|,|!|\|)/g,
-      '\\\\$1'
-    );
-    try {
-      parsedObj = JSON.parse(preEscaped);
-    } catch {
-      try {
-        parsedObj = JSON.parse(candidateJsonStr);
-      } catch {
-        parsedObj = null;
-      }
-    }
+    const parsedObj = tryParseJsonWithLatexRepair(candidateJsonStr);
 
-    if (parsedObj && typeof parsedObj === 'object') {
+    if (parsedObj && typeof parsedObj === 'object' && !Array.isArray(parsedObj)) {
       const isIncrementalPatch =
         Array.isArray(parsedObj.textReplacements) ||
         Array.isArray(parsedObj.diagramsToUpsert) ||
         Array.isArray(parsedObj.exercisesToUpsert) ||
         Array.isArray(parsedObj.heuristicQuestionsToUpsert) ||
+        Array.isArray(parsedObj.reverseChecksToUpsert) ||
         Boolean(parsedObj.teachingContextPatch && typeof parsedObj.teachingContextPatch === 'object') ||
         typeof parsedObj.markdownBodyPrefixPrepend === 'string' ||
+        typeof parsedObj.markdownBodySuffixAppend === 'string' ||
         (!parsedObj.markdownBody &&
           (Array.isArray(parsedObj.diagrams) ||
             Array.isArray(parsedObj.exercises) ||
-            Array.isArray(parsedObj.heuristicQuestions)));
+            Array.isArray(parsedObj.heuristicQuestions) ||
+            Array.isArray(parsedObj.reverseChecks) ||
+            Array.isArray(parsedObj.symbolGlossary)));
 
       if (isIncrementalPatch) {
         let replacementHits = 0;
@@ -1023,8 +1226,10 @@ export function applyCoursewareRepairPatch(
         )
           ? parsedObj.textReplacements
               .map((item: any) => ({
-                target: String(item?.target ?? item?.old ?? item?.from ?? '').trim(),
-                replacement: String(item?.replacement ?? item?.new ?? item?.to ?? '').trim(),
+                target: String(item?.target ?? item?.find ?? item?.old ?? item?.from ?? '').trim(),
+                replacement: String(
+                  item?.replacement ?? item?.replace ?? item?.new ?? item?.to ?? ''
+                ).trim(),
               }))
               .filter((r: { target: string; replacement: string }) => r.target.length > 0)
           : [];
@@ -1185,6 +1390,39 @@ export function applyCoursewareRepairPatch(
             upsertedHeuristics++;
           }
           cloned.heuristicQuestions = existingHq;
+        }
+
+        const rcInput: any[] = Array.isArray(parsedObj.reverseChecksToUpsert)
+          ? parsedObj.reverseChecksToUpsert
+          : !parsedObj.markdownBody && Array.isArray(parsedObj.reverseChecks)
+            ? parsedObj.reverseChecks
+            : [];
+        if (rcInput.length > 0) {
+          const existingRc = [...(cloned.reverseChecks || [])];
+          for (const rawRc of rcInput) {
+            if (!rawRc || typeof rawRc !== 'object') continue;
+            const id = String(rawRc.id || `rc-${existingRc.length + 1}`).trim();
+            const idx = existingRc.findIndex((r) => (r.id || '').toLowerCase() === id.toLowerCase());
+            if (idx >= 0) {
+              existingRc[idx] = { ...existingRc[idx], ...rawRc, id };
+            } else {
+              existingRc.push({ ...rawRc, id });
+            }
+          }
+          cloned.reverseChecks = existingRc;
+        }
+
+        if (!parsedObj.markdownBody && Array.isArray(parsedObj.symbolGlossary)) {
+          cloned.symbolGlossary = parsedObj.symbolGlossary;
+        }
+
+        if (
+          typeof parsedObj.markdownBodySuffixAppend === 'string' &&
+          parsedObj.markdownBodySuffixAppend.trim()
+        ) {
+          const suffix = parsedObj.markdownBodySuffixAppend.trim();
+          cloned.markdownBody = `${cloned.markdownBody || ''}\n\n${suffix}`.trim();
+          replacementHits++;
         }
 
         const explicitPatchMinutes = Number(

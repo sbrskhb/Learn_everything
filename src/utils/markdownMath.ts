@@ -385,7 +385,7 @@ export function normalizeBareMathForMarkdown(text: string): string {
     `sum|prod|coprod|ii*nt|oint|lim(?:sup|inf)?|nabla|partial|` +
     `vec|overrightarrow|overleftarrow|hat|widehat|bar|overline|underline|tilde|widetilde|dd?ot|` +
     `mathbf|mathrm|mathit|mathcal|mathbb|mathfrak|mathscr|boldsymbol|text|operatorname|mbox|boxed|` +
-    `left|right|[bB]igl|[bB]igr|langle|rangle|lfloor|rfloor|lceil|rceil|l[vV]ert|r[vV]ert|` +
+    `left(?:\\\\\\{|\\\\\\||\\.)|right(?:\\\\\\}|\\\\\\||\\.)|[bB]igl|[bB]igr|langle|rangle|lfloor|rfloor|lceil|rceil|l[vV]ert|r[vV]ert|` +
     `arcsin|arccos|arctan|sinh|cosh|tanh|sin|cos|tan|cot|sec|csc|ln|log|lg|exp|max|min|sup|inf|arg|det|dim|ker|deg|gcd|bmod|pmod|` +
     `alpha|beta|gamma|Gamma|delta|Delta|epsilon|varepsilon|zeta|eta|theta|Theta|vartheta|iota|kappa|lambda|Lambda|mu|nu|xi|Xi|pi|Pi|varpi|rho|varrho|sigma|Sigma|varsigma|tau|upsilon|Upsilon|phi|varphi|Phi|chi|psi|Psi|omega|Omega|` +
     `infty|hbar|ell|forall|exists|nexists|in|notin|ni|subset|supset|subseteq|supseteq|cup|cap|setminus|emptyset|varnothing|neg|lnot|land|lor|` +
@@ -398,10 +398,16 @@ export function normalizeBareMathForMarkdown(text: string): string {
   const opToken = `(?:!=|<=>|<->|<=|>=|->|<-|=>|=|≠|≤|≥|≈|≡|∝|±|∓|×|÷|·|\\+|\\-|\\*|/|<|>|→|←|⇌|⇔|⇒|∈|⊂|⊆|∪|∩)`;
   const unitCluster = `(?:\\d+(?:\\.\\d+)?\\s*${UNIT_PATTERN})`;
   const anyMathToken = `(?:${latexCmd}|${strongSubSup}|${unitCluster}|${plainOperand})`;
-  const innerParen = `\\([+-]?${anyMathToken}(?:\\s*${opToken}\\s*[+-]?${anyMathToken}|\\s+${anyMathToken})*\\)`;
-  const atomOrInner = `(?:${innerParen}|${anyMathToken})`;
-  const parenGroup = `\\([+-]?${atomOrInner}(?:\\s*${opToken}\\s*[+-]?${atomOrInner}|\\s+${atomOrInner})*\\)`;
-  const term = `(?:${parenGroup}|${anyMathToken})(?:\\s*(?:${parenGroup}|${strongSubSup}|${latexCmd}))*`;
+  const optTrailScripts = `(?:\\s*${scriptPart})*`;
+  const innerSeq = (atom: string) =>
+    `[+-]?${atom}(?:\\s*${opToken}\\s*[+-]?${atom}|\\s*(?=\\\\)${atom}|\\s+${atom})*`;
+  const innerRound = `(?:\\\\left)?\\(${innerSeq(anyMathToken)}(?:\\\\right)?\\)${optTrailScripts}`;
+  const innerSquare = `(?:\\\\left)?\\[${innerSeq(anyMathToken)}(?:\\\\right)?\\]${optTrailScripts}`;
+  const atomOrInner = `(?:${innerRound}|${innerSquare}|${anyMathToken})`;
+  const parenGroup = `(?:\\\\left)?\\(${innerSeq(atomOrInner)}(?:\\\\right)?\\)${optTrailScripts}`;
+  const bracketGroup = `(?:\\\\left)?\\[${innerSeq(atomOrInner)}(?:\\\\right)?\\]${optTrailScripts}`;
+  const delimGroup = `(?:${parenGroup}|${bracketGroup})`;
+  const term = `(?:${delimGroup}|${anyMathToken})(?:\\s*(?:${delimGroup}|${strongSubSup}|${latexCmd}))*`;
 
   // Match contiguous equation / expression sequences on a single line (supports unary -/+ after operators)
   const exprRegex = new RegExp(
@@ -850,6 +856,20 @@ function processLatexAndHtml(
     }
   );
 
+  // 4b. Normalize **...** bold spans outside code blocks/inline code so CJK + punctuation
+  // (e.g. `称之为**“虚地”**` or `得到**$u_P=0$**`) never fails CommonMark flanking rules.
+  const inlineCodeSpans: string[] = [];
+  processed = processed.replace(/(`+)([^`\n]+?)\1/g, (match) => {
+    const idx = inlineCodeSpans.length;
+    inlineCodeSpans.push(match);
+    return `@@INLINECODE-${idx}@@`;
+  });
+  processed = processed.replace(
+    /(?<!\*)\*\*(?!\s|\*)((?:(?!\*\*|\n).)+?(?<!\s|\*))\*\*(?!\*)/g,
+    '<strong>$1</strong>'
+  );
+  processed = processed.replace(/@@INLINECODE-(\d+)@@/g, (_m, i) => inlineCodeSpans[Number(i)] || '');
+
   // 5. Restore code blocks before running marked
   processed = processed.replace(/@@CODEBLOCK-(\d+)@@/g, (_m, i) => codeBlocks[Number(i)] || '');
 
@@ -867,26 +887,16 @@ function processLatexAndHtml(
   return linkifyDiagramRefsInHtml(withMath, visuals);
 }
 
-const SEMANTIC_CALLOUT_META: Record<
-  'TEXTBOOK' | 'PREREQ' | 'INTUITION' | 'EXTENSION',
-  { className: string; badgeLabel: string }
-> = {
-  TEXTBOOK: { className: 'lesson-callout-textbook', badgeLabel: '教材正文' },
-  PREREQ: { className: 'lesson-callout-prereq', badgeLabel: '先修补充' },
-  INTUITION: { className: 'lesson-callout-intuition', badgeLabel: '直观解释' },
-  EXTENSION: { className: 'lesson-callout-extension', badgeLabel: '边界与拓展' },
-};
-
 /**
- * Transform Obsidian/GitHub-style semantic callout blockquotes
+ * Unwrap Obsidian/GitHub-style source-classification blockquotes
  * (> [!TEXTBOOK], > [!PREREQ], > [!INTUITION], > [!EXTENSION])
- * into dark-mode styled containers with clear classification badges.
+ * into clean unboxed prose without colored borders, boxes, or source badges.
  */
 export function enhanceSemanticCalloutBlockquotes(html: string): string {
   if (!html || !html.includes('<blockquote')) return html;
   return html.replace(
     /<blockquote(\s[^>]*)?>([\s\S]*?)<\/blockquote>/gi,
-    (fullMatch, attrs = '', inner = '') => {
+    (fullMatch, _attrs = '', inner = '') => {
       const trimmedInner = String(inner).trim();
       const match = trimmedInner.match(
         /^<p([^>]*)>\s*\[!(TEXTBOOK|PREREQ|INTUITION|EXTENSION)\](?:[ \t]*((?:(?!<\/p>|<br\s*\/?>)[^\r\n])*?))?\s*(?:(<\/p>)|(?:<br\s*\/?>|\r?\n)\s*([\s\S]*)$)/i
@@ -894,8 +904,6 @@ export function enhanceSemanticCalloutBlockquotes(html: string): string {
       if (!match) return fullMatch;
 
       const pAttrs = match[1] || '';
-      const kind = match[2].toUpperCase() as keyof typeof SEMANTIC_CALLOUT_META;
-      const meta = SEMANTIC_CALLOUT_META[kind];
       const rawInline = (match[3] || '').trim();
       const hadClosingP = Boolean(match[4]);
 
@@ -916,14 +924,11 @@ export function enhanceSemanticCalloutBlockquotes(html: string): string {
         bodyHtml = `<p${pAttrs}>${remainder}`;
       }
 
-      const titleSpan = headerTitle ? `<span class="lesson-callout-title">${headerTitle}</span>` : '';
-      const existingClassMatch = String(attrs).match(/\bclass="([^"]*)"/i);
-      const classValue = existingClassMatch
-        ? `${existingClassMatch[1]} lesson-callout ${meta.className}`
-        : `lesson-callout ${meta.className}`;
-      const cleanedAttrs = String(attrs).replace(/\s*\bclass="[^"]*"/i, '');
+      const titleHtml = headerTitle
+        ? `<p class="lesson-callout-plain-title">${headerTitle}</p>`
+        : '';
 
-      return `<blockquote${cleanedAttrs} class="${classValue}"><div class="lesson-callout-header${headerTitle ? '' : ' lesson-callout-header-badge-only'}"><span class="lesson-callout-badge">${meta.badgeLabel}</span>${titleSpan}</div>${bodyHtml}</blockquote>`;
+      return `<div class="lesson-callout-plain">${titleHtml}${bodyHtml}</div>`;
     }
   );
 }

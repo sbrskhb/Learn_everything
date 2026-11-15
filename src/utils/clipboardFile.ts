@@ -39,3 +39,32 @@ export async function copyCourseFileToClipboard(
 
   return data;
 }
+
+/**
+ * Write any prompt markdown string to `courses/<folder>/prompts/<fileName>.md` and
+ * copy that `.md` file directly to the OS file clipboard (Ctrl+V ready in external AI chats).
+ */
+export async function copyPromptMarkdownFileToClipboard(
+  courseId: string,
+  fileName: string,
+  content: string
+): Promise<CopyCourseFileResult> {
+  const res = await fetch(`/api/courses/${courseId}/prompts/copy-md-clipboard`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fileName, content }),
+  });
+
+  const data = (await res.json().catch(() => ({}))) as CopyCourseFileResult;
+  if (!res.ok) {
+    throw new Error(data.error || `复制提示词 .md 文件失败 (HTTP ${res.status})`);
+  }
+
+  if (!data.copiedToOsClipboard && content && typeof navigator !== 'undefined') {
+    navigator.clipboard?.writeText(content).catch(() => {
+      // ignore clipboard permission errors
+    });
+  }
+
+  return data;
+}

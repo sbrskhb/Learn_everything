@@ -208,6 +208,16 @@
   margin: 1rem 0;
 }
 
+.lesson-callout-plain {
+  margin: 0.75rem 0;
+}
+
+.lesson-callout-plain-title {
+  color: #fafafa;
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+}
+
 .lesson-prose blockquote.lesson-callout {
   border-left-width: 3px;
   color: #e5e5e5;
@@ -283,7 +293,17 @@
   display: none !important;
 }
 
-.lesson-hide-category-badges .lesson-prose blockquote.lesson-callout {
+.lesson-hide-category-badges .lesson-callout-plain {
+  margin: 0.75rem 0;
+}
+
+.lesson-callout-plain-title {
+  color: #fafafa;
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+}
+
+.lesson-prose blockquote.lesson-callout {
   border: none;
   background: transparent;
   padding: 0;

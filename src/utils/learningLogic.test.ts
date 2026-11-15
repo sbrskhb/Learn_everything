@@ -2256,14 +2256,17 @@ test('renderMarkdownWithLatex transforms dark-mode semantic callouts cleanly', a
   ].join('\n');
 
   const html = renderMarkdownWithLatex(md);
-  assert.equal(html.includes('lesson-callout-textbook'), true);
-  assert.equal(html.includes('教材正文'), true);
-  assert.equal(html.includes('lesson-callout-prereq'), true);
-  assert.equal(html.includes('先修补充'), true);
-  assert.equal(html.includes('lesson-callout-intuition'), true);
-  assert.equal(html.includes('直观解释'), true);
-  assert.equal(html.includes('lesson-callout-extension'), true);
-  assert.equal(html.includes('边界与拓展'), true);
+  assert.equal(html.includes('lesson-callout-plain'), true);
+  assert.equal(html.includes('lesson-callout-textbook'), false);
+  assert.equal(html.includes('教材正文'), false);
+  assert.equal(html.includes('lesson-callout-prereq'), false);
+  assert.equal(html.includes('先修补充'), false);
+  assert.equal(html.includes('lesson-callout-intuition'), false);
+  assert.equal(html.includes('直观解释'), false);
+  assert.equal(html.includes('lesson-callout-extension'), false);
+  assert.equal(html.includes('边界与拓展'), false);
+  assert.equal(html.includes('教材定理'), true);
+  assert.equal(html.includes('失效边界'), true);
 });
 
 test('auditCoursewareRendering detects duplicate_id and placeholder_error; applyCoursewareRepairPatch patches teachingContext and prefix; buildStageRepairPrompt scopes stages', async () => {
@@ -2717,12 +2720,16 @@ test('Step 3 lesson parser and repair patch update estimatedMinutes and markdown
   assert.equal(repaired.mergedLesson.estimatedMinutes, 58);
 
   const badgeOnlyHtml = renderMarkdownWithLatex('> [!textbook]\n> 教材原话内容');
-  assert.equal(badgeOnlyHtml.includes('lesson-callout-textbook'), true);
-  assert.equal(badgeOnlyHtml.includes('lesson-callout-header-badge-only'), true);
-  assert.equal(badgeOnlyHtml.includes('教材正文'), true);
+  assert.equal(badgeOnlyHtml.includes('lesson-callout-plain'), true);
+  assert.equal(badgeOnlyHtml.includes('lesson-callout-textbook'), false);
+  assert.equal(badgeOnlyHtml.includes('lesson-callout-header-badge-only'), false);
+  assert.equal(badgeOnlyHtml.includes('教材正文'), false);
+  assert.equal(badgeOnlyHtml.includes('教材原话内容'), true);
 
   const titledHtml = renderMarkdownWithLatex('> [!textbook] 核心定义\n> 教材原话内容');
-  assert.equal(titledHtml.includes('lesson-callout-title'), true);
+  assert.equal(titledHtml.includes('lesson-callout-plain-title'), true);
+  assert.equal(titledHtml.includes('核心定义'), true);
+  assert.equal(titledHtml.includes('lesson-callout-title'), false);
   assert.equal(titledHtml.includes('lesson-callout-header-badge-only'), false);
 });
 
@@ -2911,5 +2918,246 @@ test('selective optional lesson fields and two-stage lesson generation (Stage 1 
   assert.equal(completeAudit.hasErrors, false);
   assert.equal(completeAudit.errorCount, 0);
 });
+
+test('LaTeX unescaped backslash repair fixes single-backslash \\tilde{\\alpha}/\\tilde{\\beta} and passes Lesson 5 Stage 1 audit', async () => {
+  const {
+    repairUnescapedLatexInJsonString,
+    tryExtractJsonObject,
+    extractPendingDiagramSpecs,
+  } = await import('./coursewareParser');
+  const { auditRawCoursewareInput } = await import('./coursewareDiagnostics');
+
+  // Inline synthetic JSON with single-backslash \alpha (SyntaxError: Bad escaped character) and \beta (becomes 0x08 BS)
+  const rawBrokenFixture =
+    '{"title":"第 5 讲：多级阻容耦合放大电路的频率响应","summary":"级联分析","estimatedMinutes":45,"markdownBody":"零极点位移 $\\\\tilde{\\alpha} + \\\\tilde{\\beta} + \\\\theta$ 推导。","diagrams":[{"id":"diag-5-1","title":"多级幅频特性","caption":"波特图","topologySpec":"画三级极点分布"}],"exercises":[{"id":"ex-1","type":"short_answer","question":"计算 $\\\\tilde{\\beta}$","answer":"B","explanation":"ok"}]}';
+
+  assert.throws(() => JSON.parse(rawBrokenFixture));
+  const repaired = repairUnescapedLatexInJsonString(rawBrokenFixture);
+  const parsedObj = JSON.parse(repaired);
+  assert.equal(parsedObj.markdownBody.includes('\\alpha'), true);
+  assert.equal(parsedObj.markdownBody.includes('\\beta'), true);
+  assert.equal(parsedObj.markdownBody.includes('\b'), false);
+  assert.notEqual(tryExtractJsonObject(rawBrokenFixture), null);
+
+  const fixtureSlot: any = {
+    id: 'sec-05',
+    dayIndex: 5,
+    date: '2026-11-20',
+    title: '多级放大电路频响',
+    objective: '掌握零极点拟合',
+    keyTopics: ['频率响应'],
+  };
+  const stage1Audit = auditRawCoursewareInput(rawBrokenFixture, fixtureSlot, {}, { stage: 'stage1' });
+  assert.ok(stage1Audit);
+  assert.equal(stage1Audit.parsedLesson !== null, true);
+  assert.equal(stage1Audit.report.errorCount, 0);
+  assert.equal(extractPendingDiagramSpecs(stage1Audit.parsedLesson!).length, 1);
+
+  const uploadedLesson5Path =
+    'C:/Users/GNZ/.gemini/antigravity/brain/ace2ba22-49be-4a81-96bb-b2ce31a0c75e/.user_uploaded/media_1794705532669_58deb011.json';
+  if (fs.existsSync(uploadedLesson5Path)) {
+    const rawLesson5 = fs.readFileSync(uploadedLesson5Path, 'utf-8');
+    const lesson5Audit = auditRawCoursewareInput(rawLesson5, fixtureSlot, {}, { stage: 'stage1' });
+    assert.ok(lesson5Audit);
+    assert.equal(lesson5Audit.parsedLesson !== null, true);
+    assert.equal(lesson5Audit.report.errorCount, 0);
+    assert.equal(extractPendingDiagramSpecs(lesson5Audit.parsedLesson!).length > 0, true);
+  }
+});
+
+test('detectPastedCoursewareInputKind identifies stage1/stage2/patch/complete and applyCoursewareRepairPatch supports find/replace', async () => {
+  const { detectPastedCoursewareInputKind } = await import('./coursewareParser');
+  const { applyCoursewareRepairPatch } = await import('./coursewareDiagnostics');
+
+  const stage1Text = JSON.stringify({
+    title: '第 1 讲',
+    markdownBody: '正弦信号 $\\sin(\\omega t)$\n\n{{diagram:diag-1}}',
+    diagrams: [{ id: 'diag-1', title: '图 1', topologySpec: '画波形图' }],
+  });
+  const stage2Text = JSON.stringify({
+    diagrams: [{ id: 'diag-1', title: '图 1', svgCode: '<svg viewBox="0 0 100 100"></svg>' }],
+  });
+  const patchText = JSON.stringify({
+    textReplacements: [{ find: '旧错别字', replace: '新修正文本' }],
+  });
+  const completeText = JSON.stringify({
+    title: '第 1 讲',
+    markdownBody: '正文\n\n{{diagram:diag-1}}',
+    diagrams: [{ id: 'diag-1', title: '图 1', svgCode: '<svg viewBox="0 0 100 100"></svg>' }],
+    exercises: [{ id: 'ex-1', type: 'short_answer', question: 'Q', answer: 'A', explanation: 'E' }],
+  });
+
+  assert.equal(detectPastedCoursewareInputKind(stage1Text, { hasStage1Draft: false }), 'stage1');
+  assert.equal(detectPastedCoursewareInputKind(stage2Text, { hasStage1Draft: true }), 'stage2');
+  assert.equal(detectPastedCoursewareInputKind(patchText, { hasBaseLesson: true }), 'patch');
+  assert.equal(detectPastedCoursewareInputKind(completeText), 'complete');
+
+  const baseLesson: any = {
+    title: '第 1 讲',
+    summary: '摘要',
+    markdownBody: '这里有一个旧错别字需要修补。',
+    diagrams: [],
+    exercises: [],
+  };
+  const slot: any = { id: 'sec-01', dayIndex: 1, date: '2026-11-15', title: '第 1 讲', objective: '', keyTopics: [] };
+  const patched = applyCoursewareRepairPatch(baseLesson, patchText, slot);
+  assert.equal(patched.mergedLesson.markdownBody.includes('新修正文本'), true);
+  assert.equal(patched.mergedLesson.markdownBody.includes('旧错别字'), false);
+});
+
+test('PDF split salvage, incremental merge, and minimal repair prompt preserve intact regions on truncation', async () => {
+  const {
+    salvagePartialPdfSplitRegions,
+    mergeImportedPdfSplitRegions,
+    buildPdfSplitIncrementalRepairPrompt,
+  } = await import('./coursewareParser');
+
+  const truncatedSplitJson = `{
+    "pageOffset": 14,
+    "regions": [
+      {"sectionId": "region-01", "sectionTitle": "绪论", "printedStartPage": 1, "printedEndPage": 8},
+      {"sectionId": "region-02", "sectionTitle": "二极管基本模型", "printedStartPage": 9, "printedEndPage": 24},
+      {"sectionId": "region-03", "sectionTitle": "放大电路分析", "printedStartPage": 25, "printedEndPage": `;
+
+  const salvaged = salvagePartialPdfSplitRegions(truncatedSplitJson, 'textbook.pdf', 120);
+  assert.equal(salvaged.detectedPageOffset, 14);
+  assert.equal(salvaged.salvagedRegions.length, 2);
+  assert.equal(salvaged.salvagedRegions[0].physicalStartPage, 15);
+  assert.equal(salvaged.salvagedRegions[1].sectionTitle, '二极管基本模型');
+
+  const incrementalPatch = [
+    {
+      sectionId: 'region-02',
+      dayIndex: 2,
+      date: '',
+      sectionTitle: '二极管基本模型与开关特性',
+      physicalStartPage: 23,
+      physicalEndPage: 38,
+      sourceFileName: 'textbook.pdf',
+      status: 'planned',
+    },
+    {
+      sectionId: 'region-03',
+      dayIndex: 3,
+      date: '',
+      sectionTitle: '放大电路分析',
+      physicalStartPage: 39,
+      physicalEndPage: 62,
+      sourceFileName: 'textbook.pdf',
+      status: 'planned',
+    },
+  ];
+  const merged = mergeImportedPdfSplitRegions(salvaged.salvagedRegions, incrementalPatch as any);
+  assert.equal(merged.length, 3);
+  assert.equal(merged[0].sectionId, 'region-01');
+  assert.equal(merged[1].sectionTitle, '二极管基本模型与开关特性');
+  assert.equal(merged[2].sectionId, 'region-03');
+
+  const repair = buildPdfSplitIncrementalRepairPrompt({
+    rawInput: truncatedSplitJson,
+    errorMessage: 'Unexpected end of JSON input',
+    defaultSourceFileName: 'textbook.pdf',
+    totalPages: 120,
+  });
+  assert.equal(repair.salvagedRegions.length, 2);
+  assert.equal(repair.repairPrompt.includes('region-01'), true);
+  assert.equal(repair.repairPrompt.includes('请勿重复输出已成功解析的前 2 个区域'), true);
+  assert.equal(repair.repairPrompt.includes('请仅输出剩余未完成或出错的区域'), true);
+  assert.equal(repair.repairPrompt.includes('"incremental": true'), true);
+});
+
+test('Broken JSON audit pinpoints exact [❌] SyntaxError offset and salvages intact top-level lesson fields', async () => {
+  const { auditRawCoursewareInput, salvagePartialLessonFromBrokenJson } = await import(
+    './coursewareDiagnostics'
+  );
+
+  const slot: any = { id: 'sec-04', dayIndex: 4, date: '2026-11-19', title: '频率响应基础', objective: '', keyTopics: [] };
+
+  // Truncated tiny object still triggers json_syntax_error with no salvaged lesson
+  const tinyBroken = auditRawCoursewareInput('{"title": "broken', slot, {});
+  assert.ok(tinyBroken);
+  assert.equal(tinyBroken.parsedLesson, null);
+  assert.equal(tinyBroken.report.issues[0].category, 'json_syntax_error');
+
+  // Larger broken JSON with syntax error inside exercises retains intact markdownBody and marks [❌] near error position
+  const brokenMidJson =
+    '{"title":"第 4 讲：频率响应基础","summary":"摘要完成","estimatedMinutes":42,"markdownBody":"' +
+    '这是完整正文，推导 $H(j\\\\omega) = \\\\frac{1}{1+j\\\\omega RC}$。' +
+    '","diagrams":[{"id":"diag-1","title":"幅频曲线","topologySpec":"画出 -20dB/dec 下降斜率"}],"exercises":[{"id":"ex-1","type":"short_answer","question":"broken unescaped quote "here"}]}';
+
+  const salvaged = salvagePartialLessonFromBrokenJson(brokenMidJson, slot, {});
+  assert.ok(salvaged.salvagedLesson);
+  assert.equal(salvaged.salvagedFields.includes('markdownBody'), true);
+  assert.equal(salvaged.salvagedFields.includes('diagrams'), true);
+
+  const audited = auditRawCoursewareInput(brokenMidJson, slot, {}, { stage: 'stage1' });
+  assert.ok(audited);
+  assert.equal(audited.report.issues.some((i) => i.category === 'json_syntax_error'), true);
+  assert.equal(audited.report.repairPrompt.includes('[❌]'), true);
+  assert.equal(audited.report.repairPrompt.includes('增量修复/续写 JSON 补丁'), true);
+});
+
+test('CJK punctuation bold spans (**“虚地”**, **$u_P = 0$**) render cleanly and prime symbols (R vs R\') stay distinct', async () => {
+  const { renderMarkdownWithLatex } = await import('./markdownMath');
+  const { normalizeSymbolKeys, buildLessonSymbolIndex, lookupSymbolInIndex } = await import(
+    './latexSymbols'
+  );
+
+  const html = renderMarkdownWithLatex(
+    '——教材中称之为**“虚地”**（“虚”即“假”），且得到**$u_P = 0$**的结论，保留`**not bold**`。'
+  );
+  assert.equal(html.includes('<strong>“虚地”</strong>'), true);
+  assert.equal(html.includes('<strong><span class="katex">'), true);
+  assert.equal(html.includes('<code>**not bold**</code>'), true);
+
+  assert.deepEqual(normalizeSymbolKeys("R'"), { canonicalKey: "R'", looseKey: "R'" });
+  assert.deepEqual(normalizeSymbolKeys('R′'), { canonicalKey: "R'", looseKey: "R'" });
+  assert.deepEqual(normalizeSymbolKeys('R^{\\prime}'), { canonicalKey: "R'", looseKey: "R'" });
+  assert.deepEqual(normalizeSymbolKeys('R'), { canonicalKey: 'R', looseKey: 'R' });
+
+  const idx = buildLessonSymbolIndex({
+    sectionId: 'sec-prime-test',
+    dayIndex: 1,
+    date: '2026-11-15',
+    title: '反相比例电路',
+    summary: '',
+    keyPoints: [],
+    markdownBody: '串联补偿电阻 $R\' = R // R_f$。',
+    symbolGlossary: [
+      { symbol: "R'", name: '平衡补偿电阻', definition: '同相端补偿电阻', unit: 'kΩ' },
+    ],
+    diagrams: [],
+    exercises: [],
+    generatedAt: '2026-11-15T00:00:00Z',
+  });
+  assert.equal(lookupSymbolInIndex(idx, "R'")?.name, '平衡补偿电阻');
+  assert.equal(lookupSymbolInIndex(idx, 'R′')?.name, '平衡补偿电阻');
+  assert.equal(lookupSymbolInIndex(idx, 'R'), null);
+});
+
+test('LessonPreview heuristic context renders inline LaTeX and enhanceDiagramSvg prevents narrow rect text overflow', async () => {
+  const { renderInlineMathWithLatex } = await import('./markdownMath');
+  const { enhanceDiagramSvg } = await import('./svgMath');
+
+  const renderedContext = renderInlineMathWithLatex(
+    "启发式思考 · 在证明复合函数链式法则 $\\frac{dy}{dx} = \\frac{dy}{du} \\cdot \\frac{du}{dx}$ 时，$\\lim_{\\Delta x \\to 0} \\frac{\\Delta y}{\\Delta x} = f'(u)g'(x)$。"
+  );
+  assert.equal(renderedContext.includes('class="katex"'), true);
+  assert.equal(renderedContext.includes('$\\frac'), false);
+
+  const narrowBoxSvg = `<svg viewBox="0 0 680 180" xmlns="http://www.w3.org/2000/svg">
+    <rect x="170" y="60" width="340" height="44" rx="8" fill="#18181b" stroke="#f59e0b" />
+    <text x="340" y="87" text-anchor="middle" font-size="15" font-weight="bold" fill="#fb923c">变化率（链式法则）：dy/dx = (dy/du) · (du/dx) = f'(u) · g'(x)</text>
+  </svg>`;
+  const enhanced = enhanceDiagramSvg(narrowBoxSvg);
+  const widthMatch = enhanced.match(/<rect[^>]*width="(\d+)"/i);
+  const heightMatch = enhanced.match(/<rect[^>]*height="(\d+)"/i);
+  const widened = widthMatch ? Number(widthMatch[1]) > 340 : false;
+  const wrappedTaller = heightMatch ? Number(heightMatch[1]) > 44 : false;
+  assert.equal(widened || wrappedTaller, true);
+});
+
+
+
 
 

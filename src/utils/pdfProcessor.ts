@@ -7,6 +7,11 @@ import type {
   PdfSplitPlanItem,
   PdfTocEntry,
 } from '../types';
+import {
+  normalizePdfSplitRegionObjects,
+  repairUnescapedLatexInJsonString,
+  tryParseJsonWithLatexRepair,
+} from './coursewareParser';
 import { ensureStableSectionId } from './learningLogic';
 
 type PdfLibModule = typeof import('pdf-lib');
@@ -448,35 +453,45 @@ export function applyPageOffsetToSplitPlan(
 
 /**
  * Parse and normalize a PDF Split Plan JSON imported via Chat Mode, Agent Mode, or LLM API.
+ * Also reports whether the payload explicitly requested incremental merge (`incremental: true` / `regionsPatch`).
  */
-export function parseImportedPdfSplitPlan(
+export function parseImportedPdfSplitPayload(
   rawInput: string | object,
   outline: DailyPlanSlot[],
   defaultSourceFileName: string,
   totalPages = 2000,
   defaultOffset = 0
-): PdfSplitPlanItem[] {
+): {
+  items: PdfSplitPlanItem[];
+  isIncremental: boolean;
+} {
   let parsed: any = rawInput;
   if (typeof rawInput === 'string') {
     const trimmed = rawInput.trim();
     if (!trimmed) {
       throw new Error('切分方案内容为空，请粘贴 JSON 格式的 PDF 切分方案。');
     }
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
+    parsed = tryParseJsonWithLatexRepair(trimmed);
+    if (!parsed) {
       const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
       if (fenceMatch) {
-        parsed = JSON.parse(fenceMatch[1].trim());
+        parsed = tryParseJsonWithLatexRepair(fenceMatch[1].trim());
+        if (!parsed) {
+          JSON.parse(repairUnescapedLatexInJsonString(fenceMatch[1].trim()));
+        }
       } else {
         const firstBrace = trimmed.indexOf('{');
         const lastBrace = trimmed.lastIndexOf('}');
         const firstBracket = trimmed.indexOf('[');
         const lastBracket = trimmed.lastIndexOf(']');
-        if (firstBrace !== -1 && (firstBracket === -1 || firstBrace < firstBracket)) {
-          parsed = JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+        if (firstBrace !== -1 && lastBrace > firstBrace && (firstBracket === -1 || firstBrace < firstBracket)) {
+          const slice = trimmed.slice(firstBrace, lastBrace + 1);
+          parsed = tryParseJsonWithLatexRepair(slice);
+          if (!parsed) JSON.parse(repairUnescapedLatexInJsonString(slice));
         } else if (firstBracket !== -1 && lastBracket > firstBracket) {
-          parsed = JSON.parse(trimmed.slice(firstBracket, lastBracket + 1));
+          const slice = trimmed.slice(firstBracket, lastBracket + 1);
+          parsed = tryParseJsonWithLatexRepair(slice);
+          if (!parsed) JSON.parse(repairUnescapedLatexInJsonString(slice));
         } else {
           throw new Error('未能识别有效的 JSON 切分方案格式。');
         }
@@ -484,17 +499,27 @@ export function parseImportedPdfSplitPlan(
     }
   }
 
+  const isIncremental = Boolean(
+    parsed &&
+    !Array.isArray(parsed) &&
+    (parsed.incremental === true ||
+      parsed.patchMode === 'merge' ||
+      Array.isArray(parsed.regionsPatch))
+  );
+
   const rawItems: any[] = Array.isArray(parsed)
     ? parsed
-    : Array.isArray(parsed?.regions)
-      ? parsed.regions
-      : Array.isArray(parsed?.segments)
-        ? parsed.segments
-        : Array.isArray(parsed?.splitPlan)
-          ? parsed.splitPlan
-          : Array.isArray(parsed?.days)
-            ? parsed.days
-            : [];
+    : Array.isArray(parsed?.regionsPatch)
+      ? parsed.regionsPatch
+      : Array.isArray(parsed?.regions)
+        ? parsed.regions
+        : Array.isArray(parsed?.segments)
+          ? parsed.segments
+          : Array.isArray(parsed?.splitPlan)
+            ? parsed.splitPlan
+            : Array.isArray(parsed?.days)
+              ? parsed.days
+              : [];
 
   if (rawItems.length === 0) {
     throw new Error('切分方案中未包含有效的区域页码数组（regions、segments 或 splitPlan）。');
@@ -514,73 +539,19 @@ export function parseImportedPdfSplitPlan(
         (typeof it.sectionId === 'string' && it.sectionId.startsWith('region-')))
   );
 
-  if (isPlaceholderOutline || usesRegionIds) {
-    return rawItems.map((item, idx) => {
-      const orderIdx = Number(item?.dayIndex) || idx + 1;
-      const rawId = item?.regionId || item?.sectionId || item?.slotId;
-      const regionId =
-        typeof rawId === 'string' && /^[a-zA-Z0-9_-]+$/.test(rawId.trim())
-          ? rawId.trim()
-          : `region-${String(idx + 1).padStart(2, '0')}`;
-
-      const itemOffset =
-        typeof item?.pageOffset === 'number' ? item.pageOffset : globalOffset;
-
-      let physicalStart = Number(item?.physicalStartPage ?? item?.startPage);
-      let physicalEnd = Number(item?.physicalEndPage ?? item?.endPage);
-      const printedStartRaw = item?.printedStartPage ?? item?.printStartPage;
-      const printedEndRaw = item?.printedEndPage ?? item?.printEndPage;
-      const printedStart = printedStartRaw !== undefined ? Number(printedStartRaw) : undefined;
-      const printedEnd = printedEndRaw !== undefined ? Number(printedEndRaw) : undefined;
-
-      if ((Number.isNaN(physicalStart) || physicalStart <= 0) && printedStart !== undefined) {
-        physicalStart = printedStart + itemOffset;
-      }
-      if ((Number.isNaN(physicalEnd) || physicalEnd <= 0) && printedEnd !== undefined) {
-        physicalEnd = printedEnd + itemOffset;
-      }
-
-      physicalStart = Math.max(1, Math.min(totalPages, physicalStart || 1));
-      physicalEnd = Math.max(physicalStart, Math.min(totalPages, physicalEnd || physicalStart));
-
-      const crossRefRaw = Array.isArray(item?.crossRefPages)
-        ? item.crossRefPages
-        : Array.isArray(item?.additionalPages)
-          ? item.additionalPages
-          : [];
-      const crossRefPages = crossRefRaw
-        .map(Number)
-        .filter((n: number) => !Number.isNaN(n) && n >= 1 && n <= totalPages);
-
-      const title =
-        String(item?.sectionTitle || item?.title || `划分区域 ${idx + 1}`).trim();
-
-      return {
-        sectionId: regionId,
-        dayIndex: orderIdx,
-        date: String(item?.date || ''),
-        sectionTitle: title,
-        sourceFileName: item?.sourceFileName || defaultSourceFileName,
-        physicalStartPage: physicalStart,
-        physicalEndPage: physicalEnd,
-        printedStartPage: printedStart ?? Math.max(1, physicalStart - itemOffset),
-        printedEndPage: printedEnd ?? Math.max(1, physicalEnd - itemOffset),
-        pageOffset: itemOffset,
-        crossRefPages,
-        outlineMappingNote:
-          item?.outlineMappingNote ||
-          item?.rationale ||
-          item?.mappingNote ||
-          `学习区域 ${regionId}（物理第 ${physicalStart}~${physicalEnd} 页）`,
-        segmentFileName: `${regionId}.pdf`,
-        status: item?.status === 'sliced' ? 'sliced' : 'planned',
-        segmentRelPath: item?.segmentRelPath,
-        segmentPageCount: item?.segmentPageCount,
-      };
-    });
+  if (isPlaceholderOutline || usesRegionIds || isIncremental) {
+    return {
+      isIncremental,
+      items: normalizePdfSplitRegionObjects(
+        rawItems,
+        defaultSourceFileName,
+        totalPages,
+        globalOffset
+      ),
+    };
   }
 
-  return outline.map((slot, idx) => {
+  const mapped = outline.map((slot, idx) => {
     const sectionId = ensureStableSectionId(slot.dayIndex, slot.id);
     const matched =
       rawItems.find(
@@ -646,9 +617,30 @@ export function parseImportedPdfSplitPlan(
         matched?.mappingNote ||
         `对应第 ${slot.dayIndex} 讲《${slot.title}》`,
       segmentFileName: `${outSecId}.pdf`,
-      status: 'planned',
+      status: 'planned' as const,
     };
   });
+
+  return {
+    isIncremental,
+    items: mapped,
+  };
+}
+
+export function parseImportedPdfSplitPlan(
+  rawInput: string | object,
+  outline: DailyPlanSlot[],
+  defaultSourceFileName: string,
+  totalPages = 2000,
+  defaultOffset = 0
+): PdfSplitPlanItem[] {
+  return parseImportedPdfSplitPayload(
+    rawInput,
+    outline,
+    defaultSourceFileName,
+    totalPages,
+    defaultOffset
+  ).items;
 }
 
 /**
@@ -661,12 +653,15 @@ export async function executePdfSplitPlanOnDisk(params: {
   courseRelDir: string;
   splitPlan: PdfSplitPlanItem[];
   targetSectionId?: string;
+  outputDir?: string;
 }): Promise<PdfSplitPlanItem[]> {
-  const { courseDir, courseRelDir, splitPlan, targetSectionId } = params;
+  const { courseDir, courseRelDir, splitPlan, targetSectionId, outputDir } = params;
   const sourcesDir = path.join(courseDir, 'sources');
-  const segmentsDir = path.join(courseDir, 'segments');
+  const courseSegmentsDir = path.join(courseDir, 'segments');
+  const segmentsDir = outputDir || courseSegmentsDir;
 
   fs.mkdirSync(sourcesDir, { recursive: true });
+  fs.mkdirSync(courseSegmentsDir, { recursive: true });
   fs.mkdirSync(segmentsDir, { recursive: true });
 
   const pdfLib = await getPdfLib();
@@ -812,7 +807,7 @@ export async function executePdfSplitPlanOnDisk(params: {
   }
 
   fs.writeFileSync(
-    path.join(segmentsDir, 'split-plan.json'),
+    path.join(courseSegmentsDir, 'split-plan.json'),
     JSON.stringify(updatedPlan, null, 2),
     'utf-8'
   );

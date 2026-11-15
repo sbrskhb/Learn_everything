@@ -207,9 +207,13 @@ export const LessonPreviewModal: React.FC<LessonPreviewModalProps> = ({
       key={key}
       className="border border-sky-900/60 bg-sky-950/20 rounded-lg p-4 space-y-2 my-3 text-xs"
     >
-      <div className="flex items-center justify-between text-sky-300 font-medium">
-        <span>启发式思考 · {hq.context || hq.id}</span>
-        <span className="font-mono text-[11px] text-sky-400/70">{hq.id}</span>
+      <div className="flex items-center justify-between gap-2 text-sky-300 font-medium">
+        <span
+          dangerouslySetInnerHTML={{
+            __html: renderInlineMathWithLatex(`启发式思考 · ${hq.context || hq.id}`, visualAssets),
+          }}
+        />
+        <span className="font-mono text-[11px] text-sky-400/70 shrink-0">{hq.id}</span>
       </div>
       <div
         className="text-neutral-100 leading-relaxed"

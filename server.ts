@@ -1,5 +1,6 @@
 import express from 'express';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import dotenv from 'dotenv';
 import { spawn, spawnSync, type ChildProcess } from 'child_process';
@@ -43,7 +44,9 @@ import {
   mapLegacyLevelToDualAxis,
 } from './src/utils/learnerProfile';
 import {
+  buildPdfSplitIncrementalRepairPrompt,
   extractPendingDiagramSpecs,
+  mergeImportedPdfSplitRegions,
   mergeStage2DiagramsIntoStage1,
   parseImportedLessonContent,
   parseImportedSyllabusContent,
@@ -58,6 +61,7 @@ import {
   buildHeuristicPdfSplitPlan,
   createMultiPagePdfBuffer,
   executePdfSplitPlanOnDisk,
+  parseImportedPdfSplitPayload,
   parseImportedPdfSplitPlan,
 } from './src/utils/pdfProcessor';
 import {
@@ -1345,6 +1349,92 @@ function saveDb(db: DatabaseSchema): void {
   );
 }
 
+function getTempSegmentsDir(folderName: string): string {
+  return path.join(os.tmpdir(), 'learn_everything_segments', folderName || 'default');
+}
+
+function cleanupCourseSegmentPdfs(
+  course: Course,
+  opts?: { onlyCompleted?: boolean; removeLegacyCourseDirPdfs?: boolean }
+): void {
+  try {
+    const { folderName, absCourseDir } = getCourseDirectory(course);
+    const legacySegDir = path.join(absCourseDir, 'segments');
+    const tempSegDir = getTempSegmentsDir(folderName);
+
+    let activeRegionIds: Set<string> | null = null;
+    if (opts?.onlyCompleted && Array.isArray(course.dailyPlan) && course.dailyPlan.length > 0) {
+      activeRegionIds = new Set<string>();
+      for (const slot of course.dailyPlan) {
+        if (slot.lesson) continue;
+        for (const seg of resolveSlotPdfSegments(slot, course.pdfSplitPlan)) {
+          if (seg.sectionId) activeRegionIds.add(seg.sectionId);
+        }
+        if (slot.regionId) activeRegionIds.add(slot.regionId);
+        if (Array.isArray(slot.regionIds)) {
+          for (const rid of slot.regionIds) {
+            if (rid) activeRegionIds.add(rid);
+          }
+        }
+      }
+    }
+
+    const purgeDir = (dirPath: string) => {
+      if (!fs.existsSync(dirPath)) return;
+      for (const f of fs.readdirSync(dirPath)) {
+        if (!f.toLowerCase().endsWith('.pdf')) continue;
+        const stem = f.slice(0, -4);
+        if (activeRegionIds && activeRegionIds.has(stem)) continue;
+        try {
+          fs.unlinkSync(path.join(dirPath, f));
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    purgeDir(tempSegDir);
+    if (opts?.removeLegacyCourseDirPdfs || opts?.onlyCompleted) {
+      purgeDir(legacySegDir);
+    }
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
+async function ensureRegionPdfExists(
+  course: Course,
+  sectionId: string
+): Promise<string | null> {
+  const safeSecId = sectionId.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!safeSecId) return null;
+  const { folderName, absCourseDir, relCourseDir } = getCourseDirectory(course);
+  const legacyPath = path.join(absCourseDir, 'segments', `${safeSecId}.pdf`);
+  if (fs.existsSync(legacyPath)) return legacyPath;
+
+  const tempDir = getTempSegmentsDir(folderName);
+  const tempPath = path.join(tempDir, `${safeSecId}.pdf`);
+  if (fs.existsSync(tempPath)) return tempPath;
+
+  if (!Array.isArray(course.pdfSplitPlan) || course.pdfSplitPlan.length === 0) {
+    return null;
+  }
+  const hasRegion = course.pdfSplitPlan.some(
+    (item) => ensureStableSectionId(item.dayIndex, item.sectionId) === safeSecId
+  );
+  if (!hasRegion) return null;
+
+  await executePdfSplitPlanOnDisk({
+    courseDir: absCourseDir,
+    courseRelDir: relCourseDir,
+    splitPlan: course.pdfSplitPlan,
+    targetSectionId: safeSecId,
+    outputDir: tempDir,
+  });
+
+  return fs.existsSync(tempPath) ? tempPath : null;
+}
+
 function loadCoursePdfAttachments(
   course: Course,
   scope: 'sources' | 'segments' | 'slot',
@@ -1352,24 +1442,33 @@ function loadCoursePdfAttachments(
   maxTotalBytes = 15 * 1024 * 1024
 ): Array<{ fileName: string; base64Data: string }> {
   try {
-    const { absCourseDir } = getCourseDirectory(course);
+    const { folderName, absCourseDir } = getCourseDirectory(course);
     const sourcesDir = path.join(absCourseDir, 'sources');
     const segmentsDir = path.join(absCourseDir, 'segments');
+    const tempSegDir = getTempSegmentsDir(folderName);
     const candidateFiles: Array<{ fileName: string; absPath: string }> = [];
 
     if (scope === 'slot' && targetSectionId) {
       const safeId = targetSectionId.replace(/[^a-zA-Z0-9_-]/g, '');
-      const segPdf = path.join(segmentsDir, `${safeId}.pdf`);
-      if (safeId && fs.existsSync(segPdf)) {
-        candidateFiles.push({ fileName: `${safeId}.pdf`, absPath: segPdf });
+      const legacyPdf = path.join(segmentsDir, `${safeId}.pdf`);
+      const tempPdf = path.join(tempSegDir, `${safeId}.pdf`);
+      const chosen = safeId && fs.existsSync(legacyPdf) ? legacyPdf : safeId && fs.existsSync(tempPdf) ? tempPdf : null;
+      if (chosen) {
+        candidateFiles.push({ fileName: `${safeId}.pdf`, absPath: chosen });
       }
-    } else if (scope === 'segments' && fs.existsSync(segmentsDir)) {
-      const segFiles = fs
-        .readdirSync(segmentsDir)
-        .filter((f) => f.toLowerCase().endsWith('.pdf'))
-        .sort();
-      for (const f of segFiles.slice(0, 12)) {
-        candidateFiles.push({ fileName: f, absPath: path.join(segmentsDir, f) });
+    } else if (scope === 'segments') {
+      const seenNames = new Set<string>();
+      for (const dir of [segmentsDir, tempSegDir]) {
+        if (!fs.existsSync(dir)) continue;
+        const segFiles = fs
+          .readdirSync(dir)
+          .filter((f) => f.toLowerCase().endsWith('.pdf'))
+          .sort();
+        for (const f of segFiles) {
+          if (seenNames.has(f) || candidateFiles.length >= 12) continue;
+          seenNames.add(f);
+          candidateFiles.push({ fileName: f, absPath: path.join(dir, f) });
+        }
       }
     }
 
@@ -2045,6 +2144,7 @@ async function generateDailyLesson(
     .slice(0, 18000);
 
   const slotSegmentId = slot.pdfSegment?.sectionId || slot.regionId || sectionId;
+  await ensureRegionPdfExists(course, slotSegmentId);
   const slotPdfAttachments = loadCoursePdfAttachments(course, 'slot', slotSegmentId);
   const totalPdfKb = Math.round(
     slotPdfAttachments.reduce((acc, att) => acc + (att.base64Data.length * 3) / 4, 0) / 1024
@@ -2991,6 +3091,7 @@ async function startServer() {
 
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
       saveDb(db);
 
       res.json({ course });
@@ -3054,6 +3155,7 @@ async function startServer() {
 
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
       saveDb(db);
 
       res.json({ course });
@@ -3102,6 +3204,7 @@ async function startServer() {
 
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
       saveDb(db);
 
       res.json({ course });
@@ -3136,6 +3239,11 @@ async function startServer() {
       courseRelDir: relCourseDir,
     });
 
+    const promptsDir = path.join(absCourseDir, 'prompts');
+    fs.mkdirSync(promptsDir, { recursive: true });
+    fs.writeFileSync(path.join(promptsDir, 'pdf-split-prompt.md'), prompts.chatSplitPrompt, 'utf-8');
+    fs.writeFileSync(path.join(promptsDir, 'agent-split-prompt.md'), prompts.agentSplitPrompt, 'utf-8');
+
     res.json({
       courseRelDir: relCourseDir,
       pdfMetas,
@@ -3143,6 +3251,8 @@ async function startServer() {
       pageOffset: course.pdfPageOffset || 0,
       agentSplitPrompt: prompts.agentSplitPrompt,
       chatSplitPrompt: prompts.chatSplitPrompt,
+      chatSplitPromptMdRelPath: 'prompts/pdf-split-prompt.md',
+      agentSplitPromptMdRelPath: 'prompts/agent-split-prompt.md',
     });
   });
 
@@ -3210,6 +3320,7 @@ async function startServer() {
 
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
       saveDb(db);
 
       res.json({
@@ -3244,14 +3355,44 @@ async function startServer() {
       }
 
       let nextPlan: PdfSplitPlanItem[] = [];
+      let importedIncremental = false;
       if (typeof rawContent === 'string' && rawContent.trim()) {
-        nextPlan = parseImportedPdfSplitPlan(
-          rawContent,
-          [],
-          defaultSource,
-          totalPages,
-          course.pdfPageOffset || 0
-        );
+        try {
+          const parsedPayload = parseImportedPdfSplitPayload(
+            rawContent,
+            [],
+            defaultSource,
+            totalPages,
+            course.pdfPageOffset || 0
+          );
+          importedIncremental = parsedPayload.isIncremental;
+          nextPlan = parsedPayload.isIncremental
+            ? mergeImportedPdfSplitRegions(course.pdfSplitPlan || [], parsedPayload.items)
+            : parsedPayload.items;
+        } catch (parseErr: any) {
+          const salvage = buildPdfSplitIncrementalRepairPrompt({
+            rawInput: rawContent,
+            errorMessage: parseErr?.message || 'PDF 区域划分 JSON 解析失败',
+            defaultSourceFileName: defaultSource,
+            totalPages,
+            defaultOffset: course.pdfPageOffset || 0,
+          });
+          if (salvage.salvagedRegions.length > 0) {
+            course.pdfSplitPlan = salvage.salvagedRegions;
+            const settings = loadSettings();
+            await persistCourseToFolder(course, settings);
+            saveDb(db);
+          }
+          res.status(400).json({
+            error: parseErr?.message || 'PDF 区域划分 JSON 解析失败',
+            repairPrompt: salvage.repairPrompt,
+            salvagedRegions: salvage.salvagedRegions,
+            brokenSnippet: salvage.brokenSnippet,
+            course: salvage.salvagedRegions.length > 0 ? course : undefined,
+            splitPlan: salvage.salvagedRegions.length > 0 ? course.pdfSplitPlan : undefined,
+          });
+          return;
+        }
       } else if (Array.isArray(splitPlan)) {
         nextPlan = parseImportedPdfSplitPlan(
           { regions: splitPlan, pageOffset: course.pdfPageOffset },
@@ -3310,11 +3451,13 @@ async function startServer() {
       course.dailyPlan = bindAndEnsureAllPdfRegionsCovered(course.dailyPlan, course.pdfSplitPlan);
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
       saveDb(db);
 
       res.json({
         course,
         splitPlan: course.pdfSplitPlan,
+        incrementalMerged: importedIncremental,
       });
     } catch (err: any) {
       res.status(400).json({ error: err?.message || '导入或更新 PDF 区域划分方案失败' });
@@ -3352,12 +3495,15 @@ async function startServer() {
         return;
       }
 
-      const { absCourseDir, relCourseDir } = getCourseDirectory(course);
+      const { folderName, absCourseDir, relCourseDir } = getCourseDirectory(course);
+      const tempSegDir = getTempSegmentsDir(folderName);
+      cleanupCourseSegmentPdfs(course, { removeLegacyCourseDirPdfs: true });
       const executedPlan = await executePdfSplitPlanOnDisk({
         courseDir: absCourseDir,
         courseRelDir: relCourseDir,
         splitPlan: course.pdfSplitPlan,
         targetSectionId: typeof sectionId === 'string' ? sectionId : undefined,
+        outputDir: tempSegDir,
       });
 
       course.pdfSplitPlan = executedPlan;
@@ -3376,8 +3522,8 @@ async function startServer() {
     }
   });
 
-  // 7e. Serve or download a sliced section PDF (`courses/<课程名称>/segments/<sectionId>.pdf`)
-  app.get('/api/courses/:courseId/segments/:sectionId/pdf', (req, res) => {
+  // 7e. Serve or download a sliced section PDF (on-demand from temp/segments dir)
+  app.get('/api/courses/:courseId/segments/:sectionId/pdf', async (req, res) => {
     const { courseId, sectionId } = req.params;
     const download = req.query.download === '1';
     const db = loadDb();
@@ -3387,11 +3533,10 @@ async function startServer() {
       return;
     }
 
-    const { absCourseDir } = getCourseDirectory(course);
     const safeSecId = sectionId.replace(/[^a-zA-Z0-9_-]/g, '');
-    const pdfPath = path.join(absCourseDir, 'segments', `${safeSecId}.pdf`);
+    const pdfPath = await ensureRegionPdfExists(course, safeSecId);
 
-    if (!fs.existsSync(pdfPath)) {
+    if (!pdfPath || !fs.existsSync(pdfPath)) {
       res.status(404).json({ error: '该小节尚未生成切分 PDF，请先执行本地切割。' });
       return;
     }
@@ -3452,6 +3597,7 @@ async function startServer() {
 
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
       saveDb(db);
 
       res.json({
@@ -3477,6 +3623,7 @@ async function startServer() {
       course.generationMode = generationMode;
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
       saveDb(db);
     }
     res.json({ course });
@@ -3596,12 +3743,23 @@ async function startServer() {
       .map((m) => `【${m.fileName}】\n${m.extractedText}`)
       .join('\n\n');
 
+    const rootPromptsDir = path.join(absCourseDir, 'prompts');
+    fs.mkdirSync(rootPromptsDir, { recursive: true });
+    fs.writeFileSync(path.join(rootPromptsDir, 'syllabus-prompt.md'), syllabusPrompt, 'utf-8');
+    fs.writeFileSync(
+      path.join(rootPromptsDir, 'pdf-split-prompt.md'),
+      splitPrompts.chatSplitPrompt,
+      'utf-8'
+    );
+
     if (!slot) {
       if (course.dailyPlan.length === 0 && dayNum === 1) {
         res.json({
           lessonPrompt: '',
           syllabusPrompt,
+          syllabusPromptMdRelPath: 'prompts/syllabus-prompt.md',
           chatSplitPrompt: splitPrompts.chatSplitPrompt,
+          chatSplitPromptMdRelPath: 'prompts/pdf-split-prompt.md',
           sectionId: 'sec-01',
           dayIndex: 1,
           date: course.startDate,
@@ -3639,11 +3797,11 @@ async function startServer() {
     fs.mkdirSync(promptsDir, { recursive: true });
     fs.mkdirSync(secPromptDir, { recursive: true });
 
-    const promptMdRelPath = `prompts/${secId}/prompt.md`;
+    const promptMdRelPath = `prompts/${secId}-prompt.md`;
     fs.writeFileSync(path.join(secPromptDir, 'prompt.md'), lessonPrompt, 'utf-8');
-    fs.writeFileSync(path.join(promptsDir, `${secId}-prompt.md`), stage1Prompt, 'utf-8');
+    fs.writeFileSync(path.join(promptsDir, `${secId}-prompt.md`), lessonPrompt, 'utf-8');
 
-    const stage1PromptMdRelPath = `prompts/${secId}/stage1-prompt.md`;
+    const stage1PromptMdRelPath = `prompts/${secId}-stage1-prompt.md`;
     fs.writeFileSync(path.join(secPromptDir, 'stage1-prompt.md'), stage1Prompt, 'utf-8');
     fs.writeFileSync(path.join(promptsDir, `${secId}-stage1-prompt.md`), stage1Prompt, 'utf-8');
 
@@ -3670,7 +3828,7 @@ async function startServer() {
         : '';
     let stage2PromptMdRelPath = '';
     if (stage2Prompt) {
-      stage2PromptMdRelPath = `prompts/${secId}/stage2-prompt.md`;
+      stage2PromptMdRelPath = `prompts/${secId}-stage2-prompt.md`;
       fs.writeFileSync(path.join(secPromptDir, 'stage2-prompt.md'), stage2Prompt, 'utf-8');
       fs.writeFileSync(path.join(promptsDir, `${secId}-stage2-prompt.md`), stage2Prompt, 'utf-8');
     }
@@ -3682,8 +3840,9 @@ async function startServer() {
       stage: 'stage1',
       teachingSystemPrompt,
     });
-    const agentStage1PromptMdRelPath = `prompts/${secId}/agent-stage1-prompt.md`;
+    const agentStage1PromptMdRelPath = `prompts/${secId}-agent-stage1-prompt.md`;
     fs.writeFileSync(path.join(secPromptDir, 'agent-stage1-prompt.md'), agentStage1Prompt, 'utf-8');
+    fs.writeFileSync(path.join(promptsDir, `${secId}-agent-stage1-prompt.md`), agentStage1Prompt, 'utf-8');
 
     const agentStage2Prompt =
       allStageDiagramSpecs.length > 0
@@ -3698,8 +3857,9 @@ async function startServer() {
         : '';
     let agentStage2PromptMdRelPath = '';
     if (agentStage2Prompt) {
-      agentStage2PromptMdRelPath = `prompts/${secId}/agent-stage2-prompt.md`;
+      agentStage2PromptMdRelPath = `prompts/${secId}-agent-stage2-prompt.md`;
       fs.writeFileSync(path.join(secPromptDir, 'agent-stage2-prompt.md'), agentStage2Prompt, 'utf-8');
+      fs.writeFileSync(path.join(promptsDir, `${secId}-agent-stage2-prompt.md`), agentStage2Prompt, 'utf-8');
     }
 
     res.json({
@@ -3865,6 +4025,7 @@ async function startServer() {
 
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
       saveDb(db);
       res.json({ course, lesson: slot.lesson, stage1Draft: slot.stage1Draft });
     } catch (err: any) {
@@ -3904,6 +4065,7 @@ async function startServer() {
 
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
       saveDb(db);
 
       res.json({ course });
@@ -4110,6 +4272,7 @@ async function startServer() {
 
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
       saveDb(db);
 
       if (wantsStream) {
@@ -4427,6 +4590,7 @@ async function startServer() {
 
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
       saveDb(db);
 
       const listRes = await callPythonJson(
@@ -4522,6 +4686,7 @@ async function startServer() {
 
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
       saveDb(db);
 
       const listRes = await callPythonJson(
@@ -4538,8 +4703,89 @@ async function startServer() {
     }
   });
 
+  function restoreSlotTitleFromOutline(course: Course, slot: DailyPlanSlot): string {
+    const matchedRegions = resolveSlotPdfSegments(slot, course.pdfSplitPlan);
+    const regionTitles = matchedRegions
+      .map((r) => (r.sectionTitle || '').trim())
+      .filter(Boolean);
+    if (regionTitles.length > 0) {
+      slot.title = regionTitles.join('、');
+      return slot.title;
+    }
+    const scopeMatch = (slot.teachingScope || '').match(
+      /对应区域\s+[A-Za-z0-9_-]+\s*[（(]([^，,）)]+)/
+    );
+    if (scopeMatch && scopeMatch[1]?.trim()) {
+      slot.title = scopeMatch[1].trim();
+      return slot.title;
+    }
+    return slot.title;
+  }
+
+  async function clearSingleLessonFromDiskAndSlot(
+    course: Course,
+    slot: DailyPlanSlot,
+    restoreOutlineTitle: boolean
+  ) {
+    const { folderName, absCourseDir } = getCourseDirectory(course);
+    const secId = ensureStableSectionId(slot.dayIndex, slot.id);
+    for (const rel of [`lessons/${secId}.json`, `lessons/${secId}.stage1.json`]) {
+      await callPythonJson(
+        `/api/py/courses/files?folder=${encodeURIComponent(folderName)}&path=${encodeURIComponent(rel)}`,
+        { method: 'DELETE' }
+      ).catch(() => null);
+    }
+
+    for (const candidate of [
+      path.join(absCourseDir, 'lessons', `${secId}.json`),
+      path.join(absCourseDir, 'lessons', `${secId}.stage1.json`),
+      path.join(absCourseDir, 'lessons', `day-${String(slot.dayIndex).padStart(2, '0')}.json`),
+    ]) {
+      if (fs.existsSync(candidate)) {
+        fs.unlinkSync(candidate);
+      }
+    }
+
+    slot.lesson = undefined;
+    slot.stage1Draft = undefined;
+    slot.estimatedMinutes = undefined;
+    if (restoreOutlineTitle) {
+      restoreSlotTitleFromOutline(course, slot);
+    }
+  }
+
   // 27. Delete a single generated lesson (`lessons/sec-XX.json` & `day-XX.json`) via Python backend
   app.delete('/api/courses/:courseId/days/:dayIndex/lesson', async (req, res) => {
+    try {
+      const { courseId, dayIndex } = req.params;
+      const restoreOutline = req.query.resetFromOutline === '1';
+      const dayNum = Number(dayIndex);
+      const db = loadDb();
+      const course = db.courses.find((c) => c.id === courseId);
+      if (!course) {
+        res.status(404).json({ error: '未找到该课程' });
+        return;
+      }
+      const slot = course.dailyPlan.find((d) => d.dayIndex === dayNum);
+      if (!slot) {
+        res.status(404).json({ error: '未找到指定小节' });
+        return;
+      }
+
+      await clearSingleLessonFromDiskAndSlot(course, slot, restoreOutline);
+      const settings = loadSettings();
+      await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
+      saveDb(db);
+
+      res.json({ ok: true, course });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || '删除小节课件失败' });
+    }
+  });
+
+  // 27b. Reset a single section back to its original outline spec for clean regeneration
+  app.post('/api/courses/:courseId/days/:dayIndex/reset-to-outline', async (req, res) => {
     try {
       const { courseId, dayIndex } = req.params;
       const dayNum = Number(dayIndex);
@@ -4555,31 +4801,15 @@ async function startServer() {
         return;
       }
 
-      const { folderName, absCourseDir } = getCourseDirectory(course);
-      const secId = ensureStableSectionId(slot.dayIndex, slot.id);
-      await callPythonJson(
-        `/api/py/courses/files?folder=${encodeURIComponent(folderName)}&path=${encodeURIComponent(`lessons/${secId}.json`)}`,
-        { method: 'DELETE' }
-      ).catch(() => null);
-
-      for (const candidate of [
-        path.join(absCourseDir, 'lessons', `${secId}.json`),
-        path.join(absCourseDir, 'lessons', `day-${String(slot.dayIndex).padStart(2, '0')}.json`),
-      ]) {
-        if (fs.existsSync(candidate)) {
-          fs.unlinkSync(candidate);
-        }
-      }
-
-      slot.lesson = undefined;
-      slot.estimatedMinutes = undefined;
+      await clearSingleLessonFromDiskAndSlot(course, slot, true);
       const settings = loadSettings();
       await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
       saveDb(db);
 
-      res.json({ ok: true, course });
+      res.json({ ok: true, course, restoredTitle: slot.title });
     } catch (err: any) {
-      res.status(500).json({ error: err?.message || '删除小节课件失败' });
+      res.status(500).json({ error: err?.message || '按大纲重置小节失败' });
     }
   });
 
@@ -4701,6 +4931,10 @@ async function startServer() {
       normalizedRel = normalizedRel.slice(relCourseDir.length + 1);
     }
     try {
+      if (normalizedRel.startsWith('segments/') && normalizedRel.toLowerCase().endsWith('.pdf')) {
+        const segId = path.basename(normalizedRel, '.pdf');
+        await ensureRegionPdfExists(course, segId);
+      }
       const pyRes = await callPythonJson('/api/py/courses/files/copy-clipboard', {
         method: 'POST',
         body: { folder: folderName, path: normalizedRel },
@@ -4711,6 +4945,65 @@ async function startServer() {
       });
     } catch (err: any) {
       res.status(500).json({ error: err?.message || '复制文件到系统剪贴板失败' });
+    }
+  });
+
+  // 31c. Write a prompt string to courses/<folder>/prompts/<fileName>.md and copy that .md file to OS file clipboard
+  app.post('/api/courses/:courseId/prompts/copy-md-clipboard', async (req, res) => {
+    const { courseId } = req.params;
+    const rawFileName = String(req.body?.fileName || 'prompt.md').trim();
+    const content = typeof req.body?.content === 'string' ? req.body.content : '';
+    if (!content.trim()) {
+      res.status(400).json({ error: '提示词内容为空，无法生成 .md 文件' });
+      return;
+    }
+
+    const db = loadDb();
+    const course = db.courses.find((c) => c.id === courseId);
+    if (!course) {
+      res.status(404).json({ error: '未找到该课程' });
+      return;
+    }
+
+    const { folderName, absCourseDir } = getCourseDirectory(course);
+    const cleanedSegments = rawFileName
+      .replace(/\\/g, '/')
+      .replace(/^\/+/, '')
+      .replace(/^prompts\//i, '')
+      .split('/')
+      .map((seg) => seg.replace(/[^a-zA-Z0-9._\-\u4e00-\u9fff]/g, '_'))
+      .filter((seg) => seg && seg !== '.' && seg !== '..');
+
+    const safeFileParts = cleanedSegments.length > 0 ? cleanedSegments : ['prompt.md'];
+    const lastIdx = safeFileParts.length - 1;
+    if (!safeFileParts[lastIdx].toLowerCase().endsWith('.md')) {
+      safeFileParts[lastIdx] = `${safeFileParts[lastIdx]}.md`;
+    }
+
+    const relPath = `prompts/${safeFileParts.join('/')}`;
+    const absTargetPath = path.resolve(absCourseDir, relPath);
+    const absPromptsRoot = path.resolve(absCourseDir, 'prompts');
+    if (!absTargetPath.startsWith(absPromptsRoot + path.sep) && absTargetPath !== absPromptsRoot) {
+      res.status(400).json({ error: '非法的提示词文件路径' });
+      return;
+    }
+
+    fs.mkdirSync(path.dirname(absTargetPath), { recursive: true });
+    fs.writeFileSync(absTargetPath, content, 'utf-8');
+
+    try {
+      const pyRes = await callPythonJson('/api/py/courses/files/copy-clipboard', {
+        method: 'POST',
+        body: { folder: folderName, path: relPath },
+      });
+      res.status(pyRes.status).json({
+        ...pyRes.data,
+        relPath,
+        fileName: path.basename(absTargetPath),
+        downloadUrl: `/api/courses/${courseId}/files/download?path=${encodeURIComponent(relPath)}&download=1`,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || '复制提示词 .md 文件到剪贴板失败' });
     }
   });
 

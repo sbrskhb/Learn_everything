@@ -205,6 +205,9 @@ export function normalizeSymbolKeys(raw: string): {
 
   // Replace Greek / math commands with Unicode equivalents
   work = work.replace(/\\([A-Za-z]+)/g, (_m, cmd: string) => {
+    if (cmd === 'prime') {
+      return "'";
+    }
     if (GREEK_COMMAND_TO_UNICODE[cmd]) {
       return GREEK_COMMAND_TO_UNICODE[cmd];
     }
@@ -234,8 +237,10 @@ export function normalizeSymbolKeys(raw: string): {
     return cmd;
   });
 
+  // Preserve prime marks (normalized to ASCII `'`) so `R` and `R'` stay distinct
   work = stripCombiningAndAccents(work)
-    .replace(/[\u200B-\u200D\uFEFF\u2060{}_\^\s,，;；:：()\[\]'′]+/g, '')
+    .replace(/′/g, "'")
+    .replace(/[\u200B-\u200D\uFEFF\u2060{}_\^\s,，;；:：()\[\]]+/g, '')
     .trim();
 
   if (!work || work.length > 18) return null;
