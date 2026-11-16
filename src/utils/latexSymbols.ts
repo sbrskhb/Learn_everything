@@ -385,10 +385,10 @@ function mineSymbolsFromText(text: string, baseOffset: number): MinedCandidate[]
   }
 
   // 2. Inline math spans `$sym$` or `$sym = ...$`
-  const inlineMathRe = /(?<!\\)\$([^\n$]{1,80}?)(?<!\\)\$/g;
+  const inlineMathRe = /(^|[^\\])\$((?:\\.|[^\n$\\]){1,80}?)\$/g;
   let match: RegExpExecArray | null;
   while ((match = inlineMathRe.exec(text)) !== null) {
-    const rawInside = match[1].trim();
+    const rawInside = match[2].trim();
     const matchStart = match.index;
     const matchEnd = matchStart + match[0].length;
 

@@ -23,6 +23,7 @@ export type CoursewareIssueCategory =
   | 'json_syntax_error'
   | 'latex_error'
   | 'unclosed_math'
+  | 'suspicious_math'
   | 'missing_diagram'
   | 'missing_anchor'
   | 'svg_error'
@@ -67,7 +68,7 @@ function stripNonProseRegionsForLeakScan(text: string): string {
     .replace(/`[^`\n]+`/g, ' ')
     .replace(/\$\$[\s\S]+?\$\$/g, ' ')
     .replace(/\\\[[\s\S]+?\\\]/g, ' ')
-    .replace(/(?<!\\)\$([^\n$]+?)(?<!\\)\$/g, ' ')
+    .replace(/(^|[^\\])\$(?:\\.|[^\n$\\])+?\$/g, '$1 ')
     .replace(/\\\([\s\S]+?\\\)/g, ' ');
 }
 
@@ -79,6 +80,82 @@ function stripSafeHtmlContainers(html: string): string {
     .replace(/<code[\s\S]*?<\/code>/gi, ' ')
     .replace(/<svg[\s\S]*?<\/svg>/gi, ' ')
     .replace(/<[^>]+>/g, ' ');
+}
+
+const TEXT_WRAPPER_CMD_RE =
+  /\\(?:text|mathrm|mbox|operatorname|mathbf|mathit|tag)\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}/g;
+
+function detectSuspiciousMathInSegment(params: {
+  tex: string;
+  rawBody: string;
+  displayMode: boolean;
+  offset: number;
+  scanWork: string;
+  fieldLabel: string;
+  isBlockMarkdown: boolean;
+  issues: CoursewareDiagnosticIssue[];
+}) {
+  const { tex, rawBody, displayMode, offset, scanWork, fieldLabel, isBlockMarkdown, issues } = params;
+  const lineNo = findLineNumber(scanWork, offset);
+  const locationLabel = isBlockMarkdown ? `${fieldLabel}（第 ${lineNo} 行附近）` : fieldLabel;
+  const rawSnippet = truncateSnippet(displayMode ? `$$${rawBody.trim()}$$` : `$${rawBody.trim()}$`);
+  const mathOnlyTex = tex.replace(TEXT_WRAPPER_CMD_RE, ' ');
+
+  // A. Stray $ or \$ inside a math segment (strong indicator of delimiter mismatch)
+  if (/\\?\$/.test(mathOnlyTex)) {
+    issues.push({
+      id: `suspicious-dollar-${issues.length + 1}`,
+      severity: 'warning',
+      category: 'suspicious_math',
+      categoryLabel: '公式内部疑似混入错位 $ 符号（需 AI 复查）',
+      locationLabel,
+      rawSnippet,
+      detail: '该公式虽符合 LaTeX 语法，但内部出现了 "$" 或 "\\$"，通常是定界符配对错位或公式被意外拆开所致。',
+      fixInstruction: '请复查该处 "$...$" 定界符边界，确保完整数学表达式由成对 "$...$" 包裹且内部不含多余 "$"。',
+    });
+    return;
+  }
+
+  // B. Bare CJK prose or CJK sentence punctuation swallowed inside math delimiters
+  const hasBareCjk = /[\u4e00-\u9fff]{2,}|[\u4e00-\u9fff][^\n]*[，。；：？！]|[，。；：？！][^\n]*[\u4e00-\u9fff]/.test(
+    mathOnlyTex
+  );
+  const hasSwallowedCjkClause =
+    !displayMode &&
+    /[\u4e00-\u9fff]/.test(tex) &&
+    /[，。；：？！]/.test(tex) &&
+    (tex.match(/[\u4e00-\u9fff]/g) || []).length >= 6;
+  if (hasBareCjk || hasSwallowedCjkClause) {
+    issues.push({
+      id: `suspicious-cjk-${issues.length + 1}`,
+      severity: 'warning',
+      category: 'suspicious_math',
+      categoryLabel: '公式内疑似吞入中文正文（需 AI 复查）',
+      locationLabel,
+      rawSnippet,
+      detail: '检测到数学定界符内部包含裸露中文或完整中文从句，常见原因是前后两个公式各漏/错位了一个 "$"。',
+      fixInstruction: '请复查该处 "$...$" 起止位置，将中文正文移出公式定界符（公式内简短文字请用 \\text{...}）。',
+    });
+    return;
+  }
+
+  // C. Syntactically valid but mathematically unreasonable superscript/subscript (e.g. x^{2+}ax+b, x^{n+})
+  const badScriptMatch =
+    mathOnlyTex.match(/\^\{([0-9]+[+\-*/=])\}(?=[A-Za-z0-9(\\[])/) ||
+    mathOnlyTex.match(/(?:^|[^A-Za-z\\])([xyzuvnmkabcfg])\^\{(\d+[+\-])\}/) ||
+    mathOnlyTex.match(/[\^_]\{([A-Za-z][A-Za-z0-9]*[+\-*/=])\}/);
+  if (badScriptMatch) {
+    issues.push({
+      id: `suspicious-script-${issues.length + 1}`,
+      severity: 'warning',
+      category: 'suspicious_math',
+      categoryLabel: '上标/下标存在疑似异常运算符（需 AI 复查）',
+      locationLabel,
+      rawSnippet,
+      detail: `公式中出现 "${badScriptMatch[0]}"，虽然符合 LaTeX 语法，但疑似误将后续加减项吸入上标或下标（如将 x^2+ax 写成 x^{2+}ax）。`,
+      fixInstruction: '请复查该公式的上标/下标花括号范围，确认指数/下标是否被错误截断或粘连了后续运算符。',
+    });
+  }
 }
 
 function auditFieldMath(params: {
@@ -122,7 +199,7 @@ function auditFieldMath(params: {
     const lines = withoutDisplay.split('\n');
     for (let li = 0; li < lines.length; li++) {
       const line = lines[li];
-      const singleDollars = line.match(/(?<!\\)\$/g) || [];
+      const singleDollars = line.replace(/\\./g, '  ').match(/\$/g) || [];
       if (singleDollars.length % 2 !== 0) {
         issues.push({
           id: `unclosed-inline-${issues.length + 1}`,
@@ -151,6 +228,16 @@ function auditFieldMath(params: {
         throwOnError: true,
         strict: false,
       });
+      detectSuspiciousMathInSegment({
+        tex,
+        rawBody,
+        displayMode,
+        offset,
+        scanWork,
+        fieldLabel,
+        isBlockMarkdown,
+        issues,
+      });
     } catch (err: any) {
       const lineNo = findLineNumber(scanWork, offset);
       const rawErr = String(err?.message || err || 'KaTeX syntax error')
@@ -176,21 +263,36 @@ function auditFieldMath(params: {
   });
 
   scanWork.replace(
-    /(?<!\\)\$([^\n$]+?)(?<!\\)\$|\\\(([\s\S]+?)\\\)/g,
-    (full, g1, g2, offset: number) => {
+    /(^|[^\\])\$((?:\\.|[^\n$\\])+?)\$|\\\(([\s\S]+?)\\\)/g,
+    (full, _pre, g1, g2, offset: number) => {
       validateTex(g1 || g2 || '', false, offset);
       return full;
     }
   );
 
-  // 3. Detect leaked raw LaTeX commands outside math delimiters (e.g. broken macro not enclosed in $...$)
+  // 2b. Detect split function-call delimiters where closing $ is immediately followed by ASCII (...) or [...]
+  const splitCallMatch = scanWork.match(/\$[^$\n]+?[A-Za-z]\$\s*[\[(][A-Za-z0-9_\\+\-*/=(),\s]+[\])]/);
+  if (splitCallMatch) {
+    issues.push({
+      id: `suspicious-split-call-${issues.length + 1}`,
+      severity: 'warning',
+      category: 'suspicious_math',
+      categoryLabel: '函数与括号参数疑似被 $ 拆开（需 AI 复查）',
+      locationLabel: fieldLabel,
+      rawSnippet: truncateSnippet(splitCallMatch[0]),
+      detail: '检测到行内公式闭合 "$" 后紧跟 ASCII 括号参数（如 "$...f$[g(x)]" 或 "$...g$(x)"），可能导致函数与自变量排版断裂。',
+      fixInstruction: '请复查该处表达式，将函数名及其括号参数（以及等号右侧）统一放在同一对 "$...$" 中。',
+    });
+  }
+
+  // 3. Detect leaked raw LaTeX commands or stray $ adjacent to commands outside math delimiters
   const renderedHtml = isBlockMarkdown
     ? renderMarkdownWithLatex(cleaned, visuals)
     : renderInlineMathWithLatex(cleaned, visuals);
 
   const visibleStripped = stripSafeHtmlContainers(renderedHtml);
   const leakedLatexMatch = visibleStripped.match(
-    /\\(?:frac|sqrt|dfrac|tfrac|text|mathrm|operatorname|mathbf|left|right|Delta|Sigma|Omega|alpha|beta|gamma|theta|lambda|omega|cdot|times|approx|equiv|neq|leq|geq|nabla|partial|sum|int)\b/
+    /\\(?:frac|sqrt|dfrac|tfrac|text|mathrm|operatorname|mathbf|left|right|lim|limsup|liminf|to|infty|sin|cos|tan|cot|sec|csc|ln|log|lg|exp|max|min|sup|inf|iff|implies|Leftrightarrow|Rightarrow|Delta|Sigma|Omega|alpha|beta|gamma|theta|lambda|omega|cdot|times|div|pm|mp|approx|equiv|neq|leq|le|geq|ge|nabla|partial|sum|prod|int|iint|oint|vec|bar|hat|tilde|overline|underline|forall|exists|in|notin|subset|subseteq|cup|cap)\b/
   );
   if (leakedLatexMatch) {
     // Find approximate source snippet in cleaned text outside delimiters
@@ -208,6 +310,20 @@ function auditFieldMath(params: {
       detail: `正文可见文本中残留了未进入公式定界符的 LaTeX 命令 "${leakedLatexMatch[0]}"（常见原因：漏写 "$...$" 或花括号嵌套损坏）。`,
       fixInstruction: `确保包含 "${leakedLatexMatch[0]}" 的完整数学表达式被成对 "$...$" 或 "$$...$$" 包裹，并检查括号匹配。`,
     });
+  } else {
+    const strayDollarMatch = visibleStripped.match(/\$\\[A-Za-z]+|\\[A-Za-z]+[^$\n]{0,20}\$/);
+    if (strayDollarMatch) {
+      issues.push({
+        id: `leaked-dollar-${issues.length + 1}`,
+        severity: 'warning',
+        category: 'suspicious_math',
+        categoryLabel: '可见文本残留错位 $ 符号（需 AI 复查）',
+        locationLabel: fieldLabel,
+        rawSnippet: truncateSnippet(strayDollarMatch[0]),
+        detail: `渲染后的可见文本中仍残留与公式相邻的 "$" 符号（"${strayDollarMatch[0]}"），通常意味着定界符错位。`,
+        fixInstruction: '请复查该句的 "$...$" 配对情况，删除多余 "$" 或补全缺失的配对定界符。',
+      });
+    }
   }
 }
 
@@ -292,6 +408,7 @@ export function buildCoursewareRepairPrompt(
     (i) =>
       i.category === 'latex_error' ||
       i.category === 'unclosed_math' ||
+      i.category === 'suspicious_math' ||
       i.category === 'missing_anchor' ||
       i.category === 'placeholder_error' ||
       i.category === 'duplicate_id'

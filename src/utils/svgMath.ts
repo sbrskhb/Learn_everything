@@ -160,7 +160,7 @@ export function formatSvgTextContentToTspans(rawText: string): string {
   // Match variable/element/digit/paren followed by subscript/superscript chains
   // e.g. u_O, R_f, i_F, K_CMR, A_{uf}, u_C^2, 10^{-6}, u_+, u_-, du_C, H_2, SO_4^{2-}
   const tokenRegex =
-    /(?<![A-Za-z0-9_])(d[A-Za-z]|[A-Za-z]+|\d+(?:\.\d+)?|[)\]])((?:(?:_\{[^{}]+\}|_[A-Za-z0-9+\-']+|\^\{[^{}]+\}|\^[A-Za-z0-9+\-'°]+))+)/g;
+    /(^|[^A-Za-z0-9_])(d[A-Za-z]|[A-Za-z]+|\d+(?:\.\d+)?|[)\]])((?:(?:_\{[^{}]+\}|_[A-Za-z0-9+\-']+|\^\{[^{}]+\}|\^[A-Za-z0-9+\-'°]+))+)/g;
 
   let result = '';
   let lastIdx = 0;
@@ -172,8 +172,12 @@ export function formatSvgTextContentToTspans(rawText: string): string {
       result += escapeXmlText(normalized.slice(lastIdx, start));
     }
 
-    const base = match[1];
-    const scriptsRaw = match[2];
+    const pre = match[1];
+    if (pre) {
+      result += escapeXmlText(pre);
+    }
+    const base = match[2];
+    const scriptsRaw = match[3];
 
     // Style single-letter or differential variables italic, keep multi-uppercase chemical/operator tokens upright
     if (/^(?:d[A-Za-z]|[A-Za-z])$/.test(base)) {

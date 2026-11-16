@@ -350,6 +350,11 @@ export interface AppSettings {
   defaultCustomLearningDepth?: string;
   showAdvancedWorkflowDetails?: boolean;
   showContentCategoryBadges?: boolean;
+  remoteAccessEnabled?: boolean;
+  serverPort?: number;
+  allowAllHosts?: boolean;
+  allowedHosts?: string;
+  tailscaleHost?: string;
   promptModules: PromptModuleToggles;
   syllabusSystemPrompt: string;
   courseSystemPrompt: string;

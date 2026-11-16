@@ -3157,6 +3157,54 @@ test('LessonPreview heuristic context renders inline LaTeX and enhanceDiagramSvg
   assert.equal(widened || wrappedTaller, true);
 });
 
+test('markdownMath preserves polynomial exponents and bare lim f[g(x)], while coursewareDiagnostics flags suspicious valid-syntax LaTeX for AI review', async () => {
+  const { normalizeBareMathForMarkdown, normalizeMathUnicodeToLatex } = await import('./markdownMath');
+  const { auditCoursewareRendering } = await import('./coursewareDiagnostics');
+
+  // 1. Regression fixes in markdownMath
+  assert.equal(normalizeMathUnicodeToLatex('\\lim_{x\\to 2}(x^2+ax+b)'), '\\lim_{x\\to 2}(x^2+ax+b)');
+  assert.equal(normalizeMathUnicodeToLatex('x^n+1'), 'x^n+1');
+  assert.equal(normalizeMathUnicodeToLatex('Fe^2+ + SO_4^2-'), 'Fe^{2+} + SO_4^{2-}');
+  assert.equal(
+    normalizeBareMathForMarkdown('复合函数极限运算法则 \\lim_{x\\to x_0}f[g(x)]=\\lim_{u\\to u_0}f(u) 成立'),
+    '复合函数极限运算法则 $\\lim_{x\\to x_0}f[g(x)]=\\lim_{u\\to u_0}f(u)$ 成立'
+  );
+
+  // 2. Semantic/layout anomaly alerts (syntactically valid LaTeX that should be flagged for AI review)
+  const suspiciousReport = auditCoursewareRendering({
+    sectionId: 'sec-04',
+    dayIndex: 1,
+    date: '2026-11-16',
+    title: '异常公式复查测试',
+    summary: '正常化学离子 $\\text{Fe}^{2+} + 2\\text{e}^- \\to \\text{Fe}$ 与单侧极限 $\\lim_{x\\to 0^+}\\frac{1}{x}$',
+    keyPoints: [
+      '异常上标：$$\\lim_{x\\to 2}(x^{2+}ax+b) = 0$$',
+      '公式内混入转义美元符：$[g(x)]=\\$\\lim_{u\\to u_0}f$',
+      '吞入中文从句：$g(x)] 不存在，因为 x\\to 0$',
+      '函数括号被拆开：$\\lim_{x\\to 0}f$[g(x)] = 0',
+    ],
+    markdownBody: '正文正常。',
+    diagrams: [],
+    heuristicQuestions: [],
+    exercises: [],
+    reverseChecks: [],
+    generatedAt: new Date().toISOString(),
+    sourceMode: 'chat',
+  });
+
+  const suspiciousIssues = suspiciousReport.issues.filter((i) => i.category === 'suspicious_math');
+  assert.equal(suspiciousIssues.length >= 4, true);
+  assert.equal(suspiciousReport.warningCount >= 4, true);
+  assert.equal(suspiciousReport.repairPrompt.includes('textReplacements'), true);
+  assert.equal(suspiciousReport.repairPrompt.includes('x^{2+}ax+b'), true);
+  // Valid chemistry/one-sided limit in summary must not be flagged
+  assert.equal(
+    suspiciousReport.issues.some((i) => i.locationLabel.includes('summary')),
+    false
+  );
+});
+
+
 
 
 

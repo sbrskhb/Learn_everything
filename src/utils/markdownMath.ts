@@ -90,75 +90,75 @@ export function expandCompactStemSubscripts(text: string): string {
   // Skip digit-preceded SI units (e.g. 20 nA, 2pF, 5 uN, 10 uC) and unambiguous standalone SI abbreviations (nA, pA, nF, pF, mL),
   // while STILL expanding electrical voltages uN, uC, uS, uL, uF when not preceded by a number.
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])([uiqpwevaxyztmqn])([PNIOFMACRLDS][0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
-    (_m, base: string, sub: string, offset: number, fullStr: string) => {
+    /(^|[^A-Za-z0-9_\\])([uiqpwevaxyztmqn])([PNIOFMACRLDS][0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    (_m, pre: string, base: string, sub: string, offset: number, fullStr: string) => {
       const token = base + sub;
-      const before = fullStr.slice(Math.max(0, offset - 16), offset);
+      const before = fullStr.slice(Math.max(0, offset + pre.length - 16), offset + pre.length);
       const precededByNumber = /\d(?:\.\d+)?\s*$/.test(before);
       if (precededByNumber && /^(?:[fpnum])(?:A|F|C|S|N|L|M|W|H|V)$/.test(token)) {
-        return token;
+        return `${pre}${token}`;
       }
       if (/^(?:nA|pA|nF|pF|mL)$/.test(token)) {
-        return token;
+        return `${pre}${token}`;
       }
-      return sub.length > 1 ? `${base}_{${sub}}` : `${base}_${sub}`;
+      return `${pre}${sub.length > 1 ? `${base}_{${sub}}` : `${base}_${sub}`}`;
     }
   );
 
   // 1b. Small-signal transistor parameters & physics constants: rbe, rce, rds, gm, kB
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])r(be|ce|ds|bb|ee)(?='|(?![A-Za-z0-9_]))/g,
-    (_m, sub: string) => `r_{${sub}}`
+    /(^|[^A-Za-z0-9_\\])r(be|ce|ds|bb|ee)(?='|(?![A-Za-z0-9_]))/g,
+    (_m, pre: string, sub: string) => `${pre}r_{${sub}}`
   );
-  out = out.replace(/(?<![A-Za-z0-9_\\])gm(?='|(?![A-Za-z0-9_]))/g, 'g_m');
-  out = out.replace(/(?<![A-Za-z0-9_\\])kB(?='|(?![A-Za-z0-9_]))/g, 'k_B');
+  out = out.replace(/(^|[^A-Za-z0-9_\\])gm(?='|(?![A-Za-z0-9_]))/g, '$1g_m');
+  out = out.replace(/(^|[^A-Za-z0-9_\\])kB(?='|(?![A-Za-z0-9_]))/g, '$1k_B');
 
   // 2. Resistor R + subscript: Rf, Ri, Ro, Rp, Rn, Rs, Rc, Rl, Rm, R1, R2, Rin, Rout, Rref, Req, RL, RS, RC, RB, RE
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])R(in|out|ref|eq|[fFiIoOnNpPsScCmMlLBE][0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
-    (_m, sub: string) => (sub.length > 1 ? `R_{${sub}}` : `R_${sub}`)
+    /(^|[^A-Za-z0-9_\\])R(in|out|ref|eq|[fFiIoOnNpPsScCmMlLBE][0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    (_m, pre: string, sub: string) => `${pre}${sub.length > 1 ? `R_{${sub}}` : `R_${sub}`}`
   );
 
   // 3. Capacitor C & Inductor L + subscript: Cf, Ci, Cp, Cn, Cs, Cl, Cm, C1, C2, Cin, Cout, Ceq, L1, L2, Lf
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])([CL])(in|out|eq|[fFiInNpPsSlLmM][0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
-    (_m, base: string, sub: string) =>
-      sub.length > 1 ? `${base}_{${sub}}` : `${base}_${sub}`
+    /(^|[^A-Za-z0-9_\\])([CL])(in|out|eq|[fFiInNpPsSlLmM][0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    (_m, pre: string, base: string, sub: string) =>
+      `${pre}${sub.length > 1 ? `${base}_{${sub}}` : `${base}_${sub}`}`
   );
 
   // 4. Uppercase Voltage U/V + subscript: Uo, Ui, Uf, Un, Vo, Vi, Vf, Vn, U1, V1, VCC, VEE, VDD, VSS, VGS, VDS, VTH, VBE, VCE, VCB, Uref, Vref, Uom
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])([UV])(in|out|ref|cc|ee|dd|ss|CC|EE|DD|SS|GS|DS|TH|BE|CE|CB|gs|ds|th|be|ce|cb|om|OM|pp|PP|rms|RMS|(?:[PNIOFMACRLDS]|[oifn])[0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
-    (_m, base: string, sub: string) =>
-      sub.length > 1 ? `${base}_{${sub}}` : `${base}_${sub}`
+    /(^|[^A-Za-z0-9_\\])([UV])(in|out|ref|cc|ee|dd|ss|CC|EE|DD|SS|GS|DS|TH|BE|CE|CB|gs|ds|th|be|ce|cb|om|OM|pp|PP|rms|RMS|(?:[PNIOFMACRLDS]|[oifn])[0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    (_m, pre: string, base: string, sub: string) =>
+      `${pre}${sub.length > 1 ? `${base}_{${sub}}` : `${base}_${sub}`}`
   );
 
   // 5. Uppercase Current I + subscript: Io, IP, IN, IO, II, IF, IB, IC, IE, ID, IS, IG, ICEO, ICBO, IDSS, I0, I1, I2, Iref
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])I(in|out|ref|CEO|CBO|DSS|(?:[PNIOFMACRLDSBCEG]|[o])[0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
-    (_m, sub: string) => (sub.length > 1 ? `I_{${sub}}` : `I_${sub}`)
+    /(^|[^A-Za-z0-9_\\])I(in|out|ref|CEO|CBO|DSS|(?:[PNIOFMACRLDSBCEG]|[o])[0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    (_m, pre: string, sub: string) => `${pre}${sub.length > 1 ? `I_{${sub}}` : `I_${sub}`}`
   );
 
   // 6. Amplifier Gain A, CMRR / Equilibrium K, Frequency f, Energy E, Force F
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])A(uf|uo|uu|od|ud|id|cm|[ufvdc][0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
-    (_m, sub: string) => (sub.length > 1 ? `A_{${sub}}` : `A_${sub}`)
+    /(^|[^A-Za-z0-9_\\])A(uf|uo|uu|od|ud|id|cm|[ufvdc][0-9]*|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    (_m, pre: string, sub: string) => `${pre}${sub.length > 1 ? `A_{${sub}}` : `A_${sub}`}`
   );
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])K(CMR|cmr|sp|eq|[abw]|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
-    (_m, sub: string) => (sub.length > 1 ? `K_{${sub}}` : `K_${sub}`)
+    /(^|[^A-Za-z0-9_\\])K(CMR|cmr|sp|eq|[abw]|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    (_m, pre: string, sub: string) => `${pre}${sub.length > 1 ? `K_{${sub}}` : `K_${sub}`}`
   );
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])f(bw|BW|[HLPT]|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
-    (_m, sub: string) => (sub.length > 1 ? `f_{${sub}}` : `f_${sub}`)
+    /(^|[^A-Za-z0-9_\\])f(bw|BW|[HLPT]|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    (_m, pre: string, sub: string) => `${pre}${sub.length > 1 ? `f_{${sub}}` : `f_${sub}`}`
   );
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])E([kp0]|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
-    (_m, sub: string) => (sub.length > 1 ? `E_{${sub}}` : `E_${sub}`)
+    /(^|[^A-Za-z0-9_\\])E([kp0]|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    (_m, pre: string, sub: string) => `${pre}${sub.length > 1 ? `E_{${sub}}` : `E_${sub}`}`
   );
   out = out.replace(
-    /(?<![A-Za-z0-9_\\])F([Nf]|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
-    (_m, sub: string) => (sub.length > 1 ? `F_{${sub}}` : `F_${sub}`)
+    /(^|[^A-Za-z0-9_\\])F([Nf]|[0-9]+)(?='|(?![A-Za-z0-9_]))/g,
+    (_m, pre: string, sub: string) => `${pre}${sub.length > 1 ? `F_{${sub}}` : `F_${sub}`}`
   );
 
   return out.replace(/@@STEMGUARD-(\d+)@@/g, (_m, i) => guarded[Number(i)] || '');
@@ -178,7 +178,7 @@ function braceMultiCharScripts(tex: string): string {
 
   out = out.replace(/([A-Za-z0-9)\]])_(\d{2,}|[A-Za-z+\-][A-Za-z0-9+\-']+)/g, '$1_{$2}');
   out = out.replace(
-    /([A-Za-z0-9)\]])\^(\d{2,}|[0-9]+[+\-]|[A-Za-z+\-][A-Za-z0-9+\-']+)/g,
+    /([A-Za-z0-9)\]])\^(\d{2,}|[0-9]+[+\-](?![A-Za-z0-9])|[+\-](?:[0-9]+|[A-Za-z][A-Za-z0-9']*)|[A-Za-z]{2,}|[A-Za-z]+')/g,
     '$1^{$2}'
   );
 
@@ -203,8 +203,8 @@ export function normalizeMathUnicodeToLatex(tex: string): string {
 
   // Convert bare math function names with subscripts like log_2 -> \log_2, lim_{x\to 0} -> \lim_{x\to 0}
   out = out.replace(
-    /(?<![\\A-Za-z])(log|ln|lg|lim|sin|cos|tan|cot|sec|csc|max|min|sup|inf|det|exp)(?=[_^(\s])/g,
-    '\\$1'
+    /(^|[^\\A-Za-z])(log|ln|lg|lim|sin|cos|tan|cot|sec|csc|max|min|sup|inf|det|exp)(?=[_^(\s])/g,
+    '$1\\$2'
   );
 
   // Convert explicit number + unit clusters inside math like "100 kΩ" or "5 μF" -> "100\,\text{k}\Omega"
@@ -348,7 +348,9 @@ export function normalizeBareMathForMarkdown(text: string): string {
     .replace(/```[\s\S]*?```/g, (m) => stash(m))
     .replace(/`[^`\n]+`/g, (m) => stash(m))
     .replace(/\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]/g, (m) => stash(m))
-    .replace(/(?<!\\)\$([^\n$]+?)(?<!\\)\$|\\\([\s\S]+?\\\)/g, (m) => stash(m))
+    .replace(/(^|[^\\])(\$((?:\\.|[^\n$\\])+?)\$)|(\\\([\s\S]+?\\\))/g, (_m, pre: string | undefined, inlineDollar: string | undefined, _inner: string | undefined, parenMath: string | undefined) =>
+      parenMath ? stash(parenMath) : `${pre || ''}${stash(inlineDollar || '')}`
+    )
     .replace(/\{\{\s*(?:heuristic|diagram|diag|exercise)\s*:[^}]+\}\}/gi, (m) => stash(m))
     .replace(/\[\[\s*(?:heuristic|diagram|diag|exercise)\s*:[^\]]+\]\]/gi, (m) => stash(m))
     .replace(/\bdiag(?:ram)?[-_][A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*\b/gi, (m) => stash(m))
@@ -397,27 +399,32 @@ export function normalizeBareMathForMarkdown(text: string): string {
   const plainOperand = `(?:\\d+(?:\\.\\d+)?(?:\\s*${UNIT_PATTERN})?|d[A-Za-z]|[A-Za-z]'?)`;
   const opToken = `(?:!=|<=>|<->|<=|>=|->|<-|=>|=|≠|≤|≥|≈|≡|∝|±|∓|×|÷|·|\\+|\\-|\\*|/|<|>|→|←|⇌|⇔|⇒|∈|⊂|⊆|∪|∩)`;
   const unitCluster = `(?:\\d+(?:\\.\\d+)?\\s*${UNIT_PATTERN})`;
-  const anyMathToken = `(?:${latexCmd}|${strongSubSup}|${unitCluster}|${plainOperand})`;
+  // Compact command pattern for exprRegex so the compiled RegExp stays small enough for Safari/WebKit YARR
+  const exprLatexCmd =
+    `\\\\(?:left(?:\\\\\\{|\\\\\\||\\.)|right(?:\\\\\\}|\\\\\\||\\.)|[A-Za-z]+)` +
+    `(?:\\s*${scriptPart})*(?:\\s*${nestedBraces})*(?:\\s*${scriptPart})*`;
+  const anyMathToken = `(?:${exprLatexCmd}|${strongSubSup}|${unitCluster}|${plainOperand})`;
   const optTrailScripts = `(?:\\s*${scriptPart})*`;
   const innerSeq = (atom: string) =>
-    `[+-]?${atom}(?:\\s*${opToken}\\s*[+-]?${atom}|\\s*(?=\\\\)${atom}|\\s+${atom})*`;
+    `[+-]?${atom}(?:\\s*${opToken}\\s*[+-]?${atom}|\\s*(?=[\\\\(\\[])` + `${atom}|\\s+${atom})*`;
   const innerRound = `(?:\\\\left)?\\(${innerSeq(anyMathToken)}(?:\\\\right)?\\)${optTrailScripts}`;
   const innerSquare = `(?:\\\\left)?\\[${innerSeq(anyMathToken)}(?:\\\\right)?\\]${optTrailScripts}`;
   const atomOrInner = `(?:${innerRound}|${innerSquare}|${anyMathToken})`;
   const parenGroup = `(?:\\\\left)?\\(${innerSeq(atomOrInner)}(?:\\\\right)?\\)${optTrailScripts}`;
   const bracketGroup = `(?:\\\\left)?\\[${innerSeq(atomOrInner)}(?:\\\\right)?\\]${optTrailScripts}`;
   const delimGroup = `(?:${parenGroup}|${bracketGroup})`;
-  const term = `(?:${delimGroup}|${anyMathToken})(?:\\s*(?:${delimGroup}|${strongSubSup}|${latexCmd}))*`;
+  const term = `(?:${delimGroup}|${anyMathToken})(?:\\s*(?:${delimGroup}|${strongSubSup}|${exprLatexCmd}|${plainOperand}))*`;
 
   // Match contiguous equation / expression sequences on a single line (supports unary -/+ after operators)
   const exprRegex = new RegExp(
     `[+-]?${term}(?:\\s*${opToken}\\s*[+-]?${term}|\\s+${term})*`,
     'g'
   );
+  const knownLatexCmdRe = new RegExp(latexCmd);
 
   work = work.replace(exprRegex, (candidate, offset: number, fullStr: string) => {
-    // Must contain at least one strong math trigger (_, ^, or \) to avoid touching normal English/numbers
-    if (!/[_^\\]/.test(candidate)) {
+    // Must contain at least one strong math trigger (_, ^, or a known \cmd) to avoid touching normal English/numbers
+    if (!/[_^]/.test(candidate) && !knownLatexCmdRe.test(candidate)) {
       return candidate;
     }
     // Avoid transforming inside protected placeholders
@@ -425,10 +432,10 @@ export function normalizeBareMathForMarkdown(text: string): string {
       return candidate;
     }
 
-    // Do not break surrounding identifiers
+    // Do not break surrounding identifiers or slice after a backslash (\lim)
     const charBefore = offset > 0 ? fullStr[offset - 1] : '';
     const charAfter = offset + candidate.length < fullStr.length ? fullStr[offset + candidate.length] : '';
-    if (/[A-Za-z0-9_]/.test(charBefore) || /[A-Za-z0-9_]/.test(charAfter)) {
+    if (/[A-Za-z0-9_\\]/.test(charBefore) || /[A-Za-z0-9_]/.test(charAfter)) {
       return candidate;
     }
 
@@ -464,8 +471,8 @@ export function normalizeBareMathForMarkdown(text: string): string {
 
   // 3. Catch any remaining isolated bare math tokens that weren't captured above
   work = work.replace(
-    new RegExp(`(?<![A-Za-z0-9_@$])(${latexCmd}|${strongSubSup})(?![A-Za-z0-9_@])`, 'g'),
-    (_m, tok: string) => stash(`$${normalizeMathUnicodeToLatex(tok)}$`)
+    new RegExp(`(^|[^A-Za-z0-9_@$\\\\])(${latexCmd}|${strongSubSup})(?![A-Za-z0-9_@])`, 'g'),
+    (_m, pre: string, tok: string) => `${pre}${stash(`$${normalizeMathUnicodeToLatex(tok)}$`)}`
   );
 
   // Restore protected spans
@@ -837,8 +844,8 @@ function processLatexAndHtml(
 
   // 4. Replace inline math $...$ and \(...\)
   processed = processed.replace(
-    /(?<!\\)\$([^\n$]+?)(?<!\\)\$|\\\(([\s\S]+?)\\\)/g,
-    (_match, g1, g2) => {
+    /(^|[^\\])\$((?:\\.|[^\n$\\])+?)\$|\\\(([\s\S]+?)\\\)/g,
+    (_match, pre, g1, g2) => {
       const tex = normalizeMathUnicodeToLatex((g1 || g2 || '').trim());
       if (!tex) return _match;
       const idx = mathBlocks.length;
@@ -852,7 +859,7 @@ function processLatexAndHtml(
       } catch {
         mathBlocks.push(`<code>${tex}</code>`);
       }
-      return `@@MATHBLOCK-${idx}@@`;
+      return `${pre || ''}@@MATHBLOCK-${idx}@@`;
     }
   );
 
@@ -865,8 +872,9 @@ function processLatexAndHtml(
     return `@@INLINECODE-${idx}@@`;
   });
   processed = processed.replace(
-    /(?<!\*)\*\*(?!\s|\*)((?:(?!\*\*|\n).)+?(?<!\s|\*))\*\*(?!\*)/g,
-    '<strong>$1</strong>'
+    /(^|[^*])\*\*(?!\s|\*)((?:(?!\*\*|\n).)+?)\*\*(?!\*)/g,
+    (full, pre: string, inner: string) =>
+      /[\s*]$/.test(inner) ? full : `${pre}<strong>${inner}</strong>`
   );
   processed = processed.replace(/@@INLINECODE-(\d+)@@/g, (_m, i) => inlineCodeSpans[Number(i)] || '');
 

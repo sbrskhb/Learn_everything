@@ -2,6 +2,7 @@ import express from 'express';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import zlib from 'zlib';
 import dotenv from 'dotenv';
 import { spawn, spawnSync, type ChildProcess } from 'child_process';
 import { createServer as createViteServer } from 'vite';
@@ -309,6 +310,11 @@ interface StoredSettings {
   defaultCustomLearningDepth: string;
   showAdvancedWorkflowDetails: boolean;
   showContentCategoryBadges: boolean;
+  remoteAccessEnabled: boolean;
+  serverPort: number;
+  allowAllHosts: boolean;
+  allowedHosts: string;
+  tailscaleHost: string;
   promptModules: PromptModuleToggles;
   syllabusSystemPrompt: string;
   courseSystemPrompt: string;
@@ -338,6 +344,18 @@ function loadSettings(): StoredSettings {
         defaultCustomLearningDepth: raw.defaultCustomLearningDepth || '',
         showAdvancedWorkflowDetails: Boolean(raw.showAdvancedWorkflowDetails),
         showContentCategoryBadges: Boolean(raw.showContentCategoryBadges),
+        remoteAccessEnabled:
+          typeof raw.remoteAccessEnabled === 'boolean' ? raw.remoteAccessEnabled : true,
+        serverPort:
+          typeof raw.serverPort === 'number' &&
+          Number.isInteger(raw.serverPort) &&
+          raw.serverPort >= 1024 &&
+          raw.serverPort <= 65535
+            ? raw.serverPort
+            : 3000,
+        allowAllHosts: typeof raw.allowAllHosts === 'boolean' ? raw.allowAllHosts : true,
+        allowedHosts: typeof raw.allowedHosts === 'string' ? raw.allowedHosts : '',
+        tailscaleHost: typeof raw.tailscaleHost === 'string' ? raw.tailscaleHost : '',
         promptModules: {
           ...DEFAULT_PROMPT_MODULE_TOGGLES,
           ...(raw.promptModules || {}),
@@ -369,6 +387,11 @@ function loadSettings(): StoredSettings {
     defaultCustomLearningDepth: '',
     showAdvancedWorkflowDetails: false,
     showContentCategoryBadges: false,
+    remoteAccessEnabled: true,
+    serverPort: 3000,
+    allowAllHosts: true,
+    allowedHosts: '',
+    tailscaleHost: '',
     promptModules: { ...DEFAULT_PROMPT_MODULE_TOGGLES },
     syllabusSystemPrompt: skillDefaults.syllabusSystemPrompt,
     courseSystemPrompt: skillDefaults.courseSystemPrompt,
@@ -2423,6 +2446,12 @@ function formatPublicSettings(settings: StoredSettings) {
     defaultCustomLearningDepth: settings.defaultCustomLearningDepth,
     showAdvancedWorkflowDetails: Boolean(settings.showAdvancedWorkflowDetails),
     showContentCategoryBadges: Boolean(settings.showContentCategoryBadges),
+    remoteAccessEnabled:
+      typeof settings.remoteAccessEnabled === 'boolean' ? settings.remoteAccessEnabled : true,
+    serverPort: settings.serverPort || 3000,
+    allowAllHosts: typeof settings.allowAllHosts === 'boolean' ? settings.allowAllHosts : true,
+    allowedHosts: settings.allowedHosts || '',
+    tailscaleHost: settings.tailscaleHost || '',
     promptModules: settings.promptModules,
     syllabusSystemPrompt: settings.syllabusSystemPrompt,
     courseSystemPrompt: settings.courseSystemPrompt,
@@ -2431,9 +2460,66 @@ function formatPublicSettings(settings: StoredSettings) {
   };
 }
 
+function detectNetworkAddresses(): { tailscaleIps: string[]; lanIps: string[] } {
+  const interfaces = os.networkInterfaces();
+  const tailscaleIps: string[] = [];
+  const lanIps: string[] = [];
+
+  for (const [name, addrs] of Object.entries(interfaces)) {
+    if (!addrs) continue;
+    for (const addr of addrs) {
+      if (addr.family !== 'IPv4' || addr.internal) continue;
+      const ip = addr.address;
+      const parts = ip.split('.').map(Number);
+      const isCgnat = parts.length === 4 && parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127;
+      if (/tailscale/i.test(name) || isCgnat) {
+        if (!tailscaleIps.includes(ip)) tailscaleIps.push(ip);
+      } else if (!lanIps.includes(ip)) {
+        lanIps.push(ip);
+      }
+    }
+  }
+
+  return { tailscaleIps, lanIps };
+}
+
+let activeListenHost = '0.0.0.0';
+let activeListenPort = PORT;
+
 async function startServer() {
+  const startupSettings = loadSettings();
+  activeListenPort = Number(process.env.PORT) || startupSettings.serverPort || 3000;
+  activeListenHost = process.env.HOST || (startupSettings.remoteAccessEnabled ? '0.0.0.0' : '127.0.0.1');
+
   const app = express();
   app.use(express.json({ limit: '100mb' }));
+
+  // Compress large JSON API responses (e.g. /api/state) over Tailscale / LAN
+  app.use('/api', (req, res, next) => {
+    const acceptEncoding = String(req.headers['accept-encoding'] || '');
+    if (!/\bgzip\b/i.test(acceptEncoding)) {
+      next();
+      return;
+    }
+    const origJson = res.json.bind(res);
+    res.json = ((body: any) => {
+      try {
+        const jsonStr = JSON.stringify(body);
+        if (jsonStr && jsonStr.length >= 2048) {
+          const gz = zlib.gzipSync(Buffer.from(jsonStr, 'utf-8'));
+          res.setHeader('Content-Encoding', 'gzip');
+          res.setHeader('Vary', 'Accept-Encoding');
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          res.setHeader('Content-Length', String(gz.length));
+          return res.send(gz);
+        }
+      } catch {
+        // Fallback to uncompressed json
+      }
+      return origJson(body);
+    }) as any;
+    next();
+  });
 
   // 1. Get application state (auto-syncs any local `courses/<课程名称>/` folders)
   app.get('/api/state', async (_req, res) => {
@@ -2624,6 +2710,11 @@ async function startServer() {
       defaultCustomLearningDepth,
       showAdvancedWorkflowDetails,
       showContentCategoryBadges,
+      remoteAccessEnabled,
+      serverPort,
+      allowAllHosts,
+      allowedHosts,
+      tailscaleHost,
       promptModules,
       syllabusSystemPrompt,
       courseSystemPrompt,
@@ -2683,6 +2774,25 @@ async function startServer() {
         typeof showContentCategoryBadges === 'boolean'
           ? showContentCategoryBadges
           : current.showContentCategoryBadges,
+      remoteAccessEnabled:
+        typeof remoteAccessEnabled === 'boolean'
+          ? remoteAccessEnabled
+          : current.remoteAccessEnabled,
+      serverPort:
+        typeof serverPort === 'number' &&
+        Number.isInteger(serverPort) &&
+        serverPort >= 1024 &&
+        serverPort <= 65535
+          ? serverPort
+          : current.serverPort,
+      allowAllHosts:
+        typeof allowAllHosts === 'boolean' ? allowAllHosts : current.allowAllHosts,
+      allowedHosts:
+        typeof allowedHosts === 'string' ? allowedHosts.trim() : current.allowedHosts,
+      tailscaleHost:
+        typeof tailscaleHost === 'string'
+          ? tailscaleHost.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '')
+          : current.tailscaleHost,
       promptModules: {
         ...current.promptModules,
         ...(promptModules || {}),
@@ -2709,6 +2819,32 @@ async function startServer() {
     res.json({
       settings: formatPublicSettings(updated),
       promptPresets: getPromptPresetsFromSkill(),
+    });
+  });
+
+  // 3b. Get local & Tailscale network info for remote/iPad access
+  app.get('/api/network-info', (_req, res) => {
+    const current = loadSettings();
+    const { tailscaleIps, lanIps } = detectNetworkAddresses();
+    const desiredHost = current.remoteAccessEnabled ? '0.0.0.0' : '127.0.0.1';
+    const restartRequired =
+      (!process.env.HOST && desiredHost !== activeListenHost) ||
+      (!process.env.PORT && (current.serverPort || 3000) !== activeListenPort);
+
+    res.json({
+      activeHost: activeListenHost,
+      activePort: activeListenPort,
+      remoteAccessEnabled: current.remoteAccessEnabled,
+      configuredPort: current.serverPort || 3000,
+      restartRequired,
+      tailscaleIps,
+      lanIps,
+      tailscaleUrls: tailscaleIps.map((ip) => `http://${ip}:${activeListenPort}`),
+      lanUrls: lanIps.map((ip) => `http://${ip}:${activeListenPort}`),
+      customTailscaleUrl: current.tailscaleHost
+        ? `http://${current.tailscaleHost}${current.tailscaleHost.includes(':') ? '' : `:${activeListenPort}`}`
+        : '',
+      hostname: os.hostname(),
     });
   });
 
@@ -5042,8 +5178,17 @@ async function startServer() {
   await ensurePythonBackendReady();
 
   if (process.env.NODE_ENV !== 'production') {
+    const parsedAllowedHosts = startupSettings.allowAllHosts
+      ? true
+      : startupSettings.allowedHosts
+          .split(/[,\s]+/)
+          .map((s) => s.trim())
+          .filter(Boolean);
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: parsedAllowedHosts,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -5055,8 +5200,19 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Learn_everything server listening on http://localhost:${PORT}`);
+  app.listen(activeListenPort, activeListenHost, () => {
+    console.log(
+      `Learn_everything server listening on http://${activeListenHost === '0.0.0.0' ? 'localhost' : activeListenHost}:${activeListenPort} (bind=${activeListenHost})`
+    );
+    if (activeListenHost === '0.0.0.0') {
+      const { tailscaleIps, lanIps } = detectNetworkAddresses();
+      for (const ip of tailscaleIps) {
+        console.log(`  Tailscale URL: http://${ip}:${activeListenPort}`);
+      }
+      for (const ip of lanIps) {
+        console.log(`  LAN URL:       http://${ip}:${activeListenPort}`);
+      }
+    }
   });
 }
 

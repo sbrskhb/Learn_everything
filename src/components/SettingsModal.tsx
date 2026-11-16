@@ -7,10 +7,14 @@ import {
   CheckCircle2,
   Clock,
   Compass,
+  Copy,
   Download,
+  Globe,
   MapPin,
+  RefreshCw,
   RotateCcw,
   Sliders,
+  Wifi,
   X,
 } from 'lucide-react';
 import type {
@@ -145,6 +149,26 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [showContentCategoryBadges, setShowContentCategoryBadges] = useState<boolean>(
     Boolean(settings.showContentCategoryBadges)
   );
+  const [remoteAccessEnabled, setRemoteAccessEnabled] = useState<boolean>(
+    settings.remoteAccessEnabled ?? true
+  );
+  const [serverPort, setServerPort] = useState<number>(settings.serverPort || 3000);
+  const [allowAllHosts, setAllowAllHosts] = useState<boolean>(settings.allowAllHosts ?? true);
+  const [allowedHosts, setAllowedHosts] = useState<string>(settings.allowedHosts || '');
+  const [tailscaleHost, setTailscaleHost] = useState<string>(settings.tailscaleHost || '');
+  const [networkInfo, setNetworkInfo] = useState<{
+    activeHost: string;
+    activePort: number;
+    restartRequired: boolean;
+    tailscaleIps: string[];
+    lanIps: string[];
+    tailscaleUrls: string[];
+    lanUrls: string[];
+    customTailscaleUrl: string;
+    hostname: string;
+  } | null>(null);
+  const [isLoadingNetworkInfo, setIsLoadingNetworkInfo] = useState(false);
+  const [copiedUrlKey, setCopiedUrlKey] = useState<string | null>(null);
   const [composeProfile, setComposeProfile] = useState<SubjectProfile>('electronics_engineering');
   const [promptModules, setPromptModules] = useState<PromptModuleToggles>(settings.promptModules);
   const [syllabusSystemPrompt, setSyllabusSystemPrompt] = useState(settings.syllabusSystemPrompt);
@@ -175,6 +199,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setDefaultCustomLearningDepth(settings.defaultCustomLearningDepth || '');
     setShowAdvancedWorkflowDetails(Boolean(settings.showAdvancedWorkflowDetails));
     setShowContentCategoryBadges(Boolean(settings.showContentCategoryBadges));
+    setRemoteAccessEnabled(settings.remoteAccessEnabled ?? true);
+    setServerPort(settings.serverPort || 3000);
+    setAllowAllHosts(settings.allowAllHosts ?? true);
+    setAllowedHosts(settings.allowedHosts || '');
+    setTailscaleHost(settings.tailscaleHost || '');
     setPromptModules(settings.promptModules);
     setSyllabusSystemPrompt(settings.syllabusSystemPrompt);
     setCourseSystemPrompt(settings.courseSystemPrompt);
@@ -184,6 +213,39 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setSavedNotice(false);
     setTestResult(null);
   }, [settings, isOpen]);
+
+  const fetchNetworkInfo = async () => {
+    setIsLoadingNetworkInfo(true);
+    try {
+      const res = await fetch('/api/network-info');
+      if (res.ok) {
+        const data = await res.json();
+        setNetworkInfo(data);
+      }
+    } catch {
+      // ignore network detection failure
+    } finally {
+      setIsLoadingNetworkInfo(false);
+    }
+  };
+
+  useEffect(() => {
+    if (isOpen) {
+      fetchNetworkInfo();
+    }
+  }, [isOpen]);
+
+  const handleCopyNetworkUrl = async (key: string, value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedUrlKey(key);
+      setTimeout(() => {
+        setCopiedUrlKey((prev) => (prev === key ? null : prev));
+      }, 1800);
+    } catch {
+      // ignore clipboard error
+    }
+  };
 
   // Render animated overlay via AnimatePresence below
 
@@ -285,6 +347,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           defaultCustomLearningDepth: defaultCustomLearningDepth.trim(),
           showAdvancedWorkflowDetails,
           showContentCategoryBadges,
+          remoteAccessEnabled,
+          serverPort:
+            Number.isInteger(Number(serverPort)) &&
+            Number(serverPort) >= 1024 &&
+            Number(serverPort) <= 65535
+              ? Number(serverPort)
+              : 3000,
+          allowAllHosts,
+          allowedHosts: allowedHosts.trim(),
+          tailscaleHost: tailscaleHost.trim(),
           promptModules,
           syllabusSystemPrompt,
           courseSystemPrompt,
@@ -297,6 +369,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         onSettingsUpdated(data.settings, data.promptPresets);
         setNewApiKey('');
         setSavedNotice(true);
+        fetchNetworkInfo();
       }
     } finally {
       setIsSaving(false);
@@ -527,6 +600,271 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </div>
             </label>
+          </div>
+
+          {/* 远程访问与 Tailscale 异地组网 (iPad 连接) */}
+          <div className="border border-neutral-800 rounded-lg p-4 bg-neutral-950/60 space-y-3.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Globe className="w-4 h-4 text-sky-400" />
+                <span className="text-xs font-medium text-neutral-200">
+                  远程访问与 Tailscale 异地组网（iPad / 移动设备连接）
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={fetchNetworkInfo}
+                disabled={isLoadingNetworkInfo}
+                className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] text-neutral-300 hover:text-white border border-neutral-800 hover:border-neutral-600 rounded transition-colors disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3 h-3 ${isLoadingNetworkInfo ? 'animate-spin' : ''}`} />
+                <span>重新检测网卡</span>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <label
+                htmlFor="settings-remote-access-toggle"
+                className="flex items-start gap-2.5 text-xs cursor-pointer p-2.5 rounded border border-neutral-900 bg-black/40"
+              >
+                <input
+                  id="settings-remote-access-toggle"
+                  type="checkbox"
+                  checked={remoteAccessEnabled}
+                  onChange={(e) => setRemoteAccessEnabled(e.target.checked)}
+                  className="mt-0.5 accent-white"
+                />
+                <div>
+                  <div className="text-neutral-200 font-medium">
+                    允许局域网 / Tailscale 远程连接（0.0.0.0）
+                  </div>
+                  <div className="text-[11px] text-neutral-500 mt-0.5 leading-relaxed">
+                    开启后服务监听所有网卡，iPad 可通过 Tailscale 或局域网 IP 访问；关闭则仅允许本机 127.0.0.1 访问。
+                  </div>
+                </div>
+              </label>
+
+              <label
+                htmlFor="settings-allow-all-hosts-toggle"
+                className="flex items-start gap-2.5 text-xs cursor-pointer p-2.5 rounded border border-neutral-900 bg-black/40"
+              >
+                <input
+                  id="settings-allow-all-hosts-toggle"
+                  type="checkbox"
+                  checked={allowAllHosts}
+                  onChange={(e) => setAllowAllHosts(e.target.checked)}
+                  className="mt-0.5 accent-white"
+                />
+                <div>
+                  <div className="text-neutral-200 font-medium">
+                    允许 Tailscale MagicDNS 与任意 Host 访问
+                  </div>
+                  <div className="text-[11px] text-neutral-500 mt-0.5 leading-relaxed">
+                    放行 Vite 开发服务器的 Host 校验，避免通过 <code className="text-neutral-300">*.ts.net</code> 域名或反向代理访问时被拦截。
+                  </div>
+                </div>
+              </label>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label
+                  htmlFor="settings-server-port"
+                  className="block text-[11px] text-neutral-400 mb-1"
+                >
+                  服务监听端口（默认 3000，保存后需重启生效）
+                </label>
+                <input
+                  id="settings-server-port"
+                  type="number"
+                  min={1024}
+                  max={65535}
+                  value={serverPort}
+                  onChange={(e) => setServerPort(Number(e.target.value) || 3000)}
+                  className="w-full bg-neutral-950 border border-neutral-800 rounded px-3 py-1.5 text-xs font-mono text-white focus:outline-none focus:border-neutral-500"
+                />
+              </div>
+
+              <div>
+                <label
+                  htmlFor="settings-tailscale-host"
+                  className="block text-[11px] text-neutral-400 mb-1"
+                >
+                  自定义 Tailscale IP 或 MagicDNS 域名（可选）
+                </label>
+                <input
+                  id="settings-tailscale-host"
+                  type="text"
+                  value={tailscaleHost}
+                  onChange={(e) => setTailscaleHost(e.target.value)}
+                  placeholder="例如 100.64.0.12 或 my-pc.tail1234.ts.net"
+                  className="w-full bg-neutral-950 border border-neutral-800 rounded px-3 py-1.5 text-xs font-mono text-white placeholder-neutral-600 focus:outline-none focus:border-neutral-500"
+                />
+              </div>
+            </div>
+
+            {!allowAllHosts && (
+              <div>
+                <label
+                  htmlFor="settings-allowed-hosts"
+                  className="block text-[11px] text-neutral-400 mb-1"
+                >
+                  允许访问的自定义 Host 列表（逗号或空格分隔）
+                </label>
+                <input
+                  id="settings-allowed-hosts"
+                  type="text"
+                  value={allowedHosts}
+                  onChange={(e) => setAllowedHosts(e.target.value)}
+                  placeholder="例如 my-pc.tail1234.ts.net, 100.64.0.12"
+                  className="w-full bg-neutral-950 border border-neutral-800 rounded px-3 py-1.5 text-xs font-mono text-white placeholder-neutral-600 focus:outline-none focus:border-neutral-500"
+                />
+              </div>
+            )}
+
+            {/* 自动检测到的 Tailscale / 局域网地址 */}
+            <div className="pt-2 border-t border-neutral-900 space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-neutral-400">
+                <span className="inline-flex items-center gap-1.5">
+                  <Wifi className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>
+                    当前服务实际监听：
+                    <code className="text-neutral-200 ml-1">
+                      {networkInfo ? `${networkInfo.activeHost}:${networkInfo.activePort}` : '检测中...'}
+                    </code>
+                  </span>
+                </span>
+                {networkInfo?.hostname && (
+                  <span className="text-neutral-500">本机名：{networkInfo.hostname}</span>
+                )}
+              </div>
+
+              {(networkInfo?.restartRequired ||
+                (networkInfo &&
+                  ((remoteAccessEnabled ? '0.0.0.0' : '127.0.0.1') !== networkInfo.activeHost ||
+                    Number(serverPort) !== networkInfo.activePort))) && (
+                <div className="text-[11px] text-amber-400 bg-amber-950/30 border border-amber-800/50 rounded px-2.5 py-1.5">
+                  监听网卡或端口配置已变更：请先点击右下角「保存设置」，然后重启服务端（重新运行 start.bat / npm run dev）即可生效。
+                </div>
+              )}
+
+              <div className="space-y-1.5">
+                {tailscaleHost.trim() && (
+                  <div className="flex items-center justify-between gap-2 bg-black/50 border border-sky-900/50 rounded px-2.5 py-1.5 text-[11px]">
+                    <div className="truncate">
+                      <span className="text-sky-400 mr-2">自定义 Tailscale 地址:</span>
+                      <code className="text-neutral-100 font-mono">
+                        {`http://${tailscaleHost.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '')}${
+                          tailscaleHost.includes(':') ? '' : `:${networkInfo?.activePort || serverPort || 3000}`
+                        }`}
+                      </code>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleCopyNetworkUrl(
+                          'custom-ts',
+                          `http://${tailscaleHost.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '')}${
+                            tailscaleHost.includes(':') ? '' : `:${networkInfo?.activePort || serverPort || 3000}`
+                          }`
+                        )
+                      }
+                      className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 border border-neutral-800 hover:border-neutral-600 rounded text-neutral-300 hover:text-white"
+                    >
+                      {copiedUrlKey === 'custom-ts' ? (
+                        <>
+                          <Check className="w-3 h-3 text-emerald-400" />
+                          <span>已复制</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3 h-3" />
+                          <span>复制</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                )}
+
+                {networkInfo?.tailscaleUrls.map((url, idx) => (
+                  <div
+                    key={`ts-${url}`}
+                    className="flex items-center justify-between gap-2 bg-black/50 border border-emerald-900/50 rounded px-2.5 py-1.5 text-[11px]"
+                  >
+                    <div className="truncate">
+                      <span className="text-emerald-400 mr-2">Tailscale 地址:</span>
+                      <code className="text-neutral-100 font-mono">{url}</code>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleCopyNetworkUrl(`ts-${idx}`, url)}
+                      className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 border border-neutral-800 hover:border-neutral-600 rounded text-neutral-300 hover:text-white"
+                    >
+                      {copiedUrlKey === `ts-${idx}` ? (
+                        <>
+                          <Check className="w-3 h-3 text-emerald-400" />
+                          <span>已复制</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3 h-3" />
+                          <span>复制</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                ))}
+
+                {networkInfo?.lanUrls.map((url, idx) => (
+                  <div
+                    key={`lan-${url}`}
+                    className="flex items-center justify-between gap-2 bg-black/40 border border-neutral-900 rounded px-2.5 py-1.5 text-[11px]"
+                  >
+                    <div className="truncate">
+                      <span className="text-neutral-400 mr-2">局域网地址:</span>
+                      <code className="text-neutral-200 font-mono">{url}</code>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleCopyNetworkUrl(`lan-${idx}`, url)}
+                      className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 border border-neutral-800 hover:border-neutral-600 rounded text-neutral-300 hover:text-white"
+                    >
+                      {copiedUrlKey === `lan-${idx}` ? (
+                        <>
+                          <Check className="w-3 h-3 text-emerald-400" />
+                          <span>已复制</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3 h-3" />
+                          <span>复制</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                ))}
+
+                {networkInfo &&
+                  networkInfo.tailscaleUrls.length === 0 &&
+                  networkInfo.lanUrls.length === 0 && (
+                    <div className="text-[11px] text-neutral-500">
+                      未检测到 Tailscale 或局域网 IPv4 地址，请确认本机已登录 Tailscale。
+                    </div>
+                  )}
+              </div>
+
+              <div className="text-[11px] text-neutral-500 leading-relaxed pt-1">
+                提示：若 iPad 浏览器仍无法打开，请检查 Windows 防火墙是否放行端口{' '}
+                <code className="text-neutral-300">{networkInfo?.activePort || serverPort || 3000}</code>
+                （可在管理员 PowerShell 运行：
+                <code className="text-neutral-300 ml-1">
+                  {`New-NetFirewallRule -DisplayName "LearnEverything" -Direction Inbound -Protocol TCP -LocalPort ${
+                    networkInfo?.activePort || serverPort || 3000
+                  } -Action Allow`}
+                </code>
+                ）。
+              </div>
+            </div>
           </div>
 
           {/* 1. 接口模式选择 */}
