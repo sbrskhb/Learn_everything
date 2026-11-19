@@ -33,6 +33,8 @@ class RootErrorBoundary extends React.Component<
   }
 }
 
+document.getElementById('boot-status')?.remove();
+
 createRoot(document.getElementById('root')!).render(
   <RootErrorBoundary>
     <App />

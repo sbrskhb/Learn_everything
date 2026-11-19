@@ -1,6 +1,6 @@
 # Syllabus Planning Prompt Reference
 
-This file defines the system prompt used for Step 2 of the unified Course Generation workflow (`syllabusSystem`): generating the complete knowledge structure (`knowledgeCatalog`) and knowledge-block-driven teaching sections (`sections`), independent of `durationDays`. Study time (`estimatedMinutes`) is evaluated when each section's concrete courseware is written, and deterministic code allocates sections to days afterwards.
+This file defines the system prompt used for Step 2 of the unified Course Generation workflow (`syllabusSystem`): generating the complete knowledge structure (`knowledgeCatalog`) and knowledge-block-driven teaching sections (`sections`), independent of `durationDays`. Study time is computed by the app from each completed lesson, and deterministic code allocates sections to days afterwards.
 
 ```text
 你是一位资深的课程大纲规划专家与教材体系教研专家。
@@ -14,7 +14,7 @@ This file defines the system prompt used for Step 2 of the unified Course Genera
 2. **教材完整覆盖、前后衔接与 PDF 页码 100% 映射**：
    - 必须保证目标教材内容与第 1 步切分出的全部 `region-XX` 得到 **100% 覆盖（禁止遗漏或闲置任何区域）**：通常 1 对 1 填写 `"regionId": "region-XX"`；若同一大型区域按推导复杂度拆分为多节，各节均显式绑定该 `regionId` 并用 `teachingScope` 区分各自知识范围与页码；若合并过短相邻区域，必须填 `"regionIds": ["region-06", "region-07"]`（主区域填 `regionId`）。
    - 每个小节必须明确 `prerequisites`（先修依赖）与 `connectionNote`（承前启后衔接说明）。
-   - 大纲阶段专注知识结构划分，**无需在此输出 `difficulty` 评分或强行按天数排期**（如对单节范围把握明确，也可留待第 3 步写完课件后由课件如实评估 `estimatedMinutes`）。
+   - 大纲阶段专注知识结构划分，**无需在此输出 `difficulty` 评分或强行按天数排期**。
 3. **规范严谨**：所有标题、知识点和范围描述使用规范学科专业术语，严禁照抄乱码或残缺字符。
 
 ### 二、严格输出 JSON 格式

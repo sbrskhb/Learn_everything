@@ -1,6 +1,12 @@
 import katex from 'katex';
 import { Marked } from 'marked';
-import { stripAiCitationArtifacts } from './coursewareParser';
+import { stripAiCitationArtifacts, tryParseJsonWithLatexRepair } from './coursewareParser';
+import {
+  buildDiagramErrorSvg,
+  compileDiagramSpec,
+  compileDiagramSpecSync,
+  validateDiagramSpec,
+} from '../diagrams';
 
 // Dedicated Marked instance where only double-tilde ~~...~~ triggers <del> strikethrough.
 // Single tilde ~ is heavily used in Chinese/STEM text for page/section/value ranges
@@ -178,15 +184,34 @@ function braceMultiCharScripts(tex: string): string {
 
   out = out.replace(/([A-Za-z0-9)\]])_(\d{2,}|[A-Za-z+\-][A-Za-z0-9+\-']+)/g, '$1_{$2}');
   out = out.replace(
-    /([A-Za-z0-9)\]])\^(\d{2,}|[0-9]+[+\-](?![A-Za-z0-9])|[+\-](?:[0-9]+|[A-Za-z][A-Za-z0-9']*)|[A-Za-z]{2,}|[A-Za-z]+')/g,
+    /([A-Za-z0-9)\]])\^(\d{2,}|[0-9]+[+\-](?![ \t]*[A-Za-z0-9\\({\[√∞α-ωΑ-Ω])|[+\-](?:[0-9]+|[A-Za-z][A-Za-z0-9']*)|[A-Za-z]{2,}|[A-Za-z]+')/g,
     '$1^{$2}'
   );
 
   return out.replace(/@@SCRIPTGUARD-(\d+)@@/g, (_m, i) => protectedSpans[Number(i)] || '');
 }
 
+// Recognize rectangular, semicolon-separated matrix assignments without treating tuples as matrices.
+function normalizeMatrixAssignments(text: string, wrap: (tex: string) => string): string {
+  return text.replace(
+    /([A-Z])\s*=\s*([（(\[［])([^()[\]（）［］\n]+)([）)\]］])/g,
+    (original, symbol: string, open: string, entries: string, close: string) => {
+      const closing: Record<string, string> = { '(': ')', '（': '）', '[': ']', '［': '］' };
+      if (closing[open] !== close || !/[;；]/.test(entries)) return original;
+      const rows = entries.split(/[;；]/).map((row) => row.trim().split(/\s*[,，&]\s*|\s+/));
+      const columns = rows[0].length;
+      if (columns < 2 || rows.some((row) => row.length !== columns ||
+        row.some((cell) => !/^[+−-]?(?:\d+(?:\.\d+)?|[A-Za-z](?:_(?:[A-Za-z\d]+|\{[A-Za-z\d]+\}))?)$/.test(cell)))) {
+        return original;
+      }
+      const environment = open === '(' || open === '（' ? 'pmatrix' : 'bmatrix';
+      return wrap(`${symbol}=\\begin{${environment}}${rows.map((row) => row.join(' & ')).join(' \\\\ ')}\\end{${environment}}`);
+    }
+  );
+}
+
 export function normalizeMathUnicodeToLatex(tex: string): string {
-  let out = braceMultiCharScripts(tex);
+  let out = braceMultiCharScripts(normalizeMatrixAssignments(tex.replace(/\n(?:[ \t]*>[ \t]?)+/g, '\n'), (matrix) => matrix));
 
   // Convert binary multiplication * (e.g. -(Rf / R1) * uI) into \cdot
   out = out.replace(/([A-Za-z0-9)}\]])\s*\*\s*(?=[A-Za-z0-9({\\])/g, '$1 \\cdot ');
@@ -263,6 +288,8 @@ export function normalizeMathUnicodeToLatex(tex: string): string {
   out = out.replace(/@@UNITGUARD-(\d+)@@/g, (_m, i) => textProtected[Number(i)] || '');
 
   out = out
+    .replace(/√\(([^()\n]+)\)/g, '\\sqrt{$1}')
+    .replace(/√([A-Za-z0-9α-ωΑ-Ω]+)/g, '\\sqrt{$1}')
     .replace(/≠/g, '\\neq ')
     .replace(/≤/g, '\\le ')
     .replace(/≥/g, '\\ge ')
@@ -317,13 +344,67 @@ export function normalizeMathUnicodeToLatex(tex: string): string {
     .replace(/Ψ/g, '\\Psi ')
     .replace(/π/g, '\\pi ')
     .replace(/Π/g, '\\Pi ')
+    .replace(/ξ/g, '\\xi ')
+    .replace(/Ξ/g, '\\Xi ')
     .replace(/ε/g, '\\varepsilon ')
     .replace(/ρ/g, '\\rho ')
     .replace(/η/g, '\\eta ')
-    .replace(/ζ/g, '\\zeta ');
+    .replace(/ζ/g, '\\zeta ')
+    .replace(/′/g, "'");
 
   return out.trim();
 }
+
+const COMPACT_UNIT_PATTERN = String.raw`(?:[kMGmμunp]?(?:[ΩAFVWCJHS]|Hz)|[mμunp]s|dBm?|mol(?:\/L)?|[km]J(?:\/mol)?|[mk]?eV|[kM]?Pa|N·m)`;
+const NESTED_BRACES_PATTERN = String.raw`\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}`;
+const NO_FOLLOW_MATH = String.raw`(?![ \t]*[A-Za-z0-9\\({\[√∞α-ωΑ-Ω])`;
+const SCRIPT_BODY_PATTERN = String.raw`(?:${NESTED_BRACES_PATTERN}|[+\-]?(?:\d+(?![0-9])|[A-Za-zα-ωΑ-Ω∞'°∘][A-Za-z0-9α-ωΑ-Ω'°∘]*)(?:[+\-]${NO_FOLLOW_MATH})?|[+\-])`;
+const SCRIPT_PART_PATTERN = String.raw`[_^]${SCRIPT_BODY_PATTERN}`;
+const STRONG_SUB_SUP_PATTERN = String.raw`(?:(?:\d+(?:\.\d+)?(?![0-9.]))?(?:\\[A-Za-z]+|[A-Za-zα-ωΑ-Ω]+['′]*)|\d+(?:\.\d+)?(?![0-9.]))(?:${SCRIPT_PART_PATTERN}[A-Za-z0-9]*)+`;
+const PLAIN_OPERAND_PATTERN = String.raw`(?:\d+(?:\.\d+)?(?![0-9.])(?:\s*${UNIT_PATTERN}|(?:[dΔδ]?[A-Za-zα-ωΑ-Ω])['′]*)?|√?(?:[dΔδ]?[A-Za-zα-ωΑ-Ω])['′]*|∞)`;
+const OP_TOKEN_PATTERN = String.raw`(?:!=|<=>|<->|<=|>=|->|<-|=>|[=≠≤≥≈≡∝±∓×÷·+\-*/<>→←⇌⇔⇒∈⊂⊆∪∩])`;
+const EXPR_LATEX_HEAD = String.raw`\\(?:left(?:\\\{|\\\||\.)|right(?:\\\}|\\\||\.)|[A-Za-z]+)`;
+const EXPR_LATEX_CMD_PATTERN = String.raw`${EXPR_LATEX_HEAD}(?:[ \t]*(?:${SCRIPT_PART_PATTERN}|${NESTED_BRACES_PATTERN}))*(?:[A-Za-zα-ωΑ-Ω]['′]*)?`;
+
+const DELIM_BASE_PATTERN = String.raw`(?:\\(?:[A-Za-z]+|[\\{}|.])|\d+(?:\.\d+)?(?![0-9.])(?:\s*${COMPACT_UNIT_PATTERN}|[A-Za-zα-ωΑ-Ω]['′]*)?|[A-Za-zα-ωΑ-Ω]+['′]*(?=[_^])|√?[dΔδ]?[A-Za-zα-ωΑ-Ω]['′]*|∞)`;
+const DELIM_SCRIPT_PATTERN = String.raw`(?:${SCRIPT_PART_PATTERN}[A-Za-z0-9]*|${NESTED_BRACES_PATTERN})*`;
+const DELIM_ATOM_PATTERN = `${DELIM_BASE_PATTERN}${DELIM_SCRIPT_PATTERN}`;
+const BARE_MATH_SEP_PATTERN = String.raw`(?:[ \t]*${OP_TOKEN_PATTERN}[ \t]*[+-]?[ \t]*|[ \t]*(?=[\\(\[|])|[ \t]+)`;
+const INNER_MATH_CHAR_CLASS = String.raw`[A-Za-z0-9α-ωΑ-Ω_^{}\\\t +*/=<>≤≥≠≈≡∝±∓×÷·.'′°∘√∞!→←⇌⇔⇒∈⊂⊆∪∩\-]`;
+const INNER_DELIM_GROUP_PATTERN = String.raw`(?:√?\(${INNER_MATH_CHAR_CLASS}+\)|\[${INNER_MATH_CHAR_CLASS}+\])(?:[_^](?:${NESTED_BRACES_PATTERN}|[+\-]?(?:\d+|[A-Za-zα-ωΑ-Ω'°∘]+)))?`;
+const DELIM_ITEM_PATTERN = String.raw`(?:${DELIM_ATOM_PATTERN}|${INNER_DELIM_GROUP_PATTERN})`;
+const seqOf = (atom: string) => `[+-]?${atom}(?:${BARE_MATH_SEP_PATTERN}${atom})*`;
+const DELIM_SEQ_PATTERN = seqOf(DELIM_ITEM_PATTERN);
+const OPT_TRAIL_SCRIPTS_PATTERN = String.raw`(?:[ \t]*${SCRIPT_PART_PATTERN})*(?:(?![0-9])[dΔδ]?[A-Za-zα-ωΑ-Ω]['′]*${DELIM_SCRIPT_PATTERN})?`;
+const ABS_GROUP_CORE_PATTERN = String.raw`\|(?![ \t])${DELIM_SEQ_PATTERN}\|`;
+const PAREN_GROUP_CORE_PATTERN = String.raw`√?(?:\\left[ \t]*)?\(${DELIM_SEQ_PATTERN}(?:\\right)?\)`;
+const BRACKET_GROUP_CORE_PATTERN = String.raw`(?:\\left[ \t]*)?\[${DELIM_SEQ_PATTERN}(?:\\right)?\]`;
+const DELIM_GROUP_PATTERN = String.raw`(?:${ABS_GROUP_CORE_PATTERN}|${PAREN_GROUP_CORE_PATTERN}|${BRACKET_GROUP_CORE_PATTERN})${OPT_TRAIL_SCRIPTS_PATTERN}`;
+const ANY_MATH_TOKEN_PATTERN = String.raw`(?:${EXPR_LATEX_CMD_PATTERN}|${STRONG_SUB_SUP_PATTERN}|${PLAIN_OPERAND_PATTERN})`;
+const MATH_UNIT_PATTERN = String.raw`(?:${DELIM_GROUP_PATTERN}|${ANY_MATH_TOKEN_PATTERN})`;
+
+const KNOWN_LATEX_CMD_PATTERN =
+  `\\\\(?:` +
+  `[dtc]?frac|sqrt|binom|overset|underset|stackrel|` +
+  `sum|prod|coprod|ii*nt|oint|lim(?:sup|inf)?|nabla|partial|` +
+  `vec|overrightarrow|overleftarrow|hat|widehat|bar|overline|underline|tilde|widetilde|dd?ot|` +
+  `mathbf|mathrm|mathit|mathcal|mathbb|mathfrak|mathscr|boldsymbol|text|operatorname|mbox|boxed|` +
+  `left(?:\\\\\\{|\\\\\\||\\.)|right(?:\\\\\\}|\\\\\\||\\.)|[bB]igl|[bB]igr|langle|rangle|lfloor|rfloor|lceil|rceil|l[vV]ert|r[vV]ert|` +
+  `arcsin|arccos|arctan|sinh|cosh|tanh|sin|cos|tan|cot|sec|csc|ln|log|lg|exp|max|min|sup|inf|arg|det|dim|ker|deg|gcd|bmod|pmod|` +
+  `alpha|beta|gamma|Gamma|delta|Delta|epsilon|varepsilon|zeta|eta|theta|Theta|vartheta|iota|kappa|lambda|Lambda|mu|nu|xi|Xi|pi|Pi|varpi|rho|varrho|sigma|Sigma|varsigma|tau|upsilon|Upsilon|phi|varphi|Phi|chi|psi|Psi|omega|Omega|` +
+  `infty|hbar|ell|forall|exists|nexists|in|notin|ni|subset|supset|subseteq|supseteq|cup|cap|setminus|emptyset|varnothing|neg|lnot|land|lor|` +
+  `neq|ne|leq|le|geq|ge|ll|gg|approx|sim|simeq|cong|equiv|propto|` +
+  `times|div|cdot|cdots|ldots|dots|vdots|ddots|pm|mp|oplus|otimes|odot|circ|bullet|star|ast|perp|parallel|angle|triangle|degree|` +
+  `rightarrow|to|leftarrow|gets|leftrightarrow|Rightarrow|implies|Leftarrow|Leftrightarrow|iff|mapsto|uparrow|downarrow|rightleftharpoons|leftharpoons` +
+  `)(?:\\s*${SCRIPT_PART_PATTERN})*(?:\\s*${NESTED_BRACES_PATTERN})*(?:\\s*${SCRIPT_PART_PATTERN})*`;
+
+// Pre-compiled compact pattern (<12 KB, zero lookbehinds) for Safari/WebKit YARR compatibility.
+export const BARE_MATH_EXPR_RE = new RegExp(seqOf(MATH_UNIT_PATTERN), 'g');
+const KNOWN_LATEX_CMD_RE = new RegExp(KNOWN_LATEX_CMD_PATTERN);
+const TRAILING_BARE_MATH_RE = new RegExp(
+  `(^|[^A-Za-z0-9_@$\\\\])(${KNOWN_LATEX_CMD_PATTERN}|${STRONG_SUB_SUP_PATTERN})(?![A-Za-z0-9_@])`,
+  'g'
+);
 
 /**
  * Normalize bare STEM mathematical tokens/equations across all disciplines
@@ -358,9 +439,11 @@ export function normalizeBareMathForMarkdown(text: string): string {
     .replace(/https?:\/\/[^\s)<>]+/gi, (m) => stash(m))
     .replace(/<\/?[a-zA-Z][^>]*>/g, (m) => stash(m));
 
+  work = normalizeMatrixAssignments(work, (matrix) => stash(`$${matrix}$`));
+
   // 1a. Wrap bare LaTeX display environments (\begin{aligned|cases|...matrix|array}...\end{...}) in $$...$$
   work = work.replace(
-    /\\begin\{(aligned|align\*?|cases|p?b?v?V?matrix|array)\}[\s\S]*?\\end\{\1\}/g,
+    /\\begin\{(aligned|align\*?|cases|(?:p|b|B|v|V|small)?matrix|array)\}[\s\S]*?\\end\{\1\}/g,
     (m) => stash(`$$${m}$$`)
   );
 
@@ -375,56 +458,12 @@ export function normalizeBareMathForMarkdown(text: string): string {
   work = expandCompactStemSubscripts(work);
 
   // 2. Group contiguous bare math expressions containing at least one strong math trigger
-  //    Supports single-letter vars, differentials (du_C, di_L), chemical formulas (H_2O, SO_4^{2-}, CH_3COOH),
-  //    operator scripts (log_2, lim_{x\to 0}), and comprehensive LaTeX commands across all STEM fields.
-  const nestedBraces = `\\{(?:[^{}]|\\{(?:[^{}]|\\{[^{}]*\\})*\\})*\\}`;
-  const scriptPart = `(?:_${nestedBraces}|_(?:\\d+|[A-Za-z+\\-'()][A-Za-z0-9+\\-'()]*)|\\^${nestedBraces}|\\^(?:\\d+[+\\-]?|[A-Za-z+\\-'()°∘][A-Za-z0-9+\\-'()°∘]*))`;
-  const strongSubSup = `(?:[A-Za-z]+|\\d+(?:\\.\\d+)?|[)\\]])(?:${scriptPart}+[A-Za-z0-9]*)+`;
-
-  const latexCmd =
-    `\\\\(?:` +
-    `[dtc]?frac|sqrt|binom|overset|underset|stackrel|` +
-    `sum|prod|coprod|ii*nt|oint|lim(?:sup|inf)?|nabla|partial|` +
-    `vec|overrightarrow|overleftarrow|hat|widehat|bar|overline|underline|tilde|widetilde|dd?ot|` +
-    `mathbf|mathrm|mathit|mathcal|mathbb|mathfrak|mathscr|boldsymbol|text|operatorname|mbox|boxed|` +
-    `left(?:\\\\\\{|\\\\\\||\\.)|right(?:\\\\\\}|\\\\\\||\\.)|[bB]igl|[bB]igr|langle|rangle|lfloor|rfloor|lceil|rceil|l[vV]ert|r[vV]ert|` +
-    `arcsin|arccos|arctan|sinh|cosh|tanh|sin|cos|tan|cot|sec|csc|ln|log|lg|exp|max|min|sup|inf|arg|det|dim|ker|deg|gcd|bmod|pmod|` +
-    `alpha|beta|gamma|Gamma|delta|Delta|epsilon|varepsilon|zeta|eta|theta|Theta|vartheta|iota|kappa|lambda|Lambda|mu|nu|xi|Xi|pi|Pi|varpi|rho|varrho|sigma|Sigma|varsigma|tau|upsilon|Upsilon|phi|varphi|Phi|chi|psi|Psi|omega|Omega|` +
-    `infty|hbar|ell|forall|exists|nexists|in|notin|ni|subset|supset|subseteq|supseteq|cup|cap|setminus|emptyset|varnothing|neg|lnot|land|lor|` +
-    `neq|ne|leq|le|geq|ge|ll|gg|approx|sim|simeq|cong|equiv|propto|` +
-    `times|div|cdot|cdots|ldots|dots|vdots|ddots|pm|mp|oplus|otimes|odot|circ|bullet|star|ast|perp|parallel|angle|triangle|degree|` +
-    `rightarrow|to|leftarrow|gets|leftrightarrow|Rightarrow|implies|Leftarrow|Leftrightarrow|iff|mapsto|uparrow|downarrow|rightleftharpoons|leftharpoons` +
-    `)(?:\\s*${scriptPart})*(?:\\s*${nestedBraces})*(?:\\s*${scriptPart})*`;
-
-  const plainOperand = `(?:\\d+(?:\\.\\d+)?(?:\\s*${UNIT_PATTERN})?|d[A-Za-z]|[A-Za-z]'?)`;
-  const opToken = `(?:!=|<=>|<->|<=|>=|->|<-|=>|=|≠|≤|≥|≈|≡|∝|±|∓|×|÷|·|\\+|\\-|\\*|/|<|>|→|←|⇌|⇔|⇒|∈|⊂|⊆|∪|∩)`;
-  const unitCluster = `(?:\\d+(?:\\.\\d+)?\\s*${UNIT_PATTERN})`;
-  // Compact command pattern for exprRegex so the compiled RegExp stays small enough for Safari/WebKit YARR
-  const exprLatexCmd =
-    `\\\\(?:left(?:\\\\\\{|\\\\\\||\\.)|right(?:\\\\\\}|\\\\\\||\\.)|[A-Za-z]+)` +
-    `(?:\\s*${scriptPart})*(?:\\s*${nestedBraces})*(?:\\s*${scriptPart})*`;
-  const anyMathToken = `(?:${exprLatexCmd}|${strongSubSup}|${unitCluster}|${plainOperand})`;
-  const optTrailScripts = `(?:\\s*${scriptPart})*`;
-  const innerSeq = (atom: string) =>
-    `[+-]?${atom}(?:\\s*${opToken}\\s*[+-]?${atom}|\\s*(?=[\\\\(\\[])` + `${atom}|\\s+${atom})*`;
-  const innerRound = `(?:\\\\left)?\\(${innerSeq(anyMathToken)}(?:\\\\right)?\\)${optTrailScripts}`;
-  const innerSquare = `(?:\\\\left)?\\[${innerSeq(anyMathToken)}(?:\\\\right)?\\]${optTrailScripts}`;
-  const atomOrInner = `(?:${innerRound}|${innerSquare}|${anyMathToken})`;
-  const parenGroup = `(?:\\\\left)?\\(${innerSeq(atomOrInner)}(?:\\\\right)?\\)${optTrailScripts}`;
-  const bracketGroup = `(?:\\\\left)?\\[${innerSeq(atomOrInner)}(?:\\\\right)?\\]${optTrailScripts}`;
-  const delimGroup = `(?:${parenGroup}|${bracketGroup})`;
-  const term = `(?:${delimGroup}|${anyMathToken})(?:\\s*(?:${delimGroup}|${strongSubSup}|${exprLatexCmd}|${plainOperand}))*`;
-
-  // Match contiguous equation / expression sequences on a single line (supports unary -/+ after operators)
-  const exprRegex = new RegExp(
-    `[+-]?${term}(?:\\s*${opToken}\\s*[+-]?${term}|\\s+${term})*`,
-    'g'
-  );
-  const knownLatexCmdRe = new RegExp(latexCmd);
-
-  work = work.replace(exprRegex, (candidate, offset: number, fullStr: string) => {
-    // Must contain at least one strong math trigger (_, ^, or a known \cmd) to avoid touching normal English/numbers
-    if (!/[_^]/.test(candidate) && !knownLatexCmdRe.test(candidate)) {
+  work = work.replace(BARE_MATH_EXPR_RE, (candidate, offset: number, fullStr: string) => {
+    // Must contain at least one strong math trigger (_, ^, a known \cmd, √, or prime derivative eq) to avoid touching normal English/numbers
+    const hasDerivativeEq =
+      /[A-Za-zα-ωΑ-Ω]['′]+\([^()\n]*\)\s*[=<>≤≥≠]|f\([A-Za-z0-9α-ωΑ-Ω+\-]+\)\s*=\s*f\([A-Za-z0-9α-ωΑ-Ω+\-]+\)|\|[A-Za-zα-ωΑ-Ω]['′]+(?:\([^()\n]*\))?\|/
+        .test(candidate);
+    if (!/[_^√]/.test(candidate) && !KNOWN_LATEX_CMD_RE.test(candidate) && !hasDerivativeEq) {
       return candidate;
     }
     // Avoid transforming inside protected placeholders
@@ -471,7 +510,7 @@ export function normalizeBareMathForMarkdown(text: string): string {
 
   // 3. Catch any remaining isolated bare math tokens that weren't captured above
   work = work.replace(
-    new RegExp(`(^|[^A-Za-z0-9_@$\\\\])(${latexCmd}|${strongSubSup})(?![A-Za-z0-9_@])`, 'g'),
+    TRAILING_BARE_MATH_RE,
     (_m, pre: string, tok: string) => `${pre}${stash(`$${normalizeMathUnicodeToLatex(tok)}$`)}`
   );
 
@@ -813,17 +852,50 @@ function processLatexAndHtml(
 
   const mathBlocks: string[] = [];
   const codeBlocks: string[] = [];
+  const diagramBlocks: string[] = [];
 
   // 1. Clean AI citation artifacts and auto-delimit bare STEM math expressions
   const cleaned = stripAiCitationArtifacts(input);
   const normalized = normalizeBareMathForMarkdown(cleaned);
 
-  // 2. Protect fenced code blocks first so $ inside code is not treated as math
-  let processed = normalized.replace(/```[\s\S]*?```/g, (match) => {
-    const idx = codeBlocks.length;
-    codeBlocks.push(match);
-    return `@@CODEBLOCK-${idx}@@`;
-  });
+  // 2. Protect fenced code blocks first so $ inside code is not treated as math;
+  //    compile ```diagram[:type] fenced blocks into deterministic SVG or async placeholders.
+  let processed = normalized.replace(
+    /```([^\n`]*)(?:\r?\n([\s\S]*?))?```/g,
+    (match, rawInfo: string, rawBody?: string) => {
+      const info = (rawInfo || '').trim();
+      const diagFenceMatch = info.match(/^diagram(?:\s*:\s*([a-z0-9_-]+))?$/i);
+      if (!inlineOnly && rawBody !== undefined && diagFenceMatch) {
+        const fenceType = diagFenceMatch[1]?.trim().toLowerCase();
+        const jsonBody = rawBody.trim();
+        const parsed = tryParseJsonWithLatexRepair(jsonBody);
+        let htmlOut = '';
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          htmlOut = `<div class="my-3 rounded border border-neutral-800 bg-neutral-950/70 px-3 py-2 text-xs font-mono text-neutral-400">正在等待完整结构化图表 JSON（${escapeHtmlAttr(fenceType || 'diagram')}）...</div>`;
+        } else {
+          const validation = validateDiagramSpec(parsed, fenceType);
+          if (!validation.success) {
+            htmlOut = `<div class="my-4 diagram-fenced-block">${buildDiagramErrorSvg(validation.error, '图表规格校验提示')}</div>`;
+          } else {
+            const syncSvg = compileDiagramSpecSync(validation.data);
+            if (syncSvg !== null) {
+              htmlOut = `<div class="my-4 diagram-fenced-block" data-diagram-fenced="${escapeHtmlAttr(validation.data.type)}">${syncSvg}</div>`;
+            } else {
+              void compileDiagramSpec(validation.data);
+              htmlOut = `<div class="my-4 diagram-fenced-block" data-diagram-async-spec="${escapeHtmlAttr(JSON.stringify(validation.data))}"><div class="rounded border border-neutral-800 bg-neutral-950/60 px-4 py-6 text-center text-xs font-mono text-neutral-400 animate-pulse">正在渲染结构化矢量图（${escapeHtmlAttr(validation.data.type)}）...</div></div>`;
+            }
+          }
+        }
+        const dIdx = diagramBlocks.length;
+        diagramBlocks.push(htmlOut);
+        return `\n\n@@DIAGRAMBLOCK-${dIdx}@@\n\n`;
+      }
+
+      const idx = codeBlocks.length;
+      codeBlocks.push(match);
+      return `@@CODEBLOCK-${idx}@@`;
+    }
+  );
 
   // 3. Replace display math $$...$$ and \[...\]
   processed = processed.replace(/\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]/g, (_match, g1, g2) => {
@@ -835,7 +907,7 @@ function processLatexAndHtml(
         throwOnError: false,
         strict: false,
       });
-      mathBlocks.push(`<div class="my-4 overflow-x-auto">${html}</div>`);
+      mathBlocks.push(inlineOnly ? html : `<div class="my-4 overflow-x-auto">${html}</div>`);
     } catch {
       mathBlocks.push(`<pre class="text-neutral-300 font-mono">${tex}</pre>`);
     }
@@ -888,8 +960,11 @@ function processLatexAndHtml(
       : markedInstance.parse(processed, { async: false })
   ) as string;
 
-  // 7. Restore rendered KaTeX HTML blocks
-  const withMath = rawHtml.replace(/@@MATHBLOCK-(\d+)@@/g, (_m, i) => mathBlocks[Number(i)] || '');
+  // 7. Restore rendered KaTeX HTML blocks & compiled Diagram blocks
+  const withMath = rawHtml
+    .replace(/@@MATHBLOCK-(\d+)@@/g, (_m, i) => mathBlocks[Number(i)] || '')
+    .replace(/<p>\s*@@DIAGRAMBLOCK-(\d+)@@\s*<\/p>/gi, (_m, i) => diagramBlocks[Number(i)] || '')
+    .replace(/@@DIAGRAMBLOCK-(\d+)@@/g, (_m, i) => diagramBlocks[Number(i)] || '');
 
   // 8. Linkify diagram/image references inside visible text nodes & inline code pills
   return linkifyDiagramRefsInHtml(withMath, visuals);

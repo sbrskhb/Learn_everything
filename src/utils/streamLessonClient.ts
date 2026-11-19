@@ -5,7 +5,7 @@ async function runSingleStageStreamRequest(
   dayIndex: number,
   stage: 'stage1' | 'stage2',
   onProgress?: (event: GenerationProgressEvent) => void
-): Promise<{ course: any; lesson: any; stage1Draft?: any; pendingDiagramsCount?: number }> {
+): Promise<{ course: any; lesson: any; stage1Draft?: any; pendingDiagramsCount?: number; diagnosticReport?: GenerationProgressEvent['diagnosticReport'] }> {
   const res = await fetch(
     `/api/courses/${encodeURIComponent(courseId)}/days/${dayIndex}/generate?stream=1&stage=${encodeURIComponent(stage)}`,
     {
@@ -29,11 +29,12 @@ async function runSingleStageStreamRequest(
       stage: 'done',
       step: 4,
       percent: 100,
-      message: stage === 'stage1' ? '阶段一内容生成完成' : '阶段二 SVG 组装完成',
+      message: stage === 'stage1' ? '阶段一内容生成完成' : '阶段二图表代码组装完成',
       course: data.course,
       lesson: data.lesson,
       stage1Draft: data.stage1Draft,
       pendingDiagramsCount: data.pendingDiagramsCount,
+      diagnosticReport: data.diagnosticReport,
     });
     return data;
   }
@@ -58,6 +59,7 @@ async function runSingleStageStreamRequest(
     lesson: any;
     stage1Draft?: any;
     pendingDiagramsCount?: number;
+    diagnosticReport?: GenerationProgressEvent['diagnosticReport'];
   } | null = null;
 
   while (true) {
@@ -89,6 +91,7 @@ async function runSingleStageStreamRequest(
           lesson: event.lesson,
           stage1Draft: event.stage1Draft,
           pendingDiagramsCount: event.pendingDiagramsCount,
+          diagnosticReport: event.diagnosticReport,
         };
       }
     }
@@ -114,6 +117,7 @@ async function runSingleStageStreamRequest(
           lesson: parsedTrailing.lesson,
           stage1Draft: parsedTrailing.stage1Draft,
           pendingDiagramsCount: parsedTrailing.pendingDiagramsCount,
+          diagnosticReport: parsedTrailing.diagnosticReport,
         };
       }
     }
@@ -137,7 +141,7 @@ export async function generateLessonWithProgressStream(
   dayIndex: number,
   onProgress?: (event: GenerationProgressEvent) => void,
   stage: 'all' | 'stage1' | 'stage2' = 'all'
-): Promise<{ course: any; lesson: any; stage1Draft?: any; pendingDiagramsCount?: number }> {
+): Promise<{ course: any; lesson: any; stage1Draft?: any; pendingDiagramsCount?: number; diagnosticReport?: GenerationProgressEvent['diagnosticReport'] }> {
   if (stage === 'stage1' || stage === 'stage2') {
     return runSingleStageStreamRequest(courseId, dayIndex, stage, onProgress);
   }
@@ -157,7 +161,7 @@ export async function generateLessonWithProgressStream(
           percent: 55,
           message:
             (ev.pendingDiagramsCount ?? 0) > 0
-              ? `步骤一已完成（待绘制 ${ev.pendingDiagramsCount} 张 SVG），正在发起步骤二请求...`
+              ? `步骤一已完成（待生成 ${ev.pendingDiagramsCount} 张图表），正在发起步骤二请求...`
               : ev.message,
           course: ev.course,
           lesson: ev.lesson,
@@ -180,7 +184,7 @@ export async function generateLessonWithProgressStream(
       stage: 'done',
       step: 4,
       percent: 100,
-      message: `第 ${dayIndex} 讲无需额外 SVG 配图，已完成生成`,
+      message: `第 ${dayIndex} 讲无需额外配图，已完成生成`,
       course: stage1Result.course,
       lesson: stage1Result.lesson,
       stage1Draft: stage1Result.stage1Draft,

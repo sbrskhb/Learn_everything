@@ -17,8 +17,8 @@ description: Configurable, self-study oriented courseware generation prompt syst
    - 每个核心知识点内部遵循“**问题引入 → 独立思考 (`{{heuristic:hq-X}}`) → 分层讲解（含 `> [!PREREQ]` / `> [!INTUITION]` / `> [!TEXTBOOK]` / `> [!EXTENSION]` 深色提示框与 `{{diagram:diag-X}}`） → 即时练习 (`{{exercise:ex-X}}`) → 错误诊断 (`wrongOptionsAnalysis`) → 针对性补救 (`remediation`) → 变式检验 (`variantCheck`)**”，支持完全离线自学与纠错。
 2. **先修知识精准适配**：
    - 根据学习者已掌握基础与目标深度，在 `teachingContext.prerequisiteCheck` 提供简短先修诊断，对必要但未确认掌握的前提在 `> [!PREREQ]` 框中精准补充，避免重复讲解已掌握内容。
-3. **图文前置规格与深色模式可读性**：
-   - 先在 `topologySpec` 确定电路拓扑/节点连接/元件参数/参考方向（或几何坐标系与状态流转），再生成深色高对比 SVG，校验与正文公式的一致性；复杂题设配专属 SVG（`diagramId`）。
+3. **两阶段图文规范与结构化图表优先**：
+   - 阶段一先在 `topologySpec` 注明推荐图表类别（`grid-annot`、`plot2d`、`graph`、`wavedrom`、`circuit` 或 `自由图表`）及完整拓扑/参数/范围；阶段二优先生成 5 类零坐标结构化 `diagramSpec`，仅当这 5 类均不符合教学表达需求时再回退深色高对比自由图表 `svgCode`（复杂题设配专属 `diagramId`），校验与正文公式的一致性。
 4. **单小节 6 阶段构造与局部修复**：
    - 按“① 教学规划 → ② 正文与推导 → ③ 练习与补救反馈 → ④ 图示与拓扑规范 → ⑤ 质量核验 → ⑥ JSON 组装”分阶段把控质量，支持通过增量补丁对局部阶段重试修复。
 
@@ -44,5 +44,5 @@ description: Configurable, self-study oriented courseware generation prompt syst
 
 1. **第 1 步：按小节切分 PDF (`segments/split-plan.json`)**：加载 `references/pdf-segmentation-prompt.md`，按教材章节、知识边界与先修关系切分独立教学单元（允许合并过短/拆分过长小节，保留原页码、公式、图示与 `crossRefPages`），再由本地脚本（`scripts/split_pdf.ts`）无损切出 `segments/region-XX.pdf`。
 2. **第 2 步：全课程大纲生成 (`outline.json`)**：加载 `references/syllabus-planning-prompt.md`，生成不受目标天数限制的知识结构 `knowledgeCatalog` 与独立教学小节 `sections`（大纲阶段专注知识划分与先修关系，不在此步骤预估学习时长）。
-3. **第 3 步：逐小节独立生成课件并评估学习时长 (`lessons/sec-XX.json`)**：每次聚焦 1 个独立小节（第 3 步提示词不含任何日历日期或排程天数），动态组合 `core-pedagogy-modules.md` + 学科规范 + 学习者配置，输出 7 步自主闭环与深色模式分类标注课件；在写完本节具体正文、推导、图示与练习后，评估并输出 `estimatedMinutes`（支持按阶段局部重试与补丁修复）。
-4. **第 4 步：代码确定性分配学习天数**：应用本地算法（`allocateSectionsToDays`）根据各小节实际课件的 `estimatedMinutes` 将小节均衡分配至目标学习天数（支持修改学习天数后立即重算日程，无需重新生成课件）。
+3. **第 3 步：逐小节独立生成课件 (`lessons/sec-XX.json`)**：每次聚焦 1 个独立小节（第 3 步提示词不含任何日历日期或排程天数），动态组合 `core-pedagogy-modules.md` + 学科规范 + 学习者配置，输出 7 步自主闭环与深色模式分类标注课件；应用按正文、推导、图示与练习计算学时（支持按阶段局部重试与补丁修复）。
+4. **第 4 步：代码确定性分配学习天数**：应用本地算法（`allocateSectionsToDays`）根据各小节实际课件的程序估算学时 将小节均衡分配至目标学习天数（支持修改学习天数后立即重算日程，无需重新生成课件）。

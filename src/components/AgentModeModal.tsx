@@ -1,3 +1,4 @@
+import { copyPromptText } from '../utils/clipboardFile';
 import React, { useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import {
@@ -158,7 +159,7 @@ const AgentModeModalInner: React.FC<{
   const handleCopyPrompt = async () => {
     if (!activePromptText) return;
     try {
-      await navigator.clipboard.writeText(activePromptText);
+      await copyPromptText(activePromptText);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {

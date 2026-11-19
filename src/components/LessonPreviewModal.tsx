@@ -1,4 +1,5 @@
-import React, { useMemo } from 'react';
+import { estimateWrittenLessonMinutes } from '../utils/learningLogic';
+import React, { useEffect, useMemo, useRef } from 'react';
 import { Check, Eye, X, AlertTriangle } from 'lucide-react';
 import type {
   DailyLessonContent,
@@ -11,6 +12,11 @@ import {
   renderMarkdownWithLatex,
   type VisualAssetRef,
 } from '../utils/markdownMath';
+import {
+  DiagramRenderer,
+  hydrateAsyncMarkdownDiagrams,
+  useCompiledLessonDiagrams,
+} from './DiagramRenderer';
 
 interface LessonPreviewModalProps {
   isOpen: boolean;
@@ -43,16 +49,21 @@ export const LessonPreviewModal: React.FC<LessonPreviewModalProps> = ({
   onClose,
   onConfirmSave,
 }) => {
+  const previewBodyRef = useRef<HTMLDivElement | null>(null);
+  const compiledDiagramSvgs = useCompiledLessonDiagrams(lesson);
+
   const visualAssets = useMemo<VisualAssetRef[]>(() => {
     const list: VisualAssetRef[] = [];
     (lesson?.diagrams || []).forEach((d, idx) => {
+      const diagId = d.id || `diag-${idx + 1}`;
+      const compiledSvg = compiledDiagramSvgs[diagId] || compiledDiagramSvgs[diagId.toLowerCase()];
       list.push({
-        id: d.id || `diag-${idx + 1}`,
+        id: diagId,
         title: d.title || d.id || `图 ${idx + 1}`,
         stageLabel: d.stageLabel,
         caption: d.caption,
-        kind: d.svgCode ? 'svg' : 'image',
-        svgCode: d.svgCode,
+        kind: d.diagramSpec || d.svgCode ? 'svg' : 'image',
+        svgCode: compiledSvg || d.svgCode,
         imageUrl: (d as any).imageUrl || (d as any).imageDataUrl,
         index: idx + 1,
       });
@@ -69,7 +80,7 @@ export const LessonPreviewModal: React.FC<LessonPreviewModalProps> = ({
       }
     });
     return list;
-  }, [lesson, customAssets]);
+  }, [lesson, customAssets, compiledDiagramSvgs]);
 
   const { blocks, leftoverDiagrams, leftoverHeuristics, leftoverExercises } = useMemo(() => {
     if (!lesson) {
@@ -162,6 +173,11 @@ export const LessonPreviewModal: React.FC<LessonPreviewModalProps> = ({
     };
   }, [lesson, visualAssets]);
 
+  useEffect(() => {
+    if (!isOpen || !previewBodyRef.current) return;
+    hydrateAsyncMarkdownDiagrams(previewBodyRef.current);
+  }, [isOpen, blocks]);
+
   if (!isOpen || !lesson) return null;
 
   const renderDiagramCard = (diag: LessonDiagram, key: string) => (
@@ -178,24 +194,29 @@ export const LessonPreviewModal: React.FC<LessonPreviewModalProps> = ({
         />
         <span className="font-mono text-[11px] text-neutral-500">{diag.id}</span>
       </div>
-      {diag.svgCode ? (
-        <div
-          className="w-full overflow-x-auto bg-black border border-neutral-900 rounded p-3 flex justify-center"
-          dangerouslySetInnerHTML={{ __html: diag.svgCode }}
-        />
+      {diag.diagramSpec || diag.svgCode ? (
+        <div className="w-full overflow-x-auto bg-black border border-neutral-900 rounded p-3 flex justify-center [&>span]:w-full [&_svg]:max-w-full [&_svg]:h-auto">
+          <DiagramRenderer spec={diag.diagramSpec} svgCode={diag.svgCode} />
+        </div>
       ) : (
         <div className="w-full bg-black/80 border border-dashed border-sky-800/70 rounded p-3 space-y-1 text-xs">
           <div className="text-sky-300 font-medium">阶段一图示规格（待阶段二生成 SVG）</div>
-          <div className="text-neutral-300 leading-relaxed whitespace-pre-wrap">
-            {diag.topologySpec || diag.caption || '已声明图示规格节点'}
-          </div>
+          <div
+            className="text-neutral-300 leading-relaxed lesson-prose [&>p]:m-0"
+            dangerouslySetInnerHTML={{
+              __html: renderMarkdownWithLatex(
+                diag.topologySpec || diag.caption || '已声明图示规格节点',
+                visualAssets
+              ),
+            }}
+          />
         </div>
       )}
       {diag.caption && (
         <div
-          className="text-xs text-neutral-400 leading-relaxed"
+          className="text-xs text-neutral-400 leading-relaxed [&>p]:m-0"
           dangerouslySetInnerHTML={{
-            __html: renderInlineMathWithLatex(diag.caption),
+            __html: renderMarkdownWithLatex(diag.caption, visualAssets),
           }}
         />
       )}
@@ -224,7 +245,17 @@ export const LessonPreviewModal: React.FC<LessonPreviewModalProps> = ({
       {hq.hint && (
         <div className="text-neutral-400">
           <span className="text-sky-300">提示：</span>
-          <span dangerouslySetInnerHTML={{ __html: renderInlineMathWithLatex(hq.hint) }} />
+          <span dangerouslySetInnerHTML={{ __html: renderInlineMathWithLatex(hq.hint, visualAssets) }} />
+        </div>
+      )}
+      {hq.approach && (
+        <div className="text-neutral-400">
+          <span className="text-sky-300">切入思路：</span>
+          <span
+            dangerouslySetInnerHTML={{
+              __html: renderInlineMathWithLatex(hq.approach, visualAssets),
+            }}
+          />
         </div>
       )}
       {hq.answerReveal && (
@@ -250,7 +281,13 @@ export const LessonPreviewModal: React.FC<LessonPreviewModalProps> = ({
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="px-2 py-0.5 rounded bg-neutral-900 border border-neutral-700 text-neutral-200 font-mono">
-          {ex.id} · {ex.categoryLabel || ex.type}
+          {ex.id} ·{' '}
+          <span
+            className="[&>p]:m-0"
+            dangerouslySetInnerHTML={{
+              __html: renderInlineMathWithLatex(ex.categoryLabel || ex.type, visualAssets),
+            }}
+          />
         </span>
         {ex.difficulty && (
           <span className="text-neutral-500 font-mono">{ex.difficulty}</span>
@@ -343,12 +380,12 @@ export const LessonPreviewModal: React.FC<LessonPreviewModalProps> = ({
         )}
 
         {/* Scrollable Content */}
-        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5 text-sm text-neutral-200">
+        <div ref={previewBodyRef} className="flex-1 overflow-y-auto px-6 py-5 space-y-5 text-sm text-neutral-200">
           {/* Summary & Meta */}
           <div className="border border-neutral-800 bg-neutral-950/60 rounded-lg p-4 space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-neutral-400">
               <span>
-                预计学时：{lesson.estimatedMinutes ? `${lesson.estimatedMinutes} 分钟` : '未标注'}
+                预计学时：{lesson.generationStage === 'stage1_content' ? '课件完成后计算' : `${estimateWrittenLessonMinutes(lesson)} 分钟`}
                 {' · '}
                 图示 {(lesson.diagrams || []).length} 幅 · 练习 {(lesson.exercises || []).length} 题
               </span>
@@ -374,23 +411,75 @@ export const LessonPreviewModal: React.FC<LessonPreviewModalProps> = ({
 
           {/* Teaching Context */}
           {lesson.teachingContext && (
-            <div className="border border-neutral-800 rounded-lg p-4 space-y-1.5 text-xs text-neutral-300 bg-neutral-950/30">
+            <div className="border border-neutral-800 rounded-lg p-4 space-y-2 text-xs text-neutral-300 bg-neutral-950/30">
+              {Array.isArray(lesson.teachingContext.prerequisites) &&
+                lesson.teachingContext.prerequisites.length > 0 && (
+                  <div>
+                    <span className="text-neutral-400 font-medium">先修要求：</span>
+                    <ul className="list-disc pl-5 mt-0.5 space-y-0.5">
+                      {lesson.teachingContext.prerequisites.map((pr, idx) => (
+                        <li
+                          key={idx}
+                          dangerouslySetInnerHTML={{
+                            __html: renderInlineMathWithLatex(pr, visualAssets),
+                          }}
+                        />
+                      ))}
+                    </ul>
+                  </div>
+                )}
               {lesson.teachingContext.prerequisiteCheck && (
                 <div>
                   <span className="text-neutral-400 font-medium">先修自检：</span>
-                  <span
+                  <div
+                    className="inline-block align-top [&>p]:m-0"
                     dangerouslySetInnerHTML={{
-                      __html: renderInlineMathWithLatex(lesson.teachingContext.prerequisiteCheck),
+                      __html: renderMarkdownWithLatex(
+                        lesson.teachingContext.prerequisiteCheck,
+                        visualAssets
+                      ),
                     }}
                   />
                 </div>
               )}
+              {Array.isArray(lesson.teachingContext.learningObjectives) &&
+                lesson.teachingContext.learningObjectives.length > 0 && (
+                  <div>
+                    <span className="text-neutral-400 font-medium">学习目标：</span>
+                    <ul className="list-disc pl-5 mt-0.5 space-y-0.5">
+                      {lesson.teachingContext.learningObjectives.map((obj, idx) => (
+                        <li
+                          key={idx}
+                          dangerouslySetInnerHTML={{
+                            __html: renderInlineMathWithLatex(obj, visualAssets),
+                          }}
+                        />
+                      ))}
+                    </ul>
+                  </div>
+                )}
               {lesson.teachingContext.teachingScope && (
                 <div>
                   <span className="text-neutral-400 font-medium">教学范围：</span>
                   <span
                     dangerouslySetInnerHTML={{
-                      __html: renderInlineMathWithLatex(lesson.teachingContext.teachingScope),
+                      __html: renderInlineMathWithLatex(
+                        lesson.teachingContext.teachingScope,
+                        visualAssets
+                      ),
+                    }}
+                  />
+                </div>
+              )}
+              {lesson.teachingContext.connectionNote && (
+                <div>
+                  <span className="text-neutral-400 font-medium">课程衔接：</span>
+                  <span
+                    dangerouslySetInnerHTML={{
+                      __html: renderInlineMathWithLatex(
+                        lesson.teachingContext.connectionNote,
+                        visualAssets
+                      ),
                     }}
                   />
                 </div>

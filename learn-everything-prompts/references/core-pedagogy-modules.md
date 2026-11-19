@@ -52,9 +52,15 @@ Schema and formatting/JSON details live cleanly in stage prompt templates so tea
 1. **图文原位同步与按图号引用**：
    - 凡涉及几何结构、电路拓扑、力学/矢量关系、波形或状态转移，必须在首次讲授对应概念的正文段落处插入 `{{diagram:diag-X}}`；后续推导或练习引用该图时直接写 `图 diag-X`（勿加反引号）。
    - 复杂题设（仅靠文字需多句才能讲清空间/支路连接关系时）须配专属图示（如 `"diagramId": "diag-ex-1"`），不靠繁琐文字口述充当画图。
-2. **图示构图与文本边界规范**：
-   - 每幅图示先明确 `topologySpec`（节点连接、元件参数、物理量、参考方向/极性、坐标范围与关键状态），确保图中符号与正文 100% 一致。
-   - 若生成 SVG，仅适配深色背景（高对比亮色线条与清晰标签，含 `viewBox`），文字距左右边界留足安全边距并换行拆分长标注，文本标签直接写清晰符号如 `u_O`、`R_f`（不使用 `$` 符号或复杂 LaTeX 宏）。
+2. **图示构图与两阶段图表选型规范（5 类结构化 `diagramSpec` 优先 → 自由图表 `svgCode` 兜底）**：
+   - **两阶段职责边界（当任务处于“阶段一：课件正文与图表描述”时）**：仅编写详尽的 `topologySpec`（写明推荐图表类型 `[推荐类型: grid-annot | plot2d | graph | wavedrom | circuit | 自由图表(svgCode)]`、节点连接、元件参数、物理量、数学表达式、参考方向/极性、坐标范围与关键状态）与 `caption`，确保与正文符号 100% 一致；**严禁在阶段一提前输出 `diagramSpec` 或 `svgCode`**（留待阶段二专项生成图表代码）。
+   - **生成图表代码时（阶段二或单步生成）**，**优先选用零坐标结构化 `diagramSpec`**（由前端确定性引擎统一编译为深色界面与白纸 PDF 双兼容矢量 SVG）：
+     - `grid-annot`：行列式沙路法、矩阵变换、卡诺图圈选、数组/指针内存布局、DP 状态转移表（`cells`, `brackets`: `none|matrix|det|box`, `rowHeaders`, `colHeaders`, `highlights`, `boxes`, `arrows`, `diagonals`, `notes`）；
+     - `plot2d`：函数曲线、切线、定积分阴影、概率密度、模电伏安特性、供需曲线（`xRange`, `yRange`, `functions` [须标准表达式如 `x^2`/`sin(x)`/`exp(-x)`/`1/x`], `shadedRegions`, `points`, `vlines`, `hlines`）；
+     - `graph`：二叉树/图、有限状态机 FSM、自控框图、协议状态转移与流程图（`direction`: `LR|TB`, `nodes` [`rect|round|circle|diamond|pill|sum`], `edges`）；
+     - `wavedrom`：数电时序波形、SPI/I2C/UART 通信时序与寄存器位域图（`signal` / `reg`）；
+     - `circuit`：基于相对走向与命名锚点的直流/交流/运放电路原理图（`elements`: `voltage_dc|voltage_ac|current_source|resistor|capacitor|inductor|diode|ground|wire|node|opamp`，支持 `dir` 与 `anchor`/`fromAnchor`/`toAnchor`/`currentLabel`/`polarity`）。
+   - **回退使用原来的“自由图表”（`svgCode`）**：**仅当上述 5 类结构化图表均无法符合本图教学表达需求时**（如三维空间几何与曲面、任意角度受力分析与滑轮/斜面机械图、光学反射折射光路、物理化学实验装置与分子结构、半导体器件物理剖面、或超出 `circuit` 内置 11 种基础元件的复杂专用器件电路），才回退输出手写深色高对比自由图表 `svgCode`（含 `viewBox`，文字距边界 `>= 18px`，长标注用 `<tspan>` 换行，文本直接写清晰符号如 `u_O`、`R_f`，不使用 `$` 符号或复杂 LaTeX 宏；与 `diagramSpec` 二选一，勿同时冗余输出）。
 3. **LaTeX 规范与符号表（`symbolGlossary`）**：
    - 正文及所有字段中涉及数学符号、方程、上下标与物理单位，统一使用标准 `$...$` 或 `$$...$$`（如 `$20\,\text{nA}$`，禁止 `\text{...}` 内写裸下划线 `_`）。
    - 核心物理/数学符号须在首次代入推导前先用文字解释含义和单位，并在 `symbolGlossary` 中列出 `symbol`（不含 `$`）、`name`、`definition`、`unit`。

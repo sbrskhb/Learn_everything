@@ -143,6 +143,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [defaultCustomLearningDepth, setDefaultCustomLearningDepth] = useState<string>(
     settings.defaultCustomLearningDepth || ''
   );
+  const [showLessonTools, setShowLessonTools] = useState(Boolean(settings.showLessonTools));
   const [showAdvancedWorkflowDetails, setShowAdvancedWorkflowDetails] = useState<boolean>(
     Boolean(settings.showAdvancedWorkflowDetails)
   );
@@ -197,6 +198,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setDefaultCustomLearnerBaseline(settings.defaultCustomLearnerBaseline || '');
     setDefaultLearningDepth(settings.defaultLearningDepth || nextFallback.depth);
     setDefaultCustomLearningDepth(settings.defaultCustomLearningDepth || '');
+    setShowLessonTools(Boolean(settings.showLessonTools));
     setShowAdvancedWorkflowDetails(Boolean(settings.showAdvancedWorkflowDetails));
     setShowContentCategoryBadges(Boolean(settings.showContentCategoryBadges));
     setRemoteAccessEnabled(settings.remoteAccessEnabled ?? true);
@@ -345,6 +347,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           defaultCustomLearnerBaseline: defaultCustomLearnerBaseline.trim(),
           defaultLearningDepth,
           defaultCustomLearningDepth: defaultCustomLearningDepth.trim(),
+          showLessonTools,
           showAdvancedWorkflowDetails,
           showContentCategoryBadges,
           remoteAccessEnabled,
@@ -559,6 +562,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </button>
               )}
             </div>
+            <label className="flex items-center gap-2 text-xs cursor-pointer">
+              <input type="checkbox" checked={showLessonTools} onChange={(e) => setShowLessonTools(e.target.checked)} />
+              显示课件顶部小节资料与提示词工具（有错误或警告时自动显示）
+            </label>
             <label
               htmlFor="settings-advanced-workflow-toggle"
               className="flex items-start gap-2.5 text-xs cursor-pointer"
@@ -946,9 +953,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 type="text"
                 value={modelName}
                 onChange={(e) => setModelName(e.target.value)}
-                placeholder="例如：deepseek-chat / gpt-4o / gemini-3.8-flash"
+                placeholder="例如：deepseek-flash / gpt-4o / gemini-3.8-flash"
                 className="w-full bg-neutral-950 border border-neutral-800 rounded px-3 py-2 text-xs font-mono text-white placeholder:text-neutral-600 focus:outline-none focus:border-neutral-500"
               />
+              {/^https:\/\/api\.deepseek\.com(?:\/|$)/i.test(apiBaseUrl.trim()) && (
+                <p className="mt-1 text-xs text-neutral-400">含 PDF 的生成请求使用 deepseek-flash，PDF 会上传至 DeepSeek 解析，按其文档解析规则计费。</p>
+              )}
             </div>
           </div>
 

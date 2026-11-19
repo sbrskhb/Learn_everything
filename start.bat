@@ -120,14 +120,19 @@ if errorlevel 1 (
 )
 
 :DO_START
+echo       Building optimized web assets...
+call npm run build
+if errorlevel 1 goto :ERR_SERVER
+
 echo [4/4] Starting Web and API server (http://localhost:3000)...
 echo.
 
 :: Open default browser after 2 seconds delay
 start "" /min cmd /c "ping 127.0.0.1 -n 3 >nul & start http://localhost:3000"
 
-:: Start server
-call npm run dev
+:: Serve the built site, including when browsing from a phone.
+set "NODE_ENV=production"
+call npx --no-install tsx server.ts
 if errorlevel 1 goto :ERR_SERVER
 goto :EXIT
 

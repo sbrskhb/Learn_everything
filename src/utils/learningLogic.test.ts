@@ -1,3 +1,4 @@
+import { estimateWrittenLessonMinutes } from './learningLogic';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -431,7 +432,7 @@ test('promptLibrary loads modular prompts and PDF split prompts accurately', () 
   });
   assert.equal(stemPrompt.includes('第 2 节'), true);
   assert.equal(stemPrompt.includes('sec-02'), true);
-  assert.equal(stemPrompt.includes('"estimatedMinutes"'), true);
+  assert.equal(stemPrompt.includes('"estimatedMinutes"'), false);
   assert.equal(stemPrompt.includes('2026-11-12'), false);
   assert.equal(stemPrompt.includes('排程第'), false);
   assert.equal(stemPrompt.includes('topologySpec'), true);
@@ -450,7 +451,7 @@ test('promptLibrary loads modular prompts and PDF split prompts accurately', () 
   });
   assert.equal(englishPrompt.includes('alleviate'), true);
   assert.equal(englishPrompt.includes('sec-02'), true);
-  assert.equal(englishPrompt.includes('estimatedMinutes'), true);
+  assert.equal(englishPrompt.includes('estimatedMinutes'), false);
   assert.equal(englishPrompt.includes('2026-11-12'), false);
   assert.equal(englishPrompt.includes('排程第'), false);
   assert.equal(englishPrompt.includes('{{heuristic:hq-X}}'), true);
@@ -544,7 +545,7 @@ test('Agent Mode & Chat Mode prompts and unified coursewareParser work end-to-en
   });
   assert.equal(agentPrompt.includes('courses/电路原理与信号分析/lessons/sec-01.json'), true);
   assert.equal(agentPrompt.includes('segments/sec-01.pdf'), true);
-  assert.equal(agentPrompt.includes('"estimatedMinutes"'), true);
+  assert.equal(agentPrompt.includes('"estimatedMinutes"'), false);
   assert.equal(agentPrompt.includes('2026-11-11'), false);
   assert.equal(agentPrompt.includes('计划总天数与起始日'), false);
   assert.equal(agentPrompt.includes('排程第'), false);
@@ -561,7 +562,7 @@ test('Agent Mode & Chat Mode prompts and unified coursewareParser work end-to-en
   });
   assert.equal(chatLessonPrompt.includes('sec-01.pdf'), true);
   assert.equal(chatLessonPrompt.includes('sec-01'), true);
-  assert.equal(chatLessonPrompt.includes('"estimatedMinutes"'), true);
+  assert.equal(chatLessonPrompt.includes('"estimatedMinutes"'), false);
   assert.equal(chatLessonPrompt.includes('2026-11-11'), false);
   assert.equal(chatLessonPrompt.includes('排程第'), false);
   assert.equal(chatLessonPrompt.includes('换路定则'), true);
@@ -2112,7 +2113,7 @@ test('parseImportedSyllabusContent supports unconstrained sections + estimatedMi
   );
   assert.deepEqual(
     parsedNew.dailyPlan.map((s) => s.estimatedMinutes),
-    [40, 55, 50, 45, 60]
+    [undefined, undefined, undefined, undefined, undefined]
   );
   assert.equal(
     parsedNew.dailyPlan.every((s) => (s.scheduledDay || 0) >= 1 && (s.scheduledDay || 0) <= 3),
@@ -2221,14 +2222,15 @@ test('parseImportedLessonContent parses prerequisiteCheck, topologySpec, remedia
   );
   const vc = parsed.lesson.exercises[0]?.variantCheck;
   assert.equal(typeof vc === 'object' && vc.answer === 'A', true);
-  assert.equal(parsed.lesson.estimatedMinutes, 65);
+  assert.equal(parsed.lesson.estimatedMinutes, estimateWrittenLessonMinutes(parsed.lesson));
+  assert.notEqual(parsed.lesson.estimatedMinutes, 65);
   assert.equal(
     estimateSectionMinutesFallback({
       ...slot,
       estimatedMinutes: 45,
       lesson: parsed.lesson,
     }),
-    65
+    parsed.lesson.estimatedMinutes
   );
 
   // When estimatedMinutes is omitted in an imported lesson, parseImportedLessonContent estimates it from written content
@@ -2236,7 +2238,7 @@ test('parseImportedLessonContent parses prerequisiteCheck, topologySpec, remedia
     JSON.stringify({ title: slot.title, markdownBody: '推导正文 $u_O = -\\frac{R_f}{R_1} u_I$' }),
     slot
   );
-  assert.equal((parsedNoMinutes.lesson.estimatedMinutes || 0) >= 20, true);
+  assert.equal(parsedNoMinutes.lesson.estimatedMinutes, estimateWrittenLessonMinutes(parsedNoMinutes.lesson));
 });
 
 test('renderMarkdownWithLatex transforms dark-mode semantic callouts cleanly', async () => {
@@ -2438,12 +2440,13 @@ test('getEvaluatedSectionMinutes, allocateSectionsToDays, parseImportedSyllabusC
       generatedAt: '2026-11-14T00:00:00.000Z',
     },
   };
-  assert.equal(getEvaluatedSectionMinutes(withLessonSlot), 65);
+  assert.equal(getEvaluatedSectionMinutes(withLessonSlot), 3);
   const afterEval = allocateSectionsToDays([withLessonSlot, reallocated[1]], 2, '2026-11-14');
-  assert.equal(afterEval[0].estimatedMinutes, 65);
+  assert.equal(afterEval[0].estimatedMinutes, estimateWrittenLessonMinutes(afterEval[0].lesson!));
   assert.equal(afterEval[1].estimatedMinutes, undefined);
   const scheduleAfterEval = buildCourseDailySchedule(afterEval, 2, '2026-11-14');
-  assert.equal(scheduleAfterEval[0].estimatedMinutes, 65);
+  assert.equal(scheduleAfterEval[0].estimatedMinutes, afterEval[0].estimatedMinutes);
+  assert.equal(getEvaluatedSectionMinutes({ ...afterEval[0], lesson: undefined }), undefined);
 
   // 2. Step 1 & Step 2 prompts do not leak durationDays, startDate, or "dayIndex"
   const testCourse = {
@@ -2600,7 +2603,7 @@ test('multi-region PDF binding ensures 100% coverage across sections including m
   assert.equal(coveredWithOrphan.has('region-14'), true);
 });
 
-test('Step 3 lesson prompts list all bound multi-region PDF segments and place estimatedMinutes after qualityCheck', async () => {
+test('Step 3 lesson prompts list all bound multi-region PDF segments without prompting for estimatedMinutes', async () => {
   const {
     buildAgentExecutionPrompt,
     buildChatLessonPrompt,
@@ -2679,14 +2682,8 @@ test('Step 3 lesson prompts list all bound multi-region PDF segments and place e
   for (const p of [chatPrompt, agentPrompt, apiUserPrompt]) {
     assert.equal(p.includes('region-06.pdf'), true);
     assert.equal(p.includes('region-07.pdf'), true);
-    const revIdx = p.indexOf('"reverseChecks"');
-    assert.equal(revIdx >= 0, true);
-    const afterRev = p.slice(revIdx);
-    assert.equal(afterRev.includes('"estimatedMinutes"'), true);
-    const summaryIdx = p.lastIndexOf('"summary"', revIdx);
-    if (summaryIdx >= 0) {
-      assert.equal(p.slice(summaryIdx, revIdx).includes('"estimatedMinutes"'), false);
-    }
+    assert.ok(p.includes('"reverseChecks"'));
+    assert.ok(!p.includes('estimatedMinutes'));
   }
 });
 
@@ -2710,14 +2707,16 @@ test('Step 3 lesson parser and repair patch update estimatedMinutes and markdown
     slot,
     'chat',
   );
-  assert.equal(parsedMd.lesson.estimatedMinutes, 52);
+  assert.equal(parsedMd.lesson.estimatedMinutes, estimateWrittenLessonMinutes(parsedMd.lesson));
+  assert.notEqual(parsedMd.lesson.estimatedMinutes, 52);
 
   const repaired = applyCoursewareRepairPatch(
     parsedMd.lesson,
     JSON.stringify({ summary: '更新摘要', estimatedMinutes: 58 }),
     slot,
   );
-  assert.equal(repaired.mergedLesson.estimatedMinutes, 58);
+  assert.equal(repaired.mergedLesson.estimatedMinutes, estimateWrittenLessonMinutes(repaired.mergedLesson));
+  assert.notEqual(repaired.mergedLesson.estimatedMinutes, 58);
 
   const badgeOnlyHtml = renderMarkdownWithLatex('> [!textbook]\n> 教材原话内容');
   assert.equal(badgeOnlyHtml.includes('lesson-callout-plain'), true);
@@ -3209,3 +3208,1001 @@ test('markdownMath preserves polynomial exponents and bare lim f[g(x)], while co
 
 
 
+
+
+test('calculate finished lesson time by content and drop stale estimates on deletion', () => {
+  const lesson = {
+    dayIndex: 1,
+    date: '',
+    title: 'Test',
+    summary: '',
+    generatedAt: '',
+    estimatedMinutes: 99,
+    markdownBody: '字'.repeat(200) + String.raw`$$x \Rightarrow y \Rightarrow z$$`,
+    keyPoints: ['概念', '概念'],
+    diagrams: [{ id: 'diag-1', title: 'Diagram', caption: '', svgCode: '' }],
+    exercises: [
+      { id: 'ex-1', type: 'fill', question: 'Q', answer: 'A', difficulty: 'basic' },
+      { id: 'ex-2', type: 'fill', question: 'Q', answer: 'A', difficulty: 'application' },
+      { id: 'ex-3', type: 'fill', question: 'Q', answer: 'A', difficulty: 'comprehensive' },
+    ],
+  } as const;
+  const complete = { ...lesson, keyPoints: [...lesson.keyPoints], diagrams: [...lesson.diagrams], exercises: [...lesson.exercises] };
+  assert.equal(getEvaluatedSectionMinutes({ lesson: complete, estimatedMinutes: 99 }), 24);
+  assert.equal(getEvaluatedSectionMinutes({ estimatedMinutes: 99 }), undefined);
+  assert.equal(getEvaluatedSectionMinutes({ lesson: { ...complete, generationStage: 'stage1_content' } }), undefined);
+});
+
+
+test('render rectangular matrix shorthand in exercises and multiline matrices in semantic callouts', async () => {
+  const { renderMarkdownWithLatex, renderInlineMathWithLatex } = await import('./markdownMath');
+  const question = '设 A=(0 a_1 0 0;0 0 a_2 0;0 0 0 a_3;a_4 0 0 0)，且 A 可逆。';
+  const callout = String.raw`> [!INTUITION]
+> $$
+> C=\begin{pmatrix}
+> 1 & 2 \\
+> 3 & 4
+> \end{pmatrix}
+> $$`;
+  for (const html of [
+    renderMarkdownWithLatex(question),
+    renderMarkdownWithLatex(callout),
+    renderInlineMathWithLatex('$B=[1,2;3,4]$'),
+  ]) {
+    assert.ok(html.includes('<mtable'));
+    assert.ok(!html.includes('katex-error'));
+  }
+  assert.ok(!renderInlineMathWithLatex('P=(1,2)').includes('<mtable'));
+});
+
+test('calculus bare-math, Greek/prime SVG subscripts, and escaped-SVG audit checks handle edge cases cleanly', async () => {
+  const fs = await import('node:fs');
+  const { normalizeBareMathForMarkdown, normalizeMathUnicodeToLatex, renderInlineMathWithLatex } =
+    await import('./markdownMath');
+  const { enhanceDiagramSvg } = await import('./svgMath');
+  const { auditCoursewareRendering } = await import('./coursewareDiagnostics');
+
+  // 1. Regression: n^2+\pi must not turn into n^{2+}\pi
+  assert.equal(normalizeMathUnicodeToLatex('n^2+\\pi'), 'n^2+\\pi');
+  const piHtml = renderInlineMathWithLatex('$n^2+\\pi$');
+  assert.ok(!piHtml.includes('katex-error'));
+
+  // 2. Regression: parenthesized calculus scripts, limits, Taylor polynomials, and Δx powers remain intact
+  assert.equal(
+    normalizeBareMathForMarkdown("曲率分母 (1 + y'^2)^{3/2} 非零"),
+    "曲率分母 $(1 + y'^2)^{3/2}$ 非零"
+  );
+  assert.equal(
+    normalizeBareMathForMarkdown('计算极限 lim_{x→0^+} (1 + 2x)^{1/x} 的值'),
+    '计算极限 $\\lim_{x\\to 0^+} (1 + 2x)^{1/x}$ 的值'
+  );
+  assert.equal(
+    normalizeBareMathForMarkdown('满足条件 p_n(x_0)=f(x_0) 且增量 (Δx)^2 很小'),
+    '满足条件 $p_n(x_0)=f(x_0)$ 且增量 $(\\Delta x)^2$ 很小'
+  );
+
+  // 3. SVG Greek letters, primes with subscripts, and trig operators
+  const enhancedSvg = enhanceDiagramSvg(
+    '<svg viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg"><text x="20" y="30">\\theta_1, \\xi_1, f\'_+(x_0), \\sec t</text></svg>'
+  );
+  assert.ok(!enhancedSvg.includes('\\sec'));
+  assert.ok(!enhancedSvg.includes('\\theta'));
+  assert.ok(enhancedSvg.includes('baseline-shift="sub" font-size="0.72em">1</tspan>'));
+  assert.ok(enhancedSvg.includes('baseline-shift="sub" font-size="0.72em">+</tspan>'));
+  assert.ok(enhancedSvg.includes('sec t'));
+
+  // 4. Escaped SVG tags are flagged by auditCoursewareRendering
+  const badSvgReport = auditCoursewareRendering({
+    sectionId: 'sec-test',
+    dayIndex: 1,
+    date: '2026-11-18',
+    title: '转义 SVG 检测',
+    summary: '摘要',
+    markdownBody: '如图 {{diagram:diag-1}} 所示。',
+    keyPoints: ['要点'],
+    diagrams: [
+      {
+        id: 'diag-1',
+        title: '图 1',
+        caption: '图注',
+        svgCode: '<svg viewBox=\\"0 0 680 320\\">\\<rect width=\\"680\\" height=\\"320\\"/></svg>',
+      },
+    ],
+    exercises: [{ id: 'ex-1', type: 'choice', question: 'Q', answer: 'A' }],
+    generatedAt: '2026-11-18T00:00:00Z',
+  });
+  assert.ok(
+    badSvgReport.issues.some((iss) => iss.category === 'svg_error' && iss.id.startsWith('svg-escaped-'))
+  );
+
+  // 5. Verify sec-11, sec-14, sec-15, sec-16 pass full audit cleanly with valid unescaped SVGs
+  for (const num of ['11', '14', '15', '16']) {
+    const lesson = JSON.parse(fs.readFileSync(`courses/高数/lessons/sec-${num}.json`, 'utf8'));
+    const report = auditCoursewareRendering(lesson);
+    assert.equal(report.errorCount, 0, `sec-${num} should have 0 errors`);
+    assert.equal(report.warningCount, 0, `sec-${num} should have 0 warnings`);
+    for (const diag of lesson.diagrams || []) {
+      assert.ok(diag.svgCode && !diag.svgCode.includes('\\"') && !diag.svgCode.includes('\\<'));
+    }
+  }
+});
+
+test('BARE_MATH_EXPR_RE stays compact for Safari/WebKit YARR and normalizes all STEM cases accurately', async () => {
+  const {
+    BARE_MATH_EXPR_RE,
+    normalizeBareMathForMarkdown,
+    renderInlineMathWithLatex,
+  } = await import('./markdownMath');
+
+  assert.equal(BARE_MATH_EXPR_RE.source.length < 15000, true);
+  assert.equal(BARE_MATH_EXPR_RE.source.includes('(?<!'), false);
+  assert.equal(BARE_MATH_EXPR_RE.source.includes('(?<='), false);
+
+  const cases: Array<[string, string]> = [
+    ['输出关系 u_O = -i_F R_f 成立', '输出关系 $u_O = -i_F R_f$ 成立'],
+    ['电路 u_O = -(R_f / R_1) * u_I 推导', '电路 $u_O = -(R_f / R_1) \\cdot u_I$ 推导'],
+    ["分母 (1 + y'^2)^{3/2} 非零", "分母 $(1 + y'^2)^{3/2}$ 非零"],
+    ['极限 lim_{x→0^+} (1 + 2x)^{1/x} 存在', '极限 $\\lim_{x\\to 0^+} (1 + 2x)^{1/x}$ 存在'],
+    [
+      '复合函数 \\lim_{x\\to x_0}f[g(x)]=\\lim_{u\\to u_0}f(u) 成立',
+      '复合函数 $\\lim_{x\\to x_0}f[g(x)]=\\lim_{u\\to u_0}f(u)$ 成立',
+    ],
+    ["满足 |f'(x)| <= M 成立", "满足 $|f'(x)| \\le  M$ 成立"],
+    ['高阶无穷小 (Δx)^2 忽略', '高阶无穷小 $(\\Delta x)^2$ 忽略'],
+    ['弱电解质 CH_3COOH 电离', '弱电解质 $CH_3COOH$ 电离'],
+    ['硫酸根离子 SO_4^{2-} 检验', '硫酸根离子 $SO_4^{2-}$ 检验'],
+    ['复杂度 O(n \\log_2 n) 分析', '复杂度 $O(n \\log_2 n)$ 分析'],
+  ];
+
+  for (const [input, expected] of cases) {
+    assert.equal(normalizeBareMathForMarkdown(input), expected);
+    const html = renderInlineMathWithLatex(input);
+    assert.equal(html.includes('class="katex"'), true);
+    assert.equal(html.includes('katex-error'), false);
+  }
+});
+
+test('Diagram Engine: all 5 structured engines compile deterministically with dark/print dual theme and zero NaN', async () => {
+  const {
+    validateDiagramSpec,
+    compileDiagramSpecSync,
+    compileDiagramSpec,
+  } = await import('../diagrams');
+  const { enhanceDiagramSvg } = await import('./svgMath');
+
+  // 1a. grid-annot: 3x3 determinant Sarrus diagonals + matrix/det brackets
+  const sarrusSvg = compileDiagramSpecSync({
+    type: 'grid-annot',
+    title: '三阶行列式沙路法（主/副对角线乘积符号）',
+    brackets: 'det',
+    cells: [
+      ['a_{11}', 'a_{12}', 'a_{13}'],
+      ['a_{21}', 'a_{22}', 'a_{23}'],
+      ['a_{31}', 'a_{32}', 'a_{33}'],
+    ],
+    highlights: [{ row: 0, col: 0, tone: 'positive' }],
+    diagonals: [
+      { cells: [[0, 0], [1, 1], [2, 2]], label: '+a_11 a_22 a_33', tone: 'positive' },
+      { cells: [[0, 2], [1, 1], [2, 0]], label: '-a_13 a_22 a_31', tone: 'negative', dashed: true },
+    ],
+    arrows: [{ from: [0, 1], to: [1, 2], tone: 'accent', curve: 14 }],
+    notes: ['主对角线方向取正号，副对角线方向取负号'],
+  });
+  assert.ok(sarrusSvg);
+  assert.equal(sarrusSvg.includes('<svg'), true);
+  assert.equal(sarrusSvg.includes('data-diagram-engine="grid-annot"'), true);
+  assert.equal(sarrusSvg.includes('viewBox="'), true);
+  assert.equal(sarrusSvg.includes('@media print'), true);
+  assert.equal(sarrusSvg.includes('NaN'), false);
+  // enhanceDiagramSvg must pass structured engine SVG through untouched
+  assert.equal(enhanceDiagramSvg(sarrusSvg), sarrusSvg);
+
+  // 1b. grid-annot: Karnaugh map with headers and rounded grouping boxes
+  const kmapSvg = compileDiagramSpecSync({
+    type: 'grid-annot',
+    title: '四变量卡诺图化简',
+    rowHeaders: ['00', '01', '11', '10'],
+    colHeaders: ['00', '01', '11', '10'],
+    cells: [
+      ['1', '1', '0', '0'],
+      ['1', '1', '0', '0'],
+      ['0', '0', '1', '1'],
+      ['0', '0', '1', '0'],
+    ],
+    boxes: [
+      { from: [0, 0], to: [1, 1], tone: 'positive', label: "\\bar{A}\\bar{C}" },
+      { from: [2, 2], to: [2, 3], tone: 'accent', dashed: true, label: 'ABC' },
+    ],
+  });
+  assert.ok(kmapSvg);
+  assert.equal(kmapSvg.includes('data-diagram-engine="grid-annot"'), true);
+  assert.equal(kmapSvg.includes('NaN'), false);
+
+  // 2. plot2d: expr-eval safe curve rendering, shaded integral region, projections, and 1/x asymptote break
+  const integralSvg = compileDiagramSpecSync({
+    type: 'plot2d',
+    title: '抛物线积分面积与 1/x 渐近线断线测试',
+    xRange: [-3, 3],
+    yRange: [-4, 5],
+    functions: [
+      { expr: 'x^2', label: 'y = x^2', tone: 'accent' },
+      { expr: '1 / x', label: 'y = 1/x', tone: 'negative' },
+    ],
+    shadedRegions: [
+      { expr: 'x^2', from: 0, to: 2, tone: 'positive', label: '∫_0^2 x^2 dx = 8/3' },
+    ],
+    points: [
+      { x: 2, y: 4, label: '(2, 4)', tone: 'warn', showProjections: true },
+    ],
+    vlines: [{ x: 0, label: 'x=0', tone: 'muted', style: 'dashed' }],
+    hlines: [{ y: 1, label: 'y=1', tone: 'muted', style: 'dotted' }],
+  });
+  assert.ok(integralSvg);
+  assert.equal(integralSvg.includes('data-diagram-engine="plot2d"'), true);
+  assert.equal(integralSvg.includes('viewBox="'), true);
+  assert.equal(integralSvg.includes('@media print'), true);
+  assert.equal(integralSvg.includes('NaN'), false);
+  assert.equal(integralSvg.includes('y = 1/x'), true);
+  // 1/x curve has an asymptote at x=0, so its path should contain multiple 'M ' subpaths rather than bridging -Inf to +Inf
+  const pathMatches = [...integralSvg.matchAll(/<path d="(M [^"]+)"/g)].map((m) => m[1]);
+  assert.equal(
+    pathMatches.some((d) => (d.match(/\bM\s/g) || []).length >= 2),
+    true,
+    'expected 1/x curve path to break cleanly across x=0 asymptote'
+  );
+
+  // 3. graph: async ELK orthogonal layout with feedback control block + sum junction
+  const graphSpec = {
+    type: 'graph' as const,
+    title: '闭环负反馈控制系统框图',
+    direction: 'LR' as const,
+    nodes: [
+      { id: 'r', label: 'R(s)', shape: 'pill' as const, tone: 'accent' as const },
+      { id: 'sum', label: 'Σ', shape: 'sum' as const, tone: 'default' as const },
+      { id: 'g', label: 'G(s)', subLabel: '前向通路', shape: 'rect' as const, tone: 'positive' as const },
+      { id: 'c', label: 'C(s)', shape: 'circle' as const, tone: 'accent' as const },
+      { id: 'cond', label: '稳态?', shape: 'diamond' as const, tone: 'warn' as const },
+      { id: 'h', label: 'H(s)', shape: 'round' as const, tone: 'negative' as const },
+    ],
+    edges: [
+      { from: 'r', to: 'sum', label: '+' },
+      { from: 'sum', to: 'g', label: 'E(s)' },
+      { from: 'g', to: 'c', tone: 'positive' as const },
+      { from: 'c', to: 'cond', style: 'dashed' as const },
+      { from: 'c', to: 'h' },
+      { from: 'h', to: 'sum', label: '-', tone: 'negative' as const },
+    ],
+  };
+  assert.equal(compileDiagramSpecSync(graphSpec), null, 'uncached graph spec returns null in sync mode');
+  const graphSvg = await compileDiagramSpec(graphSpec);
+  assert.equal(graphSvg.includes('data-diagram-engine="graph"'), true);
+  assert.equal(graphSvg.includes('viewBox="'), true);
+  assert.equal(graphSvg.includes('@media print'), true);
+  assert.equal(graphSvg.includes('NaN'), false);
+  assert.equal(graphSvg.includes('G(s)'), true);
+  assert.equal(graphSvg.includes('H(s)'), true);
+  assert.equal(compileDiagramSpecSync(graphSpec), graphSvg, 'cached graph spec resolves synchronously');
+
+  // 4. wavedrom: timing waveform + register bitfield via async wavedrom + onml
+  const timingSvg = await compileDiagramSpec({
+    type: 'wavedrom',
+    title: 'SPI 同步传输时序',
+    signal: [
+      { name: 'SCLK', wave: 'p.....' },
+      { name: 'MOSI', wave: 'x.34.5x', data: ['ADDR', 'D0', 'CRC'] },
+      { name: 'CS_N', wave: '10....1' },
+    ],
+    head: { text: 'Mode 0 Timing', tick: 0 },
+    foot: { tock: 1 },
+  });
+  assert.equal(timingSvg.includes('data-diagram-engine="wavedrom"'), true);
+  assert.equal(timingSvg.includes('viewBox="'), true);
+  assert.equal(timingSvg.includes('@media print'), true);
+  assert.equal(timingSvg.includes('NaN'), false);
+  assert.equal(timingSvg.includes('SCLK'), true);
+  assert.equal(timingSvg.includes('ADDR'), true);
+
+  const bitfieldSvg = await compileDiagramSpec({
+    type: 'wavedrom',
+    title: '状态寄存器位域分布',
+    reg: [
+      { bits: 4, name: 'MODE', attr: 'RW', type: 2 },
+      { bits: 3, name: 'IRQ', attr: 'RO', type: 4 },
+      { bits: 1, name: 'EN', attr: 'RW', type: 5 },
+    ],
+  });
+  assert.equal(bitfieldSvg.includes('data-diagram-engine="wavedrom"'), true);
+  assert.equal(bitfieldSvg.includes('viewBox="'), true);
+  assert.equal(bitfieldSvg.includes('NaN'), false);
+  assert.equal(bitfieldSvg.includes('MODE'), true);
+
+  // 5a. circuit: inverting op-amp amplifier with anchors & relative directions
+  const opampSvg = compileDiagramSpecSync({
+    type: 'circuit',
+    title: '反相比例运算放大器电路',
+    elements: [
+      { kind: 'voltage_dc', label: 'u_I', dir: 'up', anchor: 'vin' },
+      { kind: 'resistor', label: 'R_1', value: '10kΩ', dir: 'right', currentLabel: 'i_1' },
+      { kind: 'node', label: 'u_-', anchor: 'sum' },
+      { kind: 'opamp', id: 'u1', anchor: 'u1', label: 'A' },
+      { kind: 'wire', fromAnchor: 'sum', dir: 'up', length: 0.7 },
+      { kind: 'resistor', label: 'R_f', value: '100kΩ', dir: 'right', currentLabel: 'i_F', length: 1.5 },
+      { kind: 'wire', toAnchor: 'u1.out' },
+      { kind: 'ground', fromAnchor: 'u1.in+' },
+    ],
+  });
+  assert.ok(opampSvg);
+  assert.equal(opampSvg.includes('data-diagram-engine="circuit"'), true);
+  assert.equal(opampSvg.includes('viewBox="'), true);
+  assert.equal(opampSvg.includes('@media print'), true);
+  assert.equal(opampSvg.includes('NaN'), false);
+  assert.equal(opampSvg.includes('100kΩ'), true);
+  assert.equal(opampSvg.includes('>f</tspan>'), true);
+
+  // 5b. circuit: remaining primitives (voltage_ac, current_source, capacitor, inductor, diode)
+  const rlcDiodeSvg = compileDiagramSpecSync({
+    type: 'circuit',
+    title: 'RLC 与整流/恒流元件集合',
+    elements: [
+      { kind: 'voltage_ac', label: 'u_s', dir: 'up', anchor: 'src_top' },
+      { kind: 'capacitor', label: 'C_1', value: '10uF', dir: 'right' },
+      { kind: 'inductor', label: 'L_1', value: '2mH', dir: 'right' },
+      { kind: 'diode', label: 'D_1', dir: 'down', tone: 'accent' },
+      { kind: 'current_source', label: 'I_s', value: '5mA', dir: 'left' },
+      { kind: 'ground' },
+    ],
+  });
+  assert.ok(rlcDiodeSvg);
+  assert.equal(rlcDiodeSvg.includes('data-diagram-engine="circuit"'), true);
+  assert.equal(rlcDiodeSvg.includes('NaN'), false);
+  assert.equal(rlcDiodeSvg.includes('2mH'), true);
+  assert.equal(rlcDiodeSvg.includes('>1</tspan>'), true);
+
+  // 6. Zod normalization + invalid rejection
+  const aliased = validateDiagramSpec({
+    type: 'matrix',
+    cells: [[1, 2], [3, 4]],
+    highlights: [{ row: 0, col: 0, tone: 'green' }],
+  });
+  assert.equal(aliased.success, true);
+  if (aliased.success) {
+    assert.equal(aliased.data.type, 'grid-annot');
+    assert.equal(aliased.data.highlights?.[0]?.tone, 'positive');
+  }
+
+  assert.equal(validateDiagramSpec({ type: 'unknown', cells: [] }).success, false);
+  assert.equal(validateDiagramSpec({ type: 'grid-annot', cells: [] }).success, false);
+  assert.equal(validateDiagramSpec({ type: 'plot2d', xRange: [5, 1], functions: [{ expr: 'x' }] }).success, false);
+  assert.equal(validateDiagramSpec({ type: 'wavedrom', signal: [] }).success, false);
+  assert.equal(validateDiagramSpec({ type: 'circuit', elements: [{ kind: 'flux_capacitor' }] }).success, false);
+});
+
+test('Diagram Engine primary two-stage flow, diagnostics validation, repair patch, and markdown fenced blocks', async () => {
+  const {
+    parseImportedLessonContent,
+    extractPendingDiagramSpecs,
+    mergeStage2DiagramsIntoStage1,
+    hasValidDiagramContent,
+  } = await import('./coursewareParser');
+  const {
+    auditCoursewareRendering,
+    applyCoursewareRepairPatch,
+  } = await import('./coursewareDiagnostics');
+  const { renderMarkdownWithLatex } = await import('./markdownMath');
+
+  const slot = {
+    id: 'sec-det-diag',
+    dayIndex: 2,
+    sectionId: 'sec-det-diag',
+    title: '三阶行列式展开',
+    date: '2026-11-19',
+    objective: '掌握三阶行列式沙路法展开规律',
+    keyTopics: ['三阶行列式', '沙路法'],
+    prerequisites: [],
+  };
+
+  // 1. Primary track two-stage generation using diagramSpec in Stage 2
+  const stage1Payload = JSON.stringify({
+    title: '三阶行列式展开',
+    summary: '掌握三阶行列式沙路法展开规律。',
+    keyPoints: ['主对角线方向 3 项取正，副对角线方向 3 项取负'],
+    markdownBody: '对照 {{diagram:diag-1}} 观察三阶行列式的沙路展开规则，完成后完成下方练习。',
+    diagrams: [
+      {
+        id: 'diag-1',
+        title: '三阶行列式沙路法示意',
+        caption: '正负对角线方向标记',
+        topologySpec: '3x3 grid-annot det with positive main diagonals and negative anti-diagonals',
+        svgCode: '',
+      },
+    ],
+    exercises: [
+      {
+        id: 'ex-1',
+        type: 'fill',
+        question: '结合附图计算行列式的值。',
+        answer: '0',
+        diagramId: 'diag-1',
+        svgCode: '',
+      },
+    ],
+  });
+
+  const stage1Parsed = parseImportedLessonContent(stage1Payload, slot, 'chat', {}, { stageMode: 'stage1' });
+  assert.equal(stage1Parsed.lesson.generationStage, 'stage1_content');
+  const pending = extractPendingDiagramSpecs(stage1Parsed.lesson);
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].id, 'diag-1');
+
+  const stage2Payload = JSON.stringify({
+    diagrams: [
+      {
+        id: 'diag-1',
+        title: '三阶行列式沙路法示意',
+        caption: '正负对角线方向标记',
+        diagramSpec: {
+          type: 'grid-annot',
+          brackets: 'det',
+          cells: [
+            ['1', '2', '3'],
+            ['4', '5', '6'],
+            ['7', '8', '9'],
+          ],
+          diagonals: [
+            { cells: [[0, 0], [1, 1], [2, 2]], label: '+45', tone: 'positive' },
+            { cells: [[0, 2], [1, 1], [2, 0]], label: '-105', tone: 'negative', dashed: true },
+          ],
+        },
+      },
+    ],
+  });
+
+  const mergedResult = mergeStage2DiagramsIntoStage1(stage1Parsed.lesson, stage2Payload);
+  assert.equal(mergedResult.mergedLesson.generationStage, 'complete');
+  assert.equal(mergedResult.mergedLesson.diagrams?.[0]?.diagramSpec?.type, 'grid-annot');
+  assert.equal(hasValidDiagramContent(mergedResult.mergedLesson.diagrams?.[0]), true);
+  assert.equal(mergedResult.mergedLesson.exercises[0].diagramSpec?.type, 'grid-annot');
+
+  const cleanReport = auditCoursewareRendering(mergedResult.mergedLesson);
+  assert.equal(cleanReport.errorCount, 0);
+
+  // 2. auditCoursewareRendering detects invalid diagramSpec (in diagrams[], exercises[], and markdown fences),
+  //    and applyCoursewareRepairPatch repairs it via diagramsToUpsert
+  const brokenLesson = {
+    ...mergedResult.mergedLesson,
+    markdownBody: [
+      '观察 {{diagram:diag-1}} 与公式 u_O = -(R_f / R_1) * u_I：',
+      '',
+      '```diagram:plot2d',
+      '{"xRange": [10, 2], "functions": [{"expr": "x^2"}]}',
+      '```',
+    ].join('\n'),
+    diagrams: [
+      {
+        id: 'diag-1',
+        title: '损坏图',
+        caption: '缺少字段',
+        diagramSpec: { type: 'grid-annot', cells: [] } as any,
+      },
+    ],
+    exercises: [
+      {
+        id: 'ex-1',
+        type: 'fill' as const,
+        question: '观察图形回答。',
+        answer: '1',
+        diagramSpec: { type: 'wavedrom', signal: [] } as any,
+      },
+    ],
+  };
+
+  const brokenReport = auditCoursewareRendering(brokenLesson);
+  assert.equal(brokenReport.errorCount >= 3, true);
+  assert.equal(brokenReport.repairPrompt.includes('diagramSpec'), true);
+
+  const patchJson = JSON.stringify({
+    diagramsToUpsert: [
+      {
+        id: 'diag-1',
+        title: '修复后行列式图',
+        caption: '修复完成',
+        diagramSpec: {
+          type: 'grid-annot',
+          brackets: 'det',
+          cells: [['1', '0'], ['0', '1']],
+          diagonals: [{ cells: [[0, 0], [1, 1]], label: '+1', tone: 'positive' }],
+        },
+      },
+    ],
+  });
+  const patchRes = applyCoursewareRepairPatch(
+    {
+      ...mergedResult.mergedLesson,
+      diagrams: brokenLesson.diagrams,
+      exercises: [
+        {
+          ...mergedResult.mergedLesson.exercises[0],
+        },
+      ],
+    },
+    patchJson,
+    slot
+  );
+  assert.equal(patchRes.mergedLesson.diagrams?.[0]?.diagramSpec?.type, 'grid-annot');
+  assert.equal(auditCoursewareRendering(patchRes.mergedLesson).errorCount, 0);
+
+  // 3. Secondary track: markdown fenced diagram blocks + bare math coexistence + async placeholder
+  const md = [
+    '反相电路输出关系 u_O = -(R_f / R_1) * u_I 成立。',
+    '',
+    '```diagram:grid-annot',
+    '{"brackets": "matrix", "cells": [[1, 2], [3, 4]], "highlights": [{"row": 0, "col": 0, "tone": "accent"}]}',
+    '```',
+    '',
+    '```diagram:plot2d',
+    '{"xRange": [-2, 2], "functions": [{"expr": "x^2", "label": "y = x^2", "tone": "positive"}]}',
+    '```',
+    '',
+    '```diagram:graph',
+    '{"direction": "LR", "nodes": [{"id": "a", "label": "Input"}, {"id": "b", "label": "Output"}], "edges": [{"from": "a", "to": "b"}]}',
+    '```',
+    '',
+    '```diagram:plot2d',
+    '{not valid json',
+    '```',
+    '',
+    '```diagram:plot2d',
+    '{"xRange": [10, 2], "functions": []}',
+    '```',
+  ].join('\n');
+
+  const html = renderMarkdownWithLatex(md);
+  assert.equal(html.includes('class="katex"'), true);
+  assert.equal(html.includes('katex-error'), false);
+  assert.equal(html.includes('data-diagram-engine="grid-annot"'), true);
+  assert.equal(html.includes('data-diagram-engine="plot2d"'), true);
+  assert.equal(html.includes('data-diagram-async-spec='), true);
+  assert.equal(html.includes('正在等待完整结构化图表 JSON'), true);
+  assert.equal(html.includes('data-diagram-engine="error"'), true);
+});
+
+test('Two-stage prompts enforce Stage 1 spec-only -> Stage 2 structured diagramSpec priority with free-SVG fallback and clean mode switching', async () => {
+  const {
+    composeCoursewareSystemPrompt,
+    buildCourseLessonStage1Prompt,
+    buildChatLessonStage1Prompt,
+    buildLessonStage2DiagramsPrompt,
+    buildAgentExecutionPrompt,
+    buildAgentSectionStagePrompt,
+  } = await import('../prompts/promptLibrary');
+  const {
+    parseImportedLessonContent,
+    extractPendingDiagramSpecs,
+    mergeStage2DiagramsIntoStage1,
+  } = await import('./coursewareParser');
+  const {
+    auditCoursewareRendering,
+    applyCoursewareRepairPatch,
+  } = await import('./coursewareDiagnostics');
+
+  const sysPrompt = composeCoursewareSystemPrompt({
+    subjectProfile: 'electronics_engineering',
+    learnerLevel: 'intermediate',
+  });
+  assert.equal(sysPrompt.includes('严禁在阶段一提前输出 `diagramSpec` 或 `svgCode`'), true);
+  assert.equal(sysPrompt.includes('自由图表'), true);
+  for (const kind of ['grid-annot', 'plot2d', 'graph', 'wavedrom', 'circuit']) {
+    assert.equal(sysPrompt.includes(kind), true);
+  }
+
+  const slot = {
+    id: 'sec-05',
+    dayIndex: 5,
+    date: '2026-11-19',
+    title: '第 5 节：系统稳定裕度与受力分析',
+    objective: '掌握频率响应波特图与复杂受力自由体图绘制',
+    keyTopics: ['频率响应', '受力分析'],
+    prerequisites: ['拉普拉斯变换'],
+  };
+  const course = {
+    id: 'course-twostage-diag',
+    name: '控制与力学综合',
+    folderName: '控制与力学综合',
+    courseDirPath: 'courses/控制与力学综合',
+    category: 'stem' as const,
+    generationMode: 'api' as const,
+    subjectProfile: 'electronics_engineering' as const,
+    goal: '全面适配两阶段图表工作流',
+    durationDays: 8,
+    startDate: '2026-11-19',
+    extraRequirements: '',
+    materials: [],
+    masteredWords: [],
+    exerciseSubmissions: {},
+    dailyPlan: [slot],
+    createdAt: '2026-11-19T00:00:00Z',
+  };
+
+  // 1. Stage 1 prompts across API, Chat, and Agent all forbid diagramSpec/svgCode and ask for [推荐类型: ...]
+  const apiStage1 = buildCourseLessonStage1Prompt({
+    course,
+    slot,
+    materialContext: '测试教材章节',
+  });
+  const chatStage1 = buildChatLessonStage1Prompt({
+    course: { ...course, generationMode: 'chat' },
+    slot,
+    teachingSystemPrompt: sysPrompt,
+  });
+  const agentStage1 = buildAgentSectionStagePrompt({
+    course,
+    slot,
+    workspaceDir: 'courses/控制与力学综合',
+    stage: 'stage1',
+    teachingSystemPrompt: sysPrompt,
+  });
+  const agentBatch = buildAgentExecutionPrompt({
+    course,
+    workspaceDir: 'courses/控制与力学综合',
+    materialFilePaths: [],
+    teachingSystemPrompt: sysPrompt,
+  });
+
+  for (const p of [apiStage1, chatStage1, agentStage1, agentBatch]) {
+    assert.equal(p.includes('推荐类型'), true);
+    assert.equal(p.includes('自由图表(svgCode)'), true);
+    assert.equal(p.includes('grid-annot'), true);
+    assert.equal(p.includes('plot2d'), true);
+    assert.equal(p.includes('circuit'), true);
+  }
+  assert.equal(apiStage1.includes('禁止在本阶段输出 `diagramSpec`'), true);
+  assert.equal(chatStage1.includes('禁止输出 `diagramSpec`'), true);
+  assert.equal(agentStage1.includes('禁止输出 `diagramSpec`'), true);
+  assert.equal(agentBatch.includes('禁止在本阶段输出 `diagramSpec`'), true);
+
+  // 2. Stage 2 prompts across API/Chat and Agent prioritize 5 structured engines and allow free-SVG fallback
+  const stage2Specs = [
+    {
+      id: 'diag-plot',
+      title: '图 1：二次函数积分阴影',
+      topologySpec: '[推荐类型: plot2d] 绘制 y=x^2 在 [-2, 2] 的图像与 [0, 2] 阴影面积',
+      caption: '抛物线与面积阴影',
+    },
+    {
+      id: 'diag-free',
+      title: '图 2：斜面上滑块受力三维示意',
+      topologySpec: '[推荐类型: 自由图表(svgCode)] 倾角 30° 光滑斜面与斜向上拉力 F、重力 G、法向支持力 N 的矢量图',
+      caption: '5 类图表均无法直接绘制任意斜角力学受力，采用自由 SVG',
+    },
+  ];
+  const stage2Prompt = buildLessonStage2DiagramsPrompt({
+    courseName: course.name,
+    slot,
+    diagramSpecs: stage2Specs,
+  });
+  const agentStage2 = buildAgentSectionStagePrompt({
+    course,
+    slot,
+    workspaceDir: 'courses/控制与力学综合',
+    stage: 'stage2',
+    teachingSystemPrompt: sysPrompt,
+    diagramSpecs: stage2Specs,
+  });
+
+  for (const p of [stage2Prompt, agentStage2]) {
+    assert.equal(p.includes('无需教材原文 PDF'), true);
+    assert.equal(p.includes('diagramSpec'), true);
+    assert.equal(p.includes('自由图表'), true);
+    assert.equal(p.includes('svgCode'), true);
+    assert.equal(p.includes('二选一'), true);
+    assert.equal(p.includes('严禁写入 LaTeX 反斜杠命令'), true);
+  }
+  assert.equal(agentStage2.includes('只依据规格生成 SVG'), false);
+
+  // 3. Stage 1 empty spec warning tells user to complete topologySpec only (never asking for diagramSpec in Stage 1)
+  const stage1EmptySpecAudit = auditCoursewareRendering(
+    {
+      sectionId: 'sec-05',
+      dayIndex: 5,
+      date: '2026-11-19',
+      title: '空规格告警检测',
+      summary: '摘要',
+      generationStage: 'stage1_content',
+      keyPoints: ['要点'],
+      markdownBody: '正文中引用 {{diagram:diag-empty}}。',
+      diagrams: [{ id: 'diag-empty', title: '图 1', caption: '' }],
+      exercises: [],
+      generatedAt: '2026-11-19T00:00:00Z',
+    },
+    {},
+    { stage: 'stage1' }
+  );
+  const specEmptyIssue = stage1EmptySpecAudit.issues.find((i) => i.id.startsWith('spec-empty-'));
+  assert.ok(specEmptyIssue);
+  assert.equal(specEmptyIssue.fixInstruction.includes('阶段一无需输出 diagramSpec 或 svgCode'), true);
+
+  // 4. Hybrid Stage 2 merge: one structured diagramSpec + one free-form svgCode
+  const stage1Raw = JSON.stringify({
+    generationStage: 'stage1_content',
+    title: slot.title,
+    summary: '综合图表示例',
+    keyPoints: ['函数积分与受力分析'],
+    markdownBody: '首先看曲线 {{diagram:diag-plot}}，再看斜面力学分析 {{diagram:diag-free}}。',
+    diagrams: [
+      {
+        id: 'diag-plot',
+        title: '图 1：二次函数曲线',
+        topologySpec: '[推荐类型: plot2d] y=x^2，x in [-2, 2]',
+        caption: '曲线与积分阴影',
+      },
+      {
+        id: 'diag-free',
+        title: '图 2：斜面滑块受力分析',
+        topologySpec: '[推荐类型: 自由图表(svgCode)] 30° 斜面滑块 G/N/F 矢量示意',
+        caption: '斜面受力矢量图',
+      },
+    ],
+    exercises: [
+      {
+        id: 'ex-1',
+        type: 'fill',
+        question: '结合图 diag-free，求沿斜面方向平衡分量。',
+        answer: 'G sin 30°',
+        diagramId: 'diag-free',
+      },
+    ],
+  });
+  const s1 = parseImportedLessonContent(stage1Raw, slot, 'chat', {}, { stageMode: 'stage1' }).lesson;
+  assert.equal(extractPendingDiagramSpecs(s1).length, 2);
+
+  const hybridStage2 = JSON.stringify({
+    diagrams: [
+      {
+        id: 'diag-plot',
+        title: '图 1：二次函数曲线',
+        caption: '曲线与积分阴影',
+        diagramSpec: {
+          type: 'plot2d',
+          xRange: [-2, 2],
+          functions: [{ expr: 'x^2', label: 'y = x^2', tone: 'accent' }],
+          shadedRegions: [{ expr: 'x^2', from: 0, to: 1.5, tone: 'positive' }],
+        },
+      },
+      {
+        id: 'diag-free',
+        title: '图 2：斜面滑块受力分析',
+        caption: '斜面受力矢量图',
+        svgCode: '<svg viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg"><line x1="80" y1="260" x2="520" y2="260" stroke="#94a3b8" stroke-width="2"/><text x="120" y="240" fill="#e2e8f0" font-size="14">30 deg</text></svg>',
+      },
+    ],
+  });
+  const hybridMerged = mergeStage2DiagramsIntoStage1(s1, hybridStage2);
+  assert.equal(hybridMerged.matchedCount, 2);
+  assert.equal(hybridMerged.pendingRemaining.length, 0);
+  assert.equal(hybridMerged.mergedLesson.diagrams?.[0]?.diagramSpec?.type, 'plot2d');
+  assert.equal(hybridMerged.mergedLesson.diagrams?.[0]?.svgCode, undefined);
+  assert.equal(hybridMerged.mergedLesson.diagrams?.[1]?.diagramSpec, undefined);
+  assert.equal(hybridMerged.mergedLesson.diagrams?.[1]?.svgCode?.includes('<svg'), true);
+  assert.equal(hybridMerged.mergedLesson.exercises[0].diagramSpec, undefined);
+  assert.equal(hybridMerged.mergedLesson.exercises[0].svgCode?.includes('<svg'), true);
+  const hybridAudit = auditCoursewareRendering(hybridMerged.mergedLesson);
+  assert.equal(hybridAudit.errorCount, 0);
+
+  // 5. Malformed diagramSpec in Stage 2 is preserved for Zod diagnostics & repair patch can switch cleanly to free svgCode (clearing stale diagramSpec on both diagram and exercise)
+  const badStage2Payload = JSON.stringify({
+    diagrams: [
+      {
+        id: 'diag-free',
+        title: '图 2：误用失败的 plot2d',
+        caption: '待修正',
+        diagramSpec: { type: 'plot2d', xRange: [10, 2], functions: [] },
+      },
+      {
+        id: 'diag-plot',
+        diagramSpec: { type: 'plot2d', xRange: [-2, 2], functions: [{ expr: 'x^2' }] },
+      },
+    ],
+  });
+  const badMerged = mergeStage2DiagramsIntoStage1(s1, badStage2Payload);
+  assert.equal(badMerged.pendingRemaining.some((p) => p.id === 'diag-free'), true);
+  const badAudit = auditCoursewareRendering(badMerged.mergedLesson);
+  assert.equal(badAudit.errorCount > 0, true);
+  assert.equal(
+    badAudit.issues.some((iss) => iss.id.startsWith('diagramspec-invalid-') && iss.locationLabel.includes('diag-free')),
+    true
+  );
+
+  // Switch diag-free from malformed diagramSpec to free-form svgCode via repair patch
+  const switchToSvgPatch = JSON.stringify({
+    diagramsToUpsert: [
+      {
+        id: 'diag-free',
+        title: '图 2：斜面滑块受力分析',
+        caption: '切换为自由图表 SVG',
+        svgCode: '<svg viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg"><rect x="40" y="40" width="200" height="120" fill="#18181b" stroke="#38bdf8"/><text x="60" y="95" fill="#f8fafc" font-size="14">Free Diagram</text></svg>',
+      },
+    ],
+  });
+  const patchedToSvg = applyCoursewareRepairPatch(badMerged.mergedLesson, switchToSvgPatch, slot);
+  assert.equal(patchedToSvg.mergedLesson.diagrams?.[1]?.diagramSpec, undefined);
+  assert.equal(patchedToSvg.mergedLesson.diagrams?.[1]?.svgCode?.includes('<svg'), true);
+  assert.equal(patchedToSvg.mergedLesson.exercises[0].diagramSpec, undefined);
+  assert.equal(patchedToSvg.mergedLesson.exercises[0].svgCode?.includes('<svg'), true);
+  assert.equal(auditCoursewareRendering(patchedToSvg.mergedLesson).errorCount, 0);
+
+  // Conversely, switching diag-free back to valid structured diagramSpec clears stale svgCode on both diagram & exercise
+  const switchToSpec = mergeStage2DiagramsIntoStage1(patchedToSvg.mergedLesson, JSON.stringify({
+    diagrams: [
+      {
+        id: 'diag-free',
+        diagramSpec: {
+          type: 'graph',
+          direction: 'LR',
+          nodes: [{ id: 'a', label: 'Block' }, { id: 'b', label: 'Force' }],
+          edges: [{ from: 'a', to: 'b', label: 'F' }],
+        },
+      },
+    ],
+  }));
+  assert.equal(switchToSpec.mergedLesson.diagrams?.[1]?.diagramSpec?.type, 'graph');
+  assert.equal(switchToSpec.mergedLesson.diagrams?.[1]?.svgCode, undefined);
+  assert.equal(switchToSpec.mergedLesson.exercises[0].diagramSpec?.type, 'graph');
+  assert.equal(switchToSpec.mergedLesson.exercises[0].svgCode, undefined);
+  assert.equal(auditCoursewareRendering(switchToSpec.mergedLesson).errorCount, 0);
+});
+
+test('copyPromptText preserves synchronous execCommand gesture on mobile HTTP LAN, supports iOS Safari selection, and falls back/throws cleanly', async () => {
+  const { copyPromptText } = await import('./clipboardFile');
+
+  const origWindowDesc = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const origNavDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const origDocDesc = Object.getOwnPropertyDescriptor(globalThis, 'document');
+
+  const restoreGlobals = () => {
+    if (origWindowDesc) Object.defineProperty(globalThis, 'window', origWindowDesc);
+    else delete (globalThis as any).window;
+    if (origNavDesc) Object.defineProperty(globalThis, 'navigator', origNavDesc);
+    else delete (globalThis as any).navigator;
+    if (origDocDesc) Object.defineProperty(globalThis, 'document', origDocDesc);
+    else delete (globalThis as any).document;
+  };
+
+  try {
+    // 1. Mobile non-secure HTTP LAN context (Android Chrome): skips clipboard.writeText even if stubbed, invokes focus + execCommand synchronously
+    let writeTextCalled = 0;
+    let execCommandResult = true;
+    const calls: string[] = [];
+    let createdField: any = null;
+    const fakeSelection = {
+      ranges: [] as any[],
+      removeAllRanges() {
+        this.ranges = [];
+        calls.push('removeAllRanges');
+      },
+      addRange(r: any) {
+        this.ranges.push(r);
+        calls.push('addRange');
+      },
+    };
+    const fakeDocument = {
+      activeElement: { focus: () => calls.push('restoreFocus') },
+      body: {
+        appendChild(el: any) {
+          createdField = el;
+          calls.push('appendChild');
+        },
+      },
+      createElement() {
+        const el: any = {
+          value: '',
+          readOnly: false,
+          contentEditable: 'inherit',
+          style: { cssText: '' },
+          setAttribute() {},
+          focus() {
+            calls.push('focus');
+          },
+          select() {
+            calls.push('select');
+          },
+          setSelectionRange(s: number, e: number) {
+            calls.push(`setSelectionRange:${s}-${e}`);
+          },
+          remove() {
+            calls.push('remove');
+          },
+        };
+        return el;
+      },
+      createRange() {
+        return {
+          selectNodeContents() {
+            calls.push('selectNodeContents');
+          },
+        };
+      },
+      execCommand(cmd: string) {
+        calls.push(`execCommand:${cmd}`);
+        return execCommandResult;
+      },
+    };
+
+    Object.defineProperty(globalThis, 'document', { value: fakeDocument, configurable: true });
+    Object.defineProperty(globalThis, 'window', {
+      value: { isSecureContext: false, getSelection: () => fakeSelection },
+      configurable: true,
+    });
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        userAgent: 'Mozilla/5.0 (Linux; Android 14) Chrome/120.0 Mobile',
+        platform: 'Linux armv8l',
+        maxTouchPoints: 5,
+        clipboard: {
+          writeText: async () => {
+            writeTextCalled++;
+          },
+        },
+      },
+      configurable: true,
+    });
+
+    await copyPromptText('stage2-prompt-android');
+    assert.equal(writeTextCalled, 0);
+    assert.equal(createdField.readOnly, true);
+    assert.equal(calls.includes('focus'), true);
+    assert.equal(calls.includes('select'), true);
+    assert.equal(calls.includes('execCommand:copy'), true);
+    assert.ok(calls.indexOf('focus') < calls.indexOf('execCommand:copy'));
+
+    // 2. iOS Safari HTTP LAN path: sets contentEditable=true, readOnly=false, uses Range + getSelection
+    calls.length = 0;
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Safari/604.1',
+        platform: 'iPhone',
+        maxTouchPoints: 5,
+      },
+      configurable: true,
+    });
+    await copyPromptText('stage2-prompt-ios');
+    assert.equal(createdField.contentEditable, 'true');
+    assert.equal(createdField.readOnly, false);
+    assert.equal(calls.includes('selectNodeContents'), true);
+    assert.equal(calls.includes('addRange'), true);
+    assert.equal(calls.includes('execCommand:copy'), true);
+
+    // 3. Secure context where navigator.clipboard.writeText rejects falls back cleanly to execCommand
+    calls.length = 0;
+    let secureAttempted = 0;
+    Object.defineProperty(globalThis, 'window', {
+      value: { isSecureContext: true, getSelection: () => fakeSelection },
+      configurable: true,
+    });
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
+        platform: 'iPhone',
+        maxTouchPoints: 5,
+        clipboard: {
+          writeText: async () => {
+            secureAttempted++;
+            throw new Error('NotAllowedError');
+          },
+        },
+      },
+      configurable: true,
+    });
+    await copyPromptText('fallback-after-reject');
+    assert.equal(secureAttempted, 1);
+    assert.equal(calls.includes('execCommand:copy'), true);
+
+    // 4. Both async clipboard and execCommand fail -> throws actionable error for manual preview fallback
+    execCommandResult = false;
+    await assert.rejects(
+      () => copyPromptText('fail-both'),
+      /一键复制全文/
+    );
+  } finally {
+    restoreGlobals();
+  }
+});

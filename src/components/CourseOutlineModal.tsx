@@ -12,6 +12,7 @@ import {
   FileText,
   FolderOpen,
   FolderSync,
+  Image,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -39,6 +40,7 @@ import {
 } from '../utils/learningLogic';
 import {
   copyCourseFileToClipboard,
+  copyPromptText,
   copyPromptMarkdownFileToClipboard,
 } from '../utils/clipboardFile';
 import { renderInlineMathWithLatex } from '../utils/markdownMath';
@@ -52,6 +54,7 @@ import {
 import {
   detectPastedCoursewareInputKind,
   extractPendingDiagramSpecs,
+  hasValidDiagramContent,
   mergeStage2DiagramsIntoStage1,
   parseImportedLessonContent,
   tryExtractJsonObject,
@@ -60,28 +63,35 @@ import { LessonPreviewModal } from './LessonPreviewModal';
 
 export type OutlineWorkbenchStep = 'outline' | 'split_vocab' | 'lessons' | 'files';
 
+const workbenchActionClass =
+  'inline-flex items-center gap-1.5 rounded px-3 py-1.5 font-sans text-xs font-medium whitespace-nowrap transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 disabled:cursor-not-allowed disabled:opacity-50';
+const primaryActionClass = `${workbenchActionClass} border border-transparent bg-white text-black enabled:hover:bg-neutral-200`;
+const secondaryActionClass = `${workbenchActionClass} border border-neutral-700 text-neutral-200 enabled:hover:border-neutral-500 enabled:hover:text-white`;
+
 interface CourseOutlineModalProps {
   isOpen: boolean;
   course: Course | null;
   initialStep?: OutlineWorkbenchStep;
+  initialDayIndex?: number;
   showAdvancedWorkflowDetails?: boolean;
   onOpenSettings?: () => void;
   onClose: () => void;
   onCourseUpdated: (course: Course) => void;
   onOpenLesson: (courseId: string, dayIndex: number) => void;
-  onOpenAgentModal: (course: Course) => void;
+  onStepOrDayChange?: (step: OutlineWorkbenchStep, dayIndex?: number) => void;
 }
 
 export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
   isOpen,
   course,
   initialStep = 'outline',
+  initialDayIndex,
   showAdvancedWorkflowDetails = false,
   onOpenSettings,
   onClose,
   onCourseUpdated,
   onOpenLesson,
-  onOpenAgentModal,
+  onStepOrDayChange,
 }) => {
   return (
     <AnimatePresence>
@@ -90,12 +100,13 @@ export const CourseOutlineModal: React.FC<CourseOutlineModalProps> = ({
           key={course.id}
           course={course}
           initialStep={initialStep}
+          initialDayIndex={initialDayIndex}
           showAdvancedWorkflowDetails={showAdvancedWorkflowDetails}
           onOpenSettings={onOpenSettings}
           onClose={onClose}
           onCourseUpdated={onCourseUpdated}
           onOpenLesson={onOpenLesson}
-          onOpenAgentModal={onOpenAgentModal}
+          onStepOrDayChange={onStepOrDayChange}
         />
       )}
     </AnimatePresence>
@@ -109,12 +120,13 @@ interface CourseOutlineModalInnerProps extends Omit<CourseOutlineModalProps, 'is
 const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
   course,
   initialStep = 'outline',
+  initialDayIndex,
   showAdvancedWorkflowDetails = false,
   onOpenSettings,
   onClose,
   onCourseUpdated,
   onOpenLesson,
-  onOpenAgentModal,
+  onStepOrDayChange,
 }) => {
   const isOpen = true;
   const [activeStep, setActiveStep] = useState<OutlineWorkbenchStep>(initialStep);
@@ -135,7 +147,6 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
   const [syllabusWorkbenchTab, setSyllabusWorkbenchTab] = useState<'chat' | 'agent'>('chat');
 
   // Step 2: PDF Splitting & English Vocab states
-  const [splitModeTab, setSplitModeTab] = useState<'chat' | 'agent'>('chat');
   const [pdfMetas, setPdfMetas] = useState<PdfDocumentMeta[]>([]);
   const [draftSplitPlan, setDraftSplitPlan] = useState<PdfSplitPlanItem[]>([]);
   const [pageOffset, setPageOffset] = useState<number>(0);
@@ -166,12 +177,33 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
   const [deletingLessonDay, setDeletingLessonDay] = useState<number | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [selectedStep3ChatDay, setSelectedStep3ChatDay] = useState<number>(() => {
+    if (initialDayIndex !== undefined) return initialDayIndex;
     const firstPending = course.dailyPlan.find((s) => !s.lesson);
     return firstPending ? firstPending.dayIndex : course.dailyPlan[0]?.dayIndex || 1;
   });
   const [workbenchMode, setWorkbenchMode] = useState<'chat' | 'agent' | 'api'>(
     course.generationMode || 'api'
   );
+  const [agentSectionPrompt, setAgentSectionPrompt] = useState<{ dayIndex: number; text: string } | null>(null);
+  const [agentPromptError, setAgentPromptError] = useState('');
+  useEffect(() => {
+    if (workbenchMode !== 'agent' || activeStep !== 'lessons') return;
+    const controller = new AbortController();
+    setAgentSectionPrompt(null);
+    setAgentPromptError('');
+    setCopiedKey(null);
+    fetch(`/api/courses/${encodeURIComponent(course.id)}/days/${selectedStep3ChatDay}/chat-prompt`, { signal: controller.signal })
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok || !data.agentStage1Prompt) throw new Error(data.error || '未找到本节 Agent 生成指令');
+        if (!controller.signal.aborted) setAgentSectionPrompt({ dayIndex: selectedStep3ChatDay, text: data.agentStage1Prompt });
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) setAgentPromptError(error.message || '读取本节指令失败');
+      });
+    return () => controller.abort();
+  }, [course.id, activeStep, workbenchMode, selectedStep3ChatDay]);
+
   const [isSwitchingMode, setIsSwitchingMode] = useState(false);
   const [step3PendingDraft, setStep3PendingDraft] = useState<DailyLessonContent | null>(null);
   const [step3PendingDraftAudit, setStep3PendingDraftAudit] = useState<{
@@ -201,6 +233,46 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
 
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [currentStep3Prompts, setCurrentStep3Prompts] = useState<{
+    dayIndex: number;
+    lessonPrompt: string;
+    stage1Prompt: string;
+    stage2Prompt: string;
+    agentStage1Prompt: string;
+    agentStage2Prompt: string;
+  } | null>(null);
+  const [manualPromptPreview, setManualPromptPreview] = useState<{
+    title: string;
+    text: string;
+  } | null>(null);
+
+  const onStepOrDayChangeRef = React.useRef(onStepOrDayChange);
+  onStepOrDayChangeRef.current = onStepOrDayChange;
+  const lastReportedNavRef = React.useRef<{
+    step: OutlineWorkbenchStep;
+    dayIndex?: number;
+  }>({
+    step: initialStep,
+    dayIndex: initialStep === 'lessons' ? selectedStep3ChatDay : initialDayIndex,
+  });
+
+  useEffect(() => {
+    const nextDay = activeStep === 'lessons' ? selectedStep3ChatDay : undefined;
+    lastReportedNavRef.current = { step: activeStep, dayIndex: nextDay };
+    onStepOrDayChangeRef.current?.(activeStep, nextDay);
+  }, [activeStep, selectedStep3ChatDay]);
+
+  useEffect(() => {
+    if (initialStep !== lastReportedNavRef.current.step) {
+      setActiveStep(initialStep);
+    }
+    if (
+      initialDayIndex !== undefined &&
+      initialDayIndex !== lastReportedNavRef.current.dayIndex
+    ) {
+      setSelectedStep3ChatDay(initialDayIndex);
+    }
+  }, [initialStep, initialDayIndex]);
 
   const loadDiskFiles = async (courseId: string) => {
     setIsLoadingFiles(true);
@@ -240,6 +312,20 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
   };
 
   useEffect(() => {
+    const close = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return;
+      if (step3PreviewLesson) {
+        setStep3PreviewLesson(null);
+        setStep3PreviewKind(null);
+        return;
+      }
+      onClose();
+    };
+    window.addEventListener('keydown', close);
+    return () => window.removeEventListener('keydown', close);
+  }, [onClose, step3PreviewLesson]);
+
+  useEffect(() => {
     if (!isOpen || !course) return;
     setActiveStep(initialStep);
     setDraftSlots(
@@ -252,7 +338,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     setDraftDurationDays(Math.max(1, course.durationDays || 1));
     const mode = course.generationMode || 'api';
     setWorkbenchMode(mode);
-    setSplitModeTab(mode === 'agent' ? 'agent' : 'chat');
+
     setSyllabusWorkbenchTab(mode === 'agent' ? 'agent' : 'chat');
     setShowSyllabusImportBox((mode === 'chat' || mode === 'agent') && !course.outlineConfirmed);
     setPageOffset(course.pdfPageOffset || 0);
@@ -281,7 +367,30 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
 
     refreshChatPrompts(course.id);
     loadDiskFiles(course.id);
-  }, [isOpen, course?.id, initialStep]);
+  }, [isOpen, course?.id]);
+
+  useEffect(() => {
+    if (!isOpen || !course) return;
+    if (draftSlots.length === 0 || activeStep !== 'outline') {
+      setDraftSlots(
+        course.dailyPlan.map((s) => ({
+          ...s,
+          id: ensureStableSectionId(s.dayIndex, s.id),
+        }))
+      );
+    }
+  }, [isOpen, course?.dailyPlan, activeStep, draftSlots.length]);
+
+  useEffect(() => {
+    if (!isOpen || !course) return;
+    if (
+      draftSplitPlan.length === 0 &&
+      Array.isArray(course.pdfSplitPlan) &&
+      course.pdfSplitPlan.length > 0
+    ) {
+      setDraftSplitPlan(course.pdfSplitPlan);
+    }
+  }, [isOpen, course?.pdfSplitPlan, draftSplitPlan.length]);
 
   useEffect(() => {
     if (!isOpen || !course) return;
@@ -303,12 +412,55 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     );
   }, [course?.englishConfig, draftSlots.length, course?.durationDays, dailyWordCountInput]);
 
-  const triggerCopyFeedback = (key: string, text: string) => {
-    navigator.clipboard?.writeText(text).catch(() => {});
-    setCopiedKey(key);
-    setTimeout(() => {
-      setCopiedKey((prev) => (prev === key ? null : prev));
-    }, 2000);
+  const triggerCopyFeedback = async (key: string, text: string, fallbackTitle?: string) => {
+    setErrorMessage(null);
+    try {
+      await copyPromptText(text);
+      setCopiedKey(key);
+      setManualPromptPreview((prev) => (prev && prev.text === text ? prev : null));
+      if (activeStep === 'lessons') {
+        setStep3ImportNotice({
+          ok: true,
+          message: `✅ 已复制${fallbackTitle ? `「${fallbackTitle}」` : '提示词'}（${text.length} 字符），可直接切换到 AI 对话框粘贴。`,
+        });
+      }
+      setTimeout(() => setCopiedKey((prev) => (prev === key ? null : prev)), 2500);
+    } catch {
+      const previewTitle = fallbackTitle || '当前提示词（剪贴板受限，请点击一键复制或长按全选）';
+      setManualPromptPreview({
+        title: previewTitle,
+        text,
+      });
+      const failMsg = '当前浏览器限制了自动剪贴板写入，已在操作区下方展开提示词文本框，请点击“一键复制全文”或长按全选复制。';
+      setErrorMessage(failMsg);
+      if (activeStep === 'lessons') {
+        setStep3ImportNotice({ ok: false, message: failMsg });
+      }
+    }
+  };
+
+  const copyAllRepairPrompts = () => {
+    if (!course) return;
+    const prompts = course.dailyPlan.flatMap((slot) => {
+      const lesson = slot.lesson || slot.stage1Draft;
+      if (!lesson) return [];
+      try {
+        const report = auditCoursewareRendering(lesson, course.customAssets);
+        return report.issues.length
+          ? [`## lessons/${slot.id}${slot.lesson ? '' : '.stage1'}.json · ${slot.title}\n${report.repairPrompt}`]
+          : [];
+      } catch {
+        return [];
+      }
+    });
+    if (!prompts.length) {
+      setStatusMessage('当前已同步的课件没有检测到渲染错误或警告。');
+      return;
+    }
+    void triggerCopyFeedback('agent-all-repairs', [
+      `请修复 ${courseRelDir}/ 中以下课件的问题。直接修改对应文件，保留正常内容，并重新运行诊断。`,
+      ...prompts,
+    ].join('\n\n---\n\n'));
   };
 
   const handleInlineAgentSync = async () => {
@@ -353,7 +505,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     setStatusMessage(null);
     try {
       const result = await copyCourseFileToClipboard(course.id, relPath);
-      setCopiedKey(key);
+      if (result.copiedToOsClipboard) setCopiedKey(key);
       setTimeout(() => {
         setCopiedKey((prev) => (prev === key ? null : prev));
       }, 2500);
@@ -386,21 +538,28 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     try {
       const result = await copyPromptMarkdownFileToClipboard(course.id, fileName, content);
       setCopiedKey(key);
+      setManualPromptPreview(null);
       setTimeout(() => {
         setCopiedKey((prev) => (prev === key ? null : prev));
       }, 2500);
-      if (result.copiedToOsClipboard) {
-        setStatusMessage(
-          `已将提示词文件 ${result.fileName || fileName} 复制到系统剪贴板，可直接在 Chat 对话框按 Ctrl+V 作为 .md 附件发送。`
-        );
-      } else {
-        setStatusMessage(
-          result.reason ||
-            `已保存提示词至 ${result.fileName || fileName}（当前环境不支持写入剪贴板文件，请在「本地文件管理」或 prompts/ 目录拖拽使用）。`
-        );
+      const okMsg = result.copiedToOsClipboard
+        ? `已将提示词文件 ${result.fileName || fileName} 复制到系统剪贴板，可直接在 Chat 对话框按 Ctrl+V 作为 .md 附件发送。`
+        : result.reason ||
+          `已复制/保存提示词 ${result.fileName || fileName}（可直接粘贴到对话）。`;
+      setStatusMessage(okMsg);
+      if (activeStep === 'lessons') {
+        setStep3ImportNotice({ ok: true, message: `✅ ${okMsg}` });
       }
     } catch (err: any) {
-      setErrorMessage(err?.message || '复制 .md 提示词文件失败');
+      setManualPromptPreview({
+        title: `${fileName}（剪贴板受限，请点击一键复制或长按全选）`,
+        text: content,
+      });
+      const failMsg = err?.message || '复制 .md 提示词失败，已在下方展开文本供手动复制。';
+      setErrorMessage(failMsg);
+      if (activeStep === 'lessons') {
+        setStep3ImportNotice({ ok: false, message: failMsg });
+      }
     }
   };
 
@@ -514,21 +673,12 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     setErrorMessage(null);
     setStatusMessage(null);
     try {
-      const sectionMinutes: Record<string, number> = {};
-      for (const s of draftSlots) {
-        const secId = ensureStableSectionId(s.dayIndex, s.id);
-        const mins = getEvaluatedSectionMinutes(s);
-        if (mins !== undefined) {
-          sectionMinutes[secId] = mins;
-        }
-      }
       const res = await fetch(`/api/courses/${course.id}/schedule/reallocate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           durationDays: Math.max(1, Number(draftDurationDays) || 1),
           startDate: draftStartDate || course.startDate,
-          sectionMinutes,
         }),
       });
       const data = await res.json();
@@ -1094,9 +1244,17 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
         throw new Error(data.error || '切换生成模式失败');
       }
       setWorkbenchMode(nextMode);
-      setSplitModeTab(nextMode === 'agent' ? 'agent' : 'chat');
+
       setSyllabusWorkbenchTab(nextMode === 'agent' ? 'agent' : 'chat');
       onCourseUpdated(data.course);
+      if (Array.isArray(data.course?.dailyPlan)) {
+        setDraftSlots(
+          data.course.dailyPlan.map((s: DailyPlanSlot) => ({
+            ...s,
+            id: ensureStableSectionId(s.dayIndex, s.id),
+          }))
+        );
+      }
       const modeLabel =
         nextMode === 'agent'
           ? 'Agent 本地自主工作模式'
@@ -1118,7 +1276,41 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     setStep3RawImportText('');
     setShowStep3FallbackPaste(false);
     setShowStep3IssueDetails(false);
+    setManualPromptPreview(null);
   }, [selectedStep3Slot?.dayIndex]);
+
+  useEffect(() => {
+    if (!isOpen || activeStep !== 'lessons' || !selectedStep3Slot) return;
+    const targetDay = selectedStep3Slot.dayIndex;
+    const controller = new AbortController();
+    fetch(`/api/courses/${encodeURIComponent(course.id)}/days/${targetDay}/chat-prompt`, {
+      signal: controller.signal,
+    })
+      .then(async (res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!data || controller.signal.aborted) return;
+        setCurrentStep3Prompts({
+          dayIndex: targetDay,
+          lessonPrompt: String(data.lessonPrompt || ''),
+          stage1Prompt: String(data.stage1Prompt || data.lessonPrompt || ''),
+          stage2Prompt: String(data.stage2Prompt || ''),
+          agentStage1Prompt: String(data.agentStage1Prompt || ''),
+          agentStage2Prompt: String(data.agentStage2Prompt || ''),
+        });
+      })
+      .catch(() => {
+        // ignore abort/network error
+      });
+    return () => controller.abort();
+  }, [
+    isOpen,
+    course.id,
+    activeStep,
+    selectedStep3Slot?.dayIndex,
+    selectedStep3Slot?.stage1Draft?.generatedAt,
+    selectedStep3Slot?.lesson?.generatedAt,
+    step3PendingDraft,
+  ]);
 
   const duplicateLessonDaysByDay = useMemo(() => {
     const byNormTitle = new Map<string, Array<{ dayIndex: number; secId: string }>>();
@@ -1206,17 +1398,54 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     const feedbackKey = `${target}${asMdFile ? '-md' : ''}-${dayIndex}`;
     const targetSlot = effectiveSlots.find((s) => s.dayIndex === dayIndex);
     const secId = ensureStableSectionId(dayIndex, targetSlot?.id);
+
+    const deliverPrompt = async (promptText: string, mdFileName: string, label: string) => {
+      if (asMdFile) {
+        await handleCopyPromptAsMdFile(feedbackKey, mdFileName, promptText);
+      } else {
+        await triggerCopyFeedback(feedbackKey, promptText, label);
+      }
+    };
+
     try {
       if (target === 'agent_full') {
         const res = await fetch(`/api/courses/${course.id}/agent-prompt`);
         if (!res.ok) throw new Error('获取 Agent 总指令失败');
         const data = await res.json();
         if (asMdFile) {
-          await handleCopyCourseFile('AGENT_TASK_PROMPT.md', feedbackKey);
+          if (data?.prompt) {
+            await handleCopyPromptAsMdFile(feedbackKey, 'AGENT_TASK_PROMPT.md', data.prompt);
+          } else {
+            await handleCopyCourseFile('AGENT_TASK_PROMPT.md', feedbackKey);
+          }
         } else if (data?.prompt) {
-          triggerCopyFeedback(feedbackKey, data.prompt);
+          await triggerCopyFeedback(feedbackKey, data.prompt, '全课程 Agent 总指令');
         }
         return;
+      }
+
+      const cached = currentStep3Prompts?.dayIndex === dayIndex ? currentStep3Prompts : null;
+      if (cached) {
+        if (target === 'stage1' && cached.stage1Prompt) {
+          await deliverPrompt(cached.stage1Prompt, `${secId}-stage1-prompt.md`, `${secId} 阶段一提示词`);
+          return;
+        }
+        if (target === 'stage2' && cached.stage2Prompt) {
+          await deliverPrompt(cached.stage2Prompt, `${secId}-stage2-prompt.md`, `${secId} 阶段二图表提示词`);
+          return;
+        }
+        if (target === 'agent_stage1' && cached.agentStage1Prompt) {
+          await deliverPrompt(cached.agentStage1Prompt, `${secId}-agent-stage1-prompt.md`, `${secId} Agent 阶段一指令`);
+          return;
+        }
+        if (target === 'agent_stage2' && cached.agentStage2Prompt) {
+          await deliverPrompt(cached.agentStage2Prompt, `${secId}-agent-stage2-prompt.md`, `${secId} Agent 阶段二指令`);
+          return;
+        }
+        if (target === 'legacy' && cached.lessonPrompt) {
+          await deliverPrompt(cached.lessonPrompt, `${secId}-prompt.md`, `${secId} 课件生成提示词`);
+          return;
+        }
       }
 
       const res = await fetch(`/api/courses/${course.id}/days/${dayIndex}/chat-prompt`);
@@ -1224,70 +1453,42 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
         throw new Error('获取本节提示词失败');
       }
       const data = await res.json();
+      setCurrentStep3Prompts({
+        dayIndex,
+        lessonPrompt: String(data.lessonPrompt || ''),
+        stage1Prompt: String(data.stage1Prompt || data.lessonPrompt || ''),
+        stage2Prompt: String(data.stage2Prompt || ''),
+        agentStage1Prompt: String(data.agentStage1Prompt || ''),
+        agentStage2Prompt: String(data.agentStage2Prompt || ''),
+      });
+
       if (target === 'stage1') {
-        if (asMdFile) {
-          if (data?.stage1PromptMdRelPath) {
-            await handleCopyCourseFile(data.stage1PromptMdRelPath, feedbackKey);
-          } else if (data?.stage1Prompt) {
-            await handleCopyPromptAsMdFile(feedbackKey, `${secId}-stage1-prompt.md`, data.stage1Prompt);
-          } else {
-            throw new Error('未能生成阶段一 .md 提示词文件');
-          }
-        } else if (data?.stage1Prompt) {
-          triggerCopyFeedback(feedbackKey, data.stage1Prompt);
-        }
+        const text = data?.stage1Prompt || data?.lessonPrompt || '';
+        if (!text) throw new Error('未能获取阶段一提示词');
+        await deliverPrompt(text, `${secId}-stage1-prompt.md`, `${secId} 阶段一提示词`);
       } else if (target === 'stage2') {
         if (!data?.stage2Prompt) {
-          throw new Error('当前阶段一没有待生成的 SVG 图示规格，可直接保存阶段一为完整课件。');
+          throw new Error('当前阶段一没有待生成的图表规格，可直接保存阶段一为完整课件。');
         }
-        if (asMdFile) {
-          if (data?.stage2PromptMdRelPath) {
-            await handleCopyCourseFile(data.stage2PromptMdRelPath, feedbackKey);
-          } else {
-            await handleCopyPromptAsMdFile(feedbackKey, `${secId}-stage2-prompt.md`, data.stage2Prompt);
-          }
-        } else {
-          triggerCopyFeedback(feedbackKey, data.stage2Prompt);
-        }
+        await deliverPrompt(data.stage2Prompt, `${secId}-stage2-prompt.md`, `${secId} 阶段二图表提示词`);
       } else if (target === 'agent_stage1') {
-        if (asMdFile) {
-          if (!data?.agentStage1Prompt) throw new Error('未找到本节 Agent 阶段一指令');
-          await handleCopyPromptAsMdFile(
-            feedbackKey,
-            `${secId}-agent-stage1-prompt.md`,
-            data.agentStage1Prompt
-          );
-        } else if (data?.agentStage1Prompt) {
-          triggerCopyFeedback(feedbackKey, data.agentStage1Prompt);
-        }
+        if (!data?.agentStage1Prompt) throw new Error('未找到本节 Agent 阶段一指令');
+        await deliverPrompt(data.agentStage1Prompt, `${secId}-agent-stage1-prompt.md`, `${secId} Agent 阶段一指令`);
       } else if (target === 'agent_stage2') {
         if (!data?.agentStage2Prompt) {
-          throw new Error('请先让 Agent 完成阶段一并同步后，再复制本节阶段二 SVG 生成指令。');
+          throw new Error('请先让 Agent 完成阶段一并同步后，再复制本节阶段二图表生成指令。');
         }
-        if (asMdFile) {
-          await handleCopyPromptAsMdFile(
-            feedbackKey,
-            `${secId}-agent-stage2-prompt.md`,
-            data.agentStage2Prompt
-          );
-        } else {
-          triggerCopyFeedback(feedbackKey, data.agentStage2Prompt);
-        }
+        await deliverPrompt(data.agentStage2Prompt, `${secId}-agent-stage2-prompt.md`, `${secId} Agent 阶段二指令`);
       } else {
-        if (asMdFile) {
-          if (data?.promptMdRelPath) {
-            await handleCopyCourseFile(data.promptMdRelPath, feedbackKey);
-          } else if (data?.lessonPrompt) {
-            await handleCopyPromptAsMdFile(feedbackKey, `${secId}-prompt.md`, data.lessonPrompt);
-          } else {
-            throw new Error('未能生成 .md 提示词文件');
-          }
-        } else if (data?.lessonPrompt) {
-          triggerCopyFeedback(feedbackKey, data.lessonPrompt);
-        }
+        if (!data?.lessonPrompt) throw new Error('未能获取本节提示词');
+        await deliverPrompt(data.lessonPrompt, `${secId}-prompt.md`, `${secId} 课件生成提示词`);
       }
     } catch (err: any) {
-      setErrorMessage(err?.message || '复制提示词失败');
+      const errMsg = err?.message || '复制提示词失败';
+      setErrorMessage(errMsg);
+      if (activeStep === 'lessons') {
+        setStep3ImportNotice({ ok: false, message: errMsg });
+      }
     }
   };
 
@@ -1342,6 +1543,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
       setStep3PreviewLesson(null);
       setStep3PreviewKind(null);
       setShowStep3IssueDetails(false);
+      setCurrentStep3Prompts(null);
 
       if (options?.openAfterSave) {
         onClose();
@@ -1385,7 +1587,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     if (finalizeDirect && pendingSpecs.length === 0) {
       await persistStep3FinalLesson(parsedLesson, {
         importStage: 'complete',
-        summaryNote: '无待绘 SVG · 直接完成',
+        summaryNote: '无待生成图表 · 直接完成',
         advanceToNext: true,
       });
       return;
@@ -1419,17 +1621,38 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
 
       const savedDay = selectedStep3Slot.dayIndex;
       const savedSecId = ensureStableSectionId(savedDay, selectedStep3Slot.id);
+      const keepManualBoxOpen =
+        pendingSpecs.length > 0 &&
+        (showStep3FallbackPaste ||
+          typeof navigator === 'undefined' ||
+          !navigator.clipboard?.readText);
       setStep3PendingDraft(null);
       setStep3PendingDraftAudit(null);
       setStep3RawImportText('');
-      setShowStep3FallbackPaste(false);
+      setShowStep3FallbackPaste(keepManualBoxOpen);
       setStep3PreviewLesson(null);
       setStep3PreviewKind(null);
       setShowStep3IssueDetails(false);
+      setCurrentStep3Prompts((prev) => {
+        const nextStage2 = String(data?.stage2Prompt || '');
+        if (prev && prev.dayIndex === savedDay) {
+          return { ...prev, stage2Prompt: nextStage2 || prev.stage2Prompt };
+        }
+        return nextStage2
+          ? {
+              dayIndex: savedDay,
+              lessonPrompt: '',
+              stage1Prompt: '',
+              stage2Prompt: nextStage2,
+              agentStage1Prompt: '',
+              agentStage2Prompt: '',
+            }
+          : null;
+      });
 
       const stageMsg =
         pendingSpecs.length > 0
-          ? `✅ 已保存第 ${savedDay} 讲阶段一成果（lessons/${savedSecId}.stage1.json），提取到 ${pendingSpecs.length} 张待绘图示规格，已自动切换为阶段二 SVG 生成（无需再上传 PDF）。`
+          ? `✅ 已保存第 ${savedDay} 讲阶段一成果（lessons/${savedSecId}.stage1.json），提取到 ${pendingSpecs.length} 张待生成图表规格，已自动切换为阶段二图表生成（无需再上传 PDF）。`
           : `✅ 已保存第 ${savedDay} 讲阶段一草稿（lessons/${savedSecId}.stage1.json）。`;
       setStep3ImportNotice({ ok: true, message: stageMsg });
       setStatusMessage(stageMsg);
@@ -1470,7 +1693,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
         if (!step3Stage1BaseLesson) {
           setStep3ImportNotice({
             ok: false,
-            message: '检测到阶段二 SVG 输出，但当前小节尚无阶段一正文底稿，请先导入阶段一内容。',
+            message: '检测到阶段二图表输出，但当前小节尚无阶段一正文底稿，请先导入阶段一内容。',
           });
           return;
         }
@@ -1478,7 +1701,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
         const report = auditCoursewareRendering(merged.mergedLesson, assets, {
           stage: 'complete',
         });
-        const mergeSummary = `自动识别为阶段二 SVG · 组装 ${merged.matchedCount + merged.addedCount} 张图示`;
+        const mergeSummary = `自动识别为阶段二图表 · 组装 ${merged.matchedCount + merged.addedCount} 张图示`;
 
         if (report.issues.length > 0) {
           setStep3PendingDraft(merged.mergedLesson);
@@ -1487,9 +1710,11 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
             parsedLesson: merged.mergedLesson,
             appliedSummary: mergeSummary,
           });
+          setStep3RawImportText('');
+          setShowStep3FallbackPaste(true);
           setStep3ImportNotice({
             ok: false,
-            message: `${mergeSummary}，但检测到 ${report.issues.length} 处图示/渲染问题，可复制下方修复提示词或 .md 文件让 AI 局部补修。`,
+            message: `${mergeSummary}，但检测到 ${report.issues.length} 处图示/渲染问题，已保留合并底稿并清空粘贴框，可复制下方修复提示词或直接粘贴补丁。`,
           });
           return;
         }
@@ -1518,10 +1743,13 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
               (Array.isArray(rawPatchObj.diagrams) ||
                 Array.isArray(rawPatchObj.diagramsToUpsert))
           );
+        const hasAnySvgAfterPatch = (patched.mergedLesson.diagrams || []).some((d) =>
+          hasValidDiagramContent(d)
+        );
         const isStage1StillPendingSvg =
           !selectedStep3Slot.lesson &&
           extractPendingDiagramSpecs(patched.mergedLesson).length > 0 &&
-          !touchedDiagrams;
+          (!touchedDiagrams || !hasAnySvgAfterPatch);
         const report = auditCoursewareRendering(patched.mergedLesson, assets, {
           stage: isStage1StillPendingSvg ? 'stage1' : 'complete',
         });
@@ -1533,9 +1761,11 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
             parsedLesson: patched.mergedLesson,
             appliedSummary: patched.appliedSummary,
           });
+          setStep3RawImportText('');
+          setShowStep3FallbackPaste(true);
           setStep3ImportNotice({
             ok: false,
-            message: `已应用局部补丁（${patched.appliedSummary}），但仍余 ${report.issues.length} 处问题，请继续复制修复提示词处理。`,
+            message: `已应用局部补丁（${patched.appliedSummary}），仍余 ${report.issues.length} 处问题，已保留底稿并清空粘贴框，可继续复制修复提示词或粘贴下一补丁。`,
           });
           return;
         }
@@ -1560,16 +1790,52 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
       });
 
       if (check && check.report.issues.length > 0) {
+        const shouldPersistStage1Draft = Boolean(
+          check.parsedLesson &&
+            (kind === 'stage1' ||
+              (!selectedStep3Slot.lesson &&
+                extractPendingDiagramSpecs(check.parsedLesson).length > 0))
+        );
+        if (shouldPersistStage1Draft && check.parsedLesson) {
+          try {
+            const s1Res = await fetch(
+              `/api/courses/${course.id}/days/${selectedStep3Slot.dayIndex}/import`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  rawContent: JSON.stringify(check.parsedLesson, null, 2),
+                  lessonData: check.parsedLesson,
+                  sourceMode: 'chat',
+                  importStage: 'stage1',
+                }),
+              }
+            );
+            if (s1Res.ok) {
+              const s1Data = await s1Res.json();
+              onCourseUpdated(s1Data.course);
+              setDraftSlots(s1Data.course.dailyPlan || []);
+              setCurrentStep3Prompts(null);
+              loadDiskFiles(course.id);
+            }
+          } catch {
+            // preserve local step3PendingDraft even if background save fails
+          }
+        }
         setStep3PendingDraft(check.parsedLesson || null);
         setStep3PendingDraftAudit({
           report: check.report,
           parsedLesson: check.parsedLesson,
         });
+        if (check.parsedLesson) {
+          setStep3RawImportText('');
+        }
+        setShowStep3FallbackPaste(true);
         setStep3ImportNotice({
           ok: false,
           message:
             check.parsedLesson
-              ? `检测到 ${check.report.issues.length} 处可局部修复的问题（已保留已解析字段），可复制下方修复提示词或 .md 文件，修复后再点粘贴。`
+              ? `已保留底稿并清空粘贴框（检测到 ${check.report.issues.length} 处可局部修复的问题），可复制下方修复提示词后直接在此粘贴补丁，或直接复制阶段二图表提示词。`
               : `检测到 JSON 语法错误，请复制下方精确修复提示词（或 .md 文件）让 AI 修复后再次粘贴。`,
         });
         return;
@@ -1978,6 +2244,59 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     pdfMetas.length > 0;
   const slicedRegionCount = draftSplitPlan.filter((p) => p.status === 'sliced').length;
 
+  const renderManualPromptPreviewBox = () => {
+    if (!manualPromptPreview) return null;
+    return (
+      <div
+        data-testid="manual-prompt-preview-box"
+        className="border border-sky-800/70 bg-neutral-950 rounded p-3 space-y-2 text-xs"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="font-medium text-sky-200">{manualPromptPreview.title}</span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() =>
+                void triggerCopyFeedback(
+                  'manual-preview-copy',
+                  manualPromptPreview.text,
+                  manualPromptPreview.title
+                )
+              }
+              className="px-2.5 py-1 rounded bg-white text-black hover:bg-neutral-200 font-medium inline-flex items-center gap-1"
+            >
+              {copiedKey === 'manual-preview-copy' ? (
+                <>
+                  <Check className="w-3 h-3 text-emerald-600" />
+                  <span>已复制全文</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3 h-3" />
+                  <span>一键复制全文</span>
+                </>
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => setManualPromptPreview(null)}
+              className="text-neutral-400 hover:text-white px-2 py-0.5 border border-neutral-800 rounded"
+            >
+              收起
+            </button>
+          </div>
+        </div>
+        <textarea
+          readOnly
+          rows={5}
+          value={manualPromptPreview.text}
+          onFocus={(e) => e.currentTarget.select()}
+          className="w-full bg-black border border-neutral-800 rounded p-2 font-mono text-[11px] text-neutral-200 focus:outline-none focus:border-sky-500"
+        />
+      </div>
+    );
+  };
+
   return (
         <motion.div
           key="outline-workbench-backdrop"
@@ -1996,10 +2315,10 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.97 }}
             transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
-            className="glow-border w-full max-w-5xl bg-black border border-neutral-800 rounded-md p-6 my-6 max-h-[92vh] overflow-y-auto space-y-5 shadow-2xl"
+            className="glow-border w-full max-w-5xl bg-black border border-neutral-800 rounded-md p-4 sm:p-6 my-6 max-h-[92vh] overflow-y-auto space-y-5 shadow-2xl"
           >
             {/* Top Header */}
-            <div className="flex items-start justify-between gap-4 border-b border-neutral-800 pb-4">
+            <div className="sm:sticky sm:-top-6 z-30 flex flex-wrap items-start justify-between gap-3 border-b border-neutral-800 bg-black py-4">
               <div className="space-y-1 flex-1 min-w-0">
                 <div className="flex flex-wrap items-center gap-2 text-xs font-mono text-neutral-400">
                   <span className="font-display text-white font-semibold text-base" id="outline-workbench-title">
@@ -2053,16 +2372,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                   ))}
                 </div>
 
-                {workbenchMode === 'agent' && onOpenAgentModal && (
-                  <button
-                    type="button"
-                    onClick={() => onOpenAgentModal(course)}
-                    className="px-2.5 py-1.5 text-[11px] font-mono border border-neutral-700 hover:border-neutral-500 text-neutral-300 hover:text-white rounded transition-colors"
-                    title="打开独立 Agent 终端指引窗口（可选）"
-                  >
-                    Agent 独立指引窗
-                  </button>
-                )}
+
 
                 <button
                   type="button"
@@ -2163,6 +2473,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
             {errorMessage}
           </div>
         )}
+        {activeStep !== 'lessons' && renderManualPromptPreviewBox()}
 
         {/* ==================== STEP 2: COMPLETE COURSE OUTLINE (BASED ON STEP 1 REGIONS) ==================== */}
         {activeStep === 'outline' && (
@@ -2189,7 +2500,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                     type="button"
                     onClick={handleRegenerateOutlineApi}
                     disabled={isRegeneratingOutline}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs bg-white text-black font-medium rounded hover:bg-neutral-200 transition-colors disabled:opacity-50"
+                    className={primaryActionClass}
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${isRegeneratingOutline ? 'animate-spin' : ''}`} />
                     <span>{isRegeneratingOutline ? 'API 正在生成大纲...' : 'API 生成/重新生成大纲'}</span>
@@ -2219,7 +2530,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
               </div>
             </div>
 
-            {(showSyllabusImportBox || workbenchMode !== 'api') && (showSyllabusImportBox || !course.outlineConfirmed) && (
+            {workbenchMode !== 'api' && (showSyllabusImportBox || !course.outlineConfirmed) && (
               <div className="border border-neutral-800 rounded p-4 bg-neutral-950 space-y-3 text-xs">
                 {workbenchMode === 'agent' || syllabusWorkbenchTab === 'agent' ? (
                   <div className="flex flex-wrap items-center justify-between gap-2">
@@ -2802,7 +3113,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                       type="button"
                       onClick={handleAiPlanPdfSplit}
                       disabled={isPlanningSplit || isExecutingSplit}
-                      className="inline-flex items-center gap-1.5 px-3 py-1 text-xs bg-white text-black font-medium rounded hover:bg-neutral-200 transition-colors disabled:opacity-50"
+                      className={primaryActionClass}
                     >
                       <RefreshCw className={`w-3.5 h-3.5 ${isPlanningSplit ? 'animate-spin' : ''}`} />
                       <span>
@@ -2865,7 +3176,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
               )}
 
               {/* Peer Chat / Agent Inline Workbench */}
-              {(workbenchMode === 'agent' || splitModeTab === 'agent') && workbenchMode !== 'chat' && (
+              {workbenchMode === 'agent' && (
                 <div className="bg-black border border-neutral-800 rounded p-3.5 flex flex-wrap items-center justify-between gap-2 text-xs">
                   <span className="text-neutral-300 font-medium">
                     Agent 模式：复制划分提示词（或 .md 文件）交给本地 Agent 写入 <code className="text-neutral-200">segments/split-plan.json</code> 并切割，完成后点击右侧同步即可
@@ -2906,7 +3217,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                 </div>
               )}
 
-              {(workbenchMode === 'chat' || (workbenchMode === 'api' && splitModeTab === 'chat')) && (
+              {workbenchMode === 'chat' && (
                 <div className="bg-black border border-neutral-800 rounded p-3.5 space-y-3 text-xs">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <span className="text-neutral-300 font-medium">
@@ -3106,7 +3417,8 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                           </span>
                           {isSliced && (
                             <>
-                              <button
+                              {workbenchMode === 'chat' && (
+<button
                                 type="button"
                                 onClick={() =>
                                   handleCopyCourseFile(segRel, `copy-seg-step1-${item.sectionId}`)
@@ -3125,6 +3437,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                                     : '复制 PDF 文件'}
                                 </span>
                               </button>
+)}
                               <a
                                 href={`/api/courses/${course.id}/segments/${item.sectionId}/pdf`}
                                 target="_blank"
@@ -3192,7 +3505,8 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
 
                             {isSliced && (
                               <>
-                                <button
+                                {workbenchMode === 'chat' && (
+<button
                                   type="button"
                                   onClick={() =>
                                     handleCopyCourseFile(segRel, `copy-seg-adv-${item.sectionId}`)
@@ -3211,6 +3525,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                                       : '复制 PDF'}
                                   </span>
                                 </button>
+)}
                                 <a
                                   href={`/api/courses/${course.id}/segments/${item.sectionId}/pdf`}
                                   target="_blank"
@@ -3445,7 +3760,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                       generatingDayIndex !== null ||
                       draftSlots.every((s) => Boolean(s.lesson))
                     }
-                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors disabled:opacity-50 whitespace-nowrap"
+                    className={primaryActionClass}
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${isGeneratingBatch ? 'animate-spin' : ''}`} />
                     <span>
@@ -3590,7 +3905,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
               const modeBadgeLabel =
                 workbenchMode === 'agent'
                   ? 'Agent 工作台'
-                  : workbenchMode === 'api'
+                  : false
                   ? 'API 工作台'
                   : 'Chat 模式工作台';
 
@@ -3709,10 +4024,13 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                           Agent 两阶段本地执行指引（{courseRelDir}/lessons/{secId}.stage1.json ➔ {secId}.json）
                         </div>
                         <div className="text-[11px] text-neutral-400">
-                          Agent 在本地读取对应分段 PDF 与上下文，先写出 stage1 JSON，再仅根据 stage1 中的图示规格生成 SVG 并合并为最终课件。
+                          Agent 在同一次对话中生成并组装课件，运行渲染诊断，按错误报告修改并复查；完成后同步磁盘成果。
                         </div>
                       </div>
                       <div className="flex flex-wrap items-center gap-2">
+                        <button type="button" onClick={copyAllRepairPrompts} className="rounded border border-sky-800 px-3 py-2 text-xs text-sky-200">
+                          {copiedKey === 'agent-all-repairs' ? '已复制全部纠错提示词' : '复制全部纠错提示词'}
+                        </button>
                         <button
                           type="button"
                           onClick={() => handleCopySectionStagePrompt(selectedStep3Slot.dayIndex, 'agent_full', false)}
@@ -3739,56 +4057,6 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                         </button>
                         <button
                           type="button"
-                          onClick={() => handleCopySectionStagePrompt(selectedStep3Slot.dayIndex, 'agent_stage1', false)}
-                          className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors"
-                        >
-                          {copiedKey === `agent_stage1-${selectedStep3Slot.dayIndex}` ? (
-                            <Check className="w-3.5 h-3.5 text-emerald-600" />
-                          ) : (
-                            <Copy className="w-3.5 h-3.5" />
-                          )}
-                          <span>复制本节阶段一指令</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleCopySectionStagePrompt(selectedStep3Slot.dayIndex, 'agent_stage1', true)}
-                          className="inline-flex items-center gap-1 px-2 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors"
-                        >
-                          {copiedKey === `agent_stage1-md-${selectedStep3Slot.dayIndex}` ? (
-                            <Check className="w-3.5 h-3.5 text-emerald-400" />
-                          ) : (
-                            <FileText className="w-3.5 h-3.5" />
-                          )}
-                          <span>阶段一 .md</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleCopySectionStagePrompt(selectedStep3Slot.dayIndex, 'agent_stage2', false)}
-                          disabled={!hasStage1}
-                          className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 rounded transition-colors disabled:opacity-45"
-                        >
-                          {copiedKey === `agent_stage2-${selectedStep3Slot.dayIndex}` ? (
-                            <Check className="w-3.5 h-3.5 text-emerald-400" />
-                          ) : (
-                            <Copy className="w-3.5 h-3.5" />
-                          )}
-                          <span>复制本节阶段二 SVG 指令</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleCopySectionStagePrompt(selectedStep3Slot.dayIndex, 'agent_stage2', true)}
-                          disabled={!hasStage1}
-                          className="inline-flex items-center gap-1 px-2 py-1.5 border border-sky-700/80 hover:border-sky-400 text-sky-200 rounded transition-colors disabled:opacity-45"
-                        >
-                          {copiedKey === `agent_stage2-md-${selectedStep3Slot.dayIndex}` ? (
-                            <Check className="w-3.5 h-3.5 text-emerald-400" />
-                          ) : (
-                            <FileText className="w-3.5 h-3.5" />
-                          )}
-                          <span>阶段二 .md</span>
-                        </button>
-                        <button
-                          type="button"
                           onClick={handleInlineAgentSync}
                           disabled={isSyncingAgentInline}
                           className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-emerald-700/80 hover:border-emerald-400 bg-emerald-950/30 text-emerald-200 rounded transition-colors disabled:opacity-50"
@@ -3801,7 +4069,83 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                   </div>
                 )}
 
-                {/* 精简统一工作台（零标签 / 无多余文本框 / 自动识别导入） */}
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                  {workbenchMode !== 'chat' && hasStage1 && (
+                    <button type="button" className={secondaryActionClass}
+                      onClick={handlePreviewCurrentStep3Lesson}>
+                      预览课件
+                    </button>
+                  )}
+                  {hasFinalLesson && (
+                    <>
+                      <button type="button" className={secondaryActionClass}
+                        onClick={() => onOpenLesson(course.id, selectedStep3Slot.dayIndex)}>
+                        阅读课件
+                      </button>
+                      <button type="button" className={secondaryActionClass}
+                        disabled={deletingLessonDay === selectedStep3Slot.dayIndex || isGeneratingBatch || generatingDayIndex !== null}
+                        onClick={() => handleDeleteSingleLesson(selectedStep3Slot)}>
+                        删除课件
+                      </button>
+                    </>
+                  )}
+                </div>
+
+                {workbenchMode === 'api' && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleGenerateSingleSectionApi(selectedStep3Slot.dayIndex, 'all')}
+                      disabled={generatingDayIndex !== null || isGeneratingBatch}
+                      className={primaryActionClass}
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+                      <span>{hasFinalLesson ? 'API 重新生成本节' : 'API 生成本节'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleGenerateSingleSectionApi(selectedStep3Slot.dayIndex, 'stage1')}
+                      disabled={generatingDayIndex !== null || isGeneratingBatch}
+                      className={secondaryActionClass}
+                      title="通过 API 仅重跑或生成阶段一（保留既有终稿直至新内容保存，失败不清空）"
+                    >
+                      <FileText className="h-3.5 w-3.5" aria-hidden="true" />
+                      <span>API 仅执行阶段一</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleGenerateSingleSectionApi(selectedStep3Slot.dayIndex, 'stage2')}
+                      disabled={!hasStage1 || generatingDayIndex !== null || isGeneratingBatch}
+                      className={secondaryActionClass}
+                      title="仅基于阶段一规格通过 API 重跑或生成阶段二图表代码（优先 5 类结构化 diagramSpec，不重写阶段一正文）"
+                    >
+                      <Image className="h-3.5 w-3.5" aria-hidden="true" />
+                      <span>API 仅执行阶段二图表</span>
+                    </button>
+                  </div>
+                )}
+
+                {workbenchMode === 'agent' && (
+                  <section className="space-y-2 rounded border border-neutral-800 p-3">
+                    <details key={secId} open>
+                      <summary className="cursor-pointer font-medium text-neutral-200">{secId} · 单节完整生成指令</summary>
+                      {agentSectionPrompt?.dayIndex === selectedStep3Slot.dayIndex ? (
+                        <>
+                          <textarea readOnly aria-label="单节完整生成指令" value={agentSectionPrompt.text}
+                            className="mt-2 h-36 w-full rounded border border-neutral-800 bg-black p-2 text-xs" />
+                          <button type="button" className="rounded border border-neutral-700 px-3 py-1.5"
+                            onClick={() => triggerCopyFeedback('agent-section-complete', agentSectionPrompt.text)}>
+                            {copiedKey === 'agent-section-complete' ? '已复制单节指令' : '一键复制单节生成指令'}
+                          </button>
+                        </>
+                      ) : (
+                        <p role="status" className="mt-2 text-neutral-400">{agentPromptError || '正在读取本节指令…'}</p>
+                      )}
+                    </details>
+                  </section>
+                )}
+
+                {workbenchMode === 'chat' && (
                 <div className="space-y-3" data-testid="step3-unified-workbench">
                   <div className="flex flex-wrap items-center justify-between gap-2 bg-black border border-neutral-900 rounded p-3">
                     <div className="space-y-0.5 min-w-0 flex-1">
@@ -3820,7 +4164,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                           {autoStep3Stage === 'repair'
                             ? '检测到异常 · 等待局部修复'
                             : autoStep3Stage === 'stage2'
-                            ? `当前：阶段二 · SVG 图示（待绘 ${pendingStep3Specs.length} 张）`
+                            ? `当前：阶段二 · 图表代码（待生成 ${pendingStep3Specs.length} 张）`
                             : autoStep3Stage === 'complete'
                             ? '当前：已完成终稿（可直接粘贴补丁/重跑）'
                             : '当前：阶段一 · 教学正文与图示规格'}
@@ -3839,28 +4183,6 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                       </div>
                     </div>
 
-                    {workbenchMode === 'api' && (
-                      <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono shrink-0">
-                        <button
-                          type="button"
-                          onClick={() => handleGenerateSingleSectionApi(selectedStep3Slot.dayIndex, 'stage1')}
-                          disabled={generatingDayIndex !== null || isGeneratingBatch}
-                          className="px-2.5 py-1 border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded disabled:opacity-50"
-                          title="通过 API 仅重跑或生成阶段一（保留既有终稿直至新内容保存，失败不清空）"
-                        >
-                          API 仅执行阶段一
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleGenerateSingleSectionApi(selectedStep3Slot.dayIndex, 'stage2')}
-                          disabled={!hasStage1 || generatingDayIndex !== null || isGeneratingBatch}
-                          className="px-2.5 py-1 border border-sky-800/80 hover:border-sky-500 text-sky-300 hover:text-white rounded disabled:opacity-45"
-                          title="仅基于阶段一规格通过 API 重跑或生成阶段二 SVG（不重写阶段一正文）"
-                        >
-                          API 仅执行阶段二 SVG
-                        </button>
-                      </div>
-                    )}
                   </div>
 
                   {pendingStep3Specs.length > 0 && (
@@ -3872,11 +4194,21 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                         >
                           <div className="flex items-center justify-between gap-2 font-mono text-[11px]">
                             <span className="text-sky-300 font-semibold">{spec.id}</span>
-                            <span className="text-neutral-400 truncate">{spec.title}</span>
+                            <span
+                              className="text-neutral-400 truncate [&>p]:m-0"
+                              dangerouslySetInnerHTML={{
+                                __html: renderInlineMathWithLatex(spec.title || ''),
+                              }}
+                            />
                           </div>
-                          <div className="text-[11px] text-neutral-400 line-clamp-2">
-                            {spec.topologySpec || spec.caption || '待绘制图示'}
-                          </div>
+                          <div
+                            className="text-[11px] text-neutral-400 line-clamp-2 [&>p]:m-0"
+                            dangerouslySetInnerHTML={{
+                              __html: renderInlineMathWithLatex(
+                                spec.topologySpec || spec.caption || '待绘制图示'
+                              ),
+                            }}
+                          />
                         </div>
                       ))}
                     </div>
@@ -3890,55 +4222,78 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                           const fileName = seg.segmentFileName || `${segId}.pdf`;
                           const copyKey = `copy-seg-workbench-${secId}-${segId}`;
                           return (
-                            <button
-                              key={segId}
-                              type="button"
-                              onClick={() => handleCopyCourseFile(`segments/${fileName}`, copyKey)}
-                              className={`inline-flex items-center gap-1 px-2.5 py-1.5 border rounded transition-colors whitespace-nowrap ${
-                                autoStep3Stage === 'stage2'
-                                  ? 'border-neutral-800 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
-                                  : 'border-neutral-700 hover:border-neutral-500 text-neutral-100'
-                              }`}
-                              title={`将切分 PDF (${fileName}，物理第 ${seg.physicalStartPage}~${seg.physicalEndPage} 页) 复制到系统剪贴板`}
-                            >
-                              {copiedKey === copyKey ? (
-                                <Check className="w-3.5 h-3.5 text-emerald-400" />
-                              ) : (
-                                <Copy className="w-3.5 h-3.5" />
-                              )}
-                              <span>
-                                {copiedKey === copyKey
-                                  ? `已复制 ${slicedSegs.length > 1 ? fileName : '小节 PDF'}`
-                                  : `① 复制 ${slicedSegs.length > 1 ? fileName : '小节 PDF'}`}
-                              </span>
-                            </button>
+                            <React.Fragment key={segId}>
+                              <button
+                                type="button"
+                                onClick={() => handleCopyCourseFile(`segments/${fileName}`, copyKey)}
+                                className={`inline-flex items-center gap-1 px-2.5 py-1.5 border rounded transition-colors whitespace-nowrap ${
+                                  autoStep3Stage === 'stage2'
+                                    ? 'border-neutral-800 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                                    : 'border-neutral-700 hover:border-neutral-500 text-neutral-100'
+                                }`}
+                                title={`将切分 PDF (${fileName}，物理第 ${seg.physicalStartPage}~${seg.physicalEndPage} 页) 复制到系统剪贴板`}
+                              >
+                                {copiedKey === copyKey ? (
+                                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                ) : (
+                                  <Copy className="w-3.5 h-3.5" />
+                                )}
+                                <span>
+                                  {copiedKey === copyKey
+                                    ? `已复制 ${slicedSegs.length > 1 ? fileName : '小节 PDF'}`
+                                    : `① 复制 ${slicedSegs.length > 1 ? fileName : '小节 PDF'}`}
+                                </span>
+                              </button>
+                              <a
+                                href={`/api/courses/${course.id}/segments/${segId}/pdf?download=1`}
+                                download={fileName}
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors whitespace-nowrap"
+                                title={`下载切分 PDF (${fileName})`}
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                                <span>{slicedSegs.length > 1 ? `下载 ${fileName}` : '下载小节 PDF'}</span>
+                              </a>
+                            </React.Fragment>
                           );
                         })
                       ) : pdfMetas[0] ? (
-                        <button
-                          type="button"
-                          onClick={() =>
-                            handleCopyCourseFile(
-                              `sources/${pdfMetas[0].fileName}`,
-                              `copy-src-workbench-${secId}`
-                            )
-                          }
-                          className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-100 rounded transition-colors whitespace-nowrap"
-                        >
-                          {copiedKey === `copy-src-workbench-${secId}` ? (
-                            <Check className="w-3.5 h-3.5 text-emerald-400" />
-                          ) : (
-                            <Copy className="w-3.5 h-3.5" />
-                          )}
-                          <span>
-                            {copiedKey === `copy-src-workbench-${secId}`
-                              ? '已复制原教材 PDF'
-                              : '① 复制原教材 PDF'}
-                          </span>
-                        </button>
+                        <>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleCopyCourseFile(
+                                `sources/${pdfMetas[0].fileName}`,
+                                `copy-src-workbench-${secId}`
+                              )
+                            }
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-100 rounded transition-colors whitespace-nowrap"
+                          >
+                            {copiedKey === `copy-src-workbench-${secId}` ? (
+                              <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            ) : (
+                              <Copy className="w-3.5 h-3.5" />
+                            )}
+                            <span>
+                              {copiedKey === `copy-src-workbench-${secId}`
+                                ? '已复制原教材 PDF'
+                                : '① 复制原教材 PDF'}
+                            </span>
+                          </button>
+                          <a
+                            href={`/api/courses/${course.id}/files/download?path=${encodeURIComponent(`sources/${pdfMetas[0].fileName}`)}&download=1`}
+                            download={pdfMetas[0].fileName}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors whitespace-nowrap"
+                            title={`下载原教材 PDF (${pdfMetas[0].fileName})`}
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            <span>下载原教材 PDF</span>
+                          </a>
+                        </>
                       ) : null}
 
-                      {autoStep3Stage === 'stage2' ? (
+                      {(autoStep3Stage === 'stage2' ||
+                        pendingStep3Specs.length > 0 ||
+                        Boolean(step3Stage1BaseLesson?.diagrams?.length)) ? (
                         <>
                           <button
                             type="button"
@@ -3956,7 +4311,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                             <span>
                               {copiedKey === `stage2-${selectedStep3Slot.dayIndex}`
                                 ? '已复制阶段二提示词'
-                                : '② 复制阶段二 SVG 提示词'}
+                                : '② 复制阶段二图表提示词'}
                             </span>
                           </button>
                           <button
@@ -4069,6 +4424,27 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                         </span>
                       </button>
 
+                      <button
+                        type="button"
+                        data-testid="step3-toggle-manual-paste-btn"
+                        onClick={() => {
+                          setShowStep3FallbackPaste((v) => {
+                            const next = !v;
+                            if (next) {
+                              window.setTimeout(() => step3TextareaRef.current?.focus(), 30);
+                            }
+                            return next;
+                          });
+                        }}
+                        className={`inline-flex items-center gap-1 px-2.5 py-1.5 border rounded transition-colors whitespace-nowrap ${
+                          showStep3FallbackPaste
+                            ? 'border-sky-500/70 bg-sky-950/40 text-sky-200'
+                            : 'border-neutral-700 hover:border-neutral-500 text-neutral-200 hover:text-white'
+                        }`}
+                      >
+                        <span>{showStep3FallbackPaste ? '收起粘贴框' : '手动粘贴框 / 补丁'}</span>
+                      </button>
+
                       <label className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 hover:text-white rounded transition-colors cursor-pointer whitespace-nowrap">
                         <Upload className="w-3.5 h-3.5" />
                         <span>导入 JSON 文件</span>
@@ -4103,7 +4479,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                         <button
                           type="button"
                           data-testid="step3-reset-to-outline-btn"
-                          onClick={() => handleResetSectionToOutline(selectedStep3Slot, workbenchMode === 'api')}
+                          onClick={() => handleResetSectionToOutline(selectedStep3Slot, false)}
                           disabled={deletingLessonDay === selectedStep3Slot.dayIndex || isGeneratingBatch}
                           className={`inline-flex items-center gap-1 px-2.5 py-1.5 border rounded transition-colors disabled:opacity-45 whitespace-nowrap ${
                             duplicateLessonDaysByDay.has(selectedStep3Slot.dayIndex)
@@ -4116,9 +4492,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                           <span>
                             {deletingLessonDay === selectedStep3Slot.dayIndex
                               ? '重置中...'
-                              : workbenchMode === 'api'
-                                ? '从大纲重新生成 (API)'
-                                : '从大纲重新生成'}
+                              : '从大纲重新生成'}
                           </span>
                         </button>
                       )}
@@ -4134,7 +4508,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                       </span>
                       <button
                         type="button"
-                        onClick={() => handleResetSectionToOutline(selectedStep3Slot, workbenchMode === 'api')}
+                        onClick={() => handleResetSectionToOutline(selectedStep3Slot, false)}
                         disabled={deletingLessonDay === selectedStep3Slot.dayIndex || isGeneratingBatch}
                         className="px-2.5 py-1 rounded border border-amber-500/60 bg-amber-900/40 hover:bg-amber-800/50 text-amber-100 font-medium whitespace-nowrap"
                       >
@@ -4146,17 +4520,31 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                   {showStep3FallbackPaste && (
                     <div className="bg-black border border-neutral-800 rounded p-3 space-y-2">
                       <div className="flex items-center justify-between gap-2 text-[11px] text-neutral-300">
-                        <span>浏览器未开放读取剪贴板权限，请在此临时粘贴后点击识别导入：</span>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setShowStep3FallbackPaste(false);
-                            setStep3RawImportText('');
-                          }}
-                          className="text-neutral-500 hover:text-neutral-300"
-                        >
-                          收起
-                        </button>
+                        <span>在此手动粘贴阶段一 JSON / 阶段二图表 / 局部修复补丁后点击识别导入：</span>
+                        <div className="flex items-center gap-2 shrink-0">
+                          {step3RawImportText && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setStep3RawImportText('');
+                                step3TextareaRef.current?.focus();
+                              }}
+                              className="text-neutral-400 hover:text-white"
+                            >
+                              清空
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShowStep3FallbackPaste(false);
+                              setStep3RawImportText('');
+                            }}
+                            className="text-neutral-500 hover:text-neutral-300"
+                          >
+                            收起
+                          </button>
+                        </div>
                       </div>
                       <textarea
                         ref={step3TextareaRef}
@@ -4165,7 +4553,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                         rows={4}
                         value={step3RawImportText}
                         onChange={(e) => setStep3RawImportText(e.target.value)}
-                        placeholder="按 Ctrl+V 粘贴 AI 输出（自动识别阶段一 JSON / 阶段二 SVG / 局部修复补丁 / 完整课件）..."
+                        placeholder="按 Ctrl+V 粘贴 AI 输出（自动识别阶段一 JSON / 阶段二图表 / 局部修复补丁 / 完整课件）..."
                         className="w-full bg-neutral-950 border border-neutral-800 rounded p-2.5 text-xs font-mono text-neutral-100 focus:outline-none focus:border-sky-500"
                       />
                       <div className="flex justify-end gap-2">
@@ -4247,6 +4635,18 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
 
                           <button
                             type="button"
+                            data-testid="step3-audit-open-paste-btn"
+                            onClick={() => {
+                              setShowStep3FallbackPaste(true);
+                              window.setTimeout(() => step3TextareaRef.current?.focus(), 30);
+                            }}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 hover:text-white rounded transition-colors"
+                          >
+                            <span>粘贴修复补丁</span>
+                          </button>
+
+                          <button
+                            type="button"
                             onClick={() => setShowStep3IssueDetails((v) => !v)}
                             className="px-2 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-300 rounded"
                           >
@@ -4292,13 +4692,20 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                                 {issue.categoryLabel}
                                 {issue.locationLabel ? ` · ${issue.locationLabel}` : ''}
                               </div>
-                              <div className="text-neutral-300 mt-0.5">{issue.detail}</div>
+                              <div
+                                className="text-neutral-300 mt-0.5 [&>p]:m-0"
+                                dangerouslySetInnerHTML={{
+                                  __html: renderInlineMathWithLatex(issue.detail),
+                                }}
+                              />
                             </li>
                           ))}
                         </ul>
                       )}
                     </div>
                   )}
+
+                  {renderManualPromptPreviewBox()}
 
                   {step3ImportNotice && (
                     <div
@@ -4313,6 +4720,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                     </div>
                   )}
                 </div>
+                )}
               </div>
               );
             })()}
@@ -4333,381 +4741,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                   <span>返回第 2 步：生成课程大纲 →</span>
                 </button>
               </div>
-            ) : (
-            <div className="space-y-3 max-h-[48vh] overflow-y-auto pr-1">
-              {effectiveSlots.map((slot) => {
-                const secId = ensureStableSectionId(slot.dayIndex, slot.id);
-                const boundSegs = resolveSlotPdfSegments(slot, draftSplitPlan);
-                const slicedSegs = boundSegs.filter(
-                  (item) =>
-                    item.status === 'sliced' ||
-                    Boolean(item.segmentRelPath || item.segmentFileName)
-                );
-                const hasLesson = Boolean(slot.lesson);
-                const isGenThis = generatingDayIndex === slot.dayIndex;
-                const isSelectedChatSlot = selectedStep3Slot?.dayIndex === slot.dayIndex;
-                const evaluatedMinutes = getEvaluatedSectionMinutes(slot);
-
-                return (
-                  <div
-                    key={secId}
-                    data-testid={`step3-section-card-${slot.dayIndex}`}
-                    className={`border rounded-lg p-4 bg-black flex flex-col gap-3 text-xs transition-colors ${
-                      isSelectedChatSlot
-                        ? 'border-neutral-500 ring-1 ring-white/15'
-                        : 'border-neutral-800 hover:border-neutral-700'
-                    }`}
-                  >
-                    {/* Top Metadata Row (never crushed horizontally) */}
-                    <div className="flex flex-wrap items-start justify-between gap-2">
-                      <div className="flex flex-wrap items-center gap-2 font-mono min-w-0">
-                        <span className="px-2 py-0.5 bg-neutral-900 border border-neutral-700 rounded text-white font-semibold">
-                          {secId}
-                        </span>
-                        <span className="text-neutral-300">
-                          第 {slot.dayIndex} 讲 · 排程第 {slot.scheduledDay || slot.dayIndex}/{draftDurationDays} 天
-                        </span>
-                        <span className="text-neutral-500" aria-hidden="true">
-                          ·
-                        </span>
-                        <span className="text-neutral-400">
-                          {evaluatedMinutes !== undefined
-                            ? `预计 ${evaluatedMinutes} 分钟`
-                            : '待生成课件后评估学时'}
-                        </span>
-                        <span className="text-neutral-500" aria-hidden="true">
-                          ·
-                        </span>
-                        <span className="text-neutral-500">{slot.date}</span>
-                        {boundSegs.map((seg) => (
-                          <span
-                            key={seg.sectionId}
-                            className="px-2 py-0.5 rounded border border-neutral-800 bg-neutral-950 text-neutral-300 text-[11px]"
-                          >
-                            {seg.segmentFileName || `${seg.sectionId}.pdf`} (物理第{' '}
-                            {seg.physicalStartPage}~{seg.physicalEndPage} 页)
-                          </span>
-                        ))}
-                      </div>
-
-                      <span
-                        className={`font-mono text-[11px] px-2 py-0.5 rounded border shrink-0 ${
-                          hasLesson
-                            ? 'border-emerald-800/70 bg-emerald-950/30 text-emerald-300'
-                            : slot.stage1Draft
-                            ? 'border-sky-800/70 bg-sky-950/30 text-sky-300'
-                            : 'border-neutral-800 bg-neutral-950 text-neutral-400'
-                        }`}
-                      >
-                        {hasLesson
-                          ? `✅ 已生成 (lessons/${secId}.json)`
-                          : slot.stage1Draft
-                          ? `📝 阶段一已存 (${extractPendingDiagramSpecs(slot.stage1Draft).length} 图待生成)`
-                          : '⏳ 待生成课件'}
-                      </span>
-                    </div>
-
-                    {/* Full-Width Title, Objective & Scope */}
-                    <div className="space-y-1 min-w-0">
-                      <div
-                        className="text-sm font-semibold text-white leading-snug"
-                        dangerouslySetInnerHTML={{
-                          __html: renderInlineMathWithLatex(slot.title),
-                        }}
-                      />
-
-                      <div
-                        className="text-neutral-400 leading-relaxed"
-                        dangerouslySetInnerHTML={{
-                          __html: renderInlineMathWithLatex(
-                            `目标：${slot.objective} · 范围：${
-                              slot.teachingScope || (slot.keyTopics || []).join('、') || '待完善'
-                            }`
-                          ),
-                        }}
-                      />
-
-                      {slot.assignedWords && slot.assignedWords.length > 0 && (
-                        <div className="text-neutral-500 font-mono truncate">
-                          本节目标词汇 ({slot.assignedWords.length} 词)：
-                          {slot.assignedWords.map((w) => w.word).join(', ')}
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Bottom Action Bar */}
-                    <div className="flex flex-wrap items-center justify-between gap-2 pt-2.5 border-t border-neutral-900">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            handleCopySectionStagePrompt(slot.dayIndex, 'stage1', false)
-                          }
-                          className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
-                          title="复制本节阶段一提示词（教学正文与图示规格）"
-                        >
-                          {copiedKey === `stage1-${slot.dayIndex}` ? (
-                            <Check className="w-3.5 h-3.5 text-emerald-400" />
-                          ) : (
-                            <Copy className="w-3.5 h-3.5" />
-                          )}
-                          <span>
-                            {copiedKey === `stage1-${slot.dayIndex}`
-                              ? '已复制阶段一'
-                              : '复制阶段一提示词'}
-                          </span>
-                        </button>
-
-                        <button
-                          type="button"
-                          onClick={() =>
-                            handleCopySectionStagePrompt(slot.dayIndex, 'stage1', true)
-                          }
-                          className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
-                          title="将阶段一提示词保存为 .md 文件并复制到系统剪贴板"
-                        >
-                          {copiedKey === `stage1-md-${slot.dayIndex}` ? (
-                            <Check className="w-3.5 h-3.5 text-emerald-400" />
-                          ) : (
-                            <FileText className="w-3.5 h-3.5" />
-                          )}
-                          <span>
-                            {copiedKey === `stage1-md-${slot.dayIndex}`
-                              ? '已复制 .md'
-                              : '复制阶段一 .md'}
-                          </span>
-                        </button>
-
-                        {slot.stage1Draft && (
-                          <>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handleCopySectionStagePrompt(slot.dayIndex, 'stage2', false)
-                              }
-                              className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-sky-800/80 hover:border-sky-500 bg-sky-950/30 text-sky-200 rounded transition-colors whitespace-nowrap"
-                              title="复制阶段二 SVG 生成提示词（复用阶段一规格，无需上传 PDF）"
-                            >
-                              {copiedKey === `stage2-${slot.dayIndex}` ? (
-                                <Check className="w-3.5 h-3.5 text-emerald-400" />
-                              ) : (
-                                <Copy className="w-3.5 h-3.5" />
-                              )}
-                              <span>
-                                {copiedKey === `stage2-${slot.dayIndex}`
-                                  ? '已复制阶段二'
-                                  : '复制阶段二 SVG'}
-                              </span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handleCopySectionStagePrompt(slot.dayIndex, 'stage2', true)
-                              }
-                              className="inline-flex items-center gap-1 px-2 py-1.5 border border-sky-800/80 hover:border-sky-500 text-sky-200 rounded transition-colors whitespace-nowrap"
-                              title="将阶段二 SVG 提示词复制为 .md 文件"
-                            >
-                              {copiedKey === `stage2-md-${slot.dayIndex}` ? (
-                                <Check className="w-3.5 h-3.5 text-emerald-400" />
-                              ) : (
-                                <FileText className="w-3.5 h-3.5" />
-                              )}
-                              <span>阶段二 .md</span>
-                            </button>
-                          </>
-                        )}
-
-                        <button
-                          type="button"
-                          data-testid={`step3-select-paste-${slot.dayIndex}`}
-                          onClick={() => {
-                            setSelectedStep3ChatDay(slot.dayIndex);
-                            setStep3ImportNotice(null);
-                            window.setTimeout(() => {
-                              const workbenchEl = document.querySelector(
-                                '[data-testid="step3-chat-workbench"]'
-                              );
-                              workbenchEl?.scrollIntoView({
-                                behavior: 'smooth',
-                                block: 'center',
-                              });
-                            }, 30);
-                          }}
-                          className={`inline-flex items-center gap-1 px-2.5 py-1.5 border rounded transition-colors whitespace-nowrap ${
-                            isSelectedChatSlot
-                              ? 'border-sky-500/80 bg-sky-950/40 text-sky-200'
-                              : 'border-neutral-700 hover:border-neutral-500 text-neutral-200'
-                          }`}
-                          title="切换上方工作台到本节并导入或局部修补"
-                        >
-                          <FileText className="w-3.5 h-3.5" />
-                          <span>
-                            {hasLesson
-                              ? '进入工作台修补'
-                              : slot.stage1Draft
-                              ? '继续阶段二 SVG'
-                              : '进入工作台导入'}
-                          </span>
-                        </button>
-
-                        {slicedSegs.length > 0 ? (
-                          slicedSegs.map((seg) => {
-                            const segId = seg.sectionId || secId;
-                            const fileName = seg.segmentFileName || `${segId}.pdf`;
-                            const copyKey = `copy-seg-step3-${secId}-${segId}`;
-                            return (
-                              <button
-                                key={segId}
-                                type="button"
-                                onClick={() =>
-                                  handleCopyCourseFile(`segments/${fileName}`, copyKey)
-                                }
-                                className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
-                                title={`将 ${fileName} 复制到系统剪贴板，等效在资源管理器按 Ctrl+C，可直接 Ctrl+V 粘贴`}
-                              >
-                                {copiedKey === copyKey ? (
-                                  <Check className="w-3.5 h-3.5 text-emerald-400" />
-                                ) : (
-                                  <Copy className="w-3.5 h-3.5" />
-                                )}
-                                <span>
-                                  {copiedKey === copyKey
-                                    ? `已复制 ${slicedSegs.length > 1 ? fileName : '文件'}`
-                                    : `复制 ${slicedSegs.length > 1 ? fileName : '小节 PDF'}`}
-                                </span>
-                              </button>
-                            );
-                          })
-                        ) : pdfMetas[0] ? (
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleCopyCourseFile(
-                                `sources/${pdfMetas[0].fileName}`,
-                                `copy-src-step3-${secId}`
-                              )
-                            }
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
-                            title="将原始教材 PDF 复制到系统剪贴板，等效资源管理器 Ctrl+C"
-                          >
-                            {copiedKey === `copy-src-step3-${secId}` ? (
-                              <Check className="w-3.5 h-3.5 text-emerald-400" />
-                            ) : (
-                              <Copy className="w-3.5 h-3.5" />
-                            )}
-                            <span>
-                              {copiedKey === `copy-src-step3-${secId}`
-                                ? '已复制文件'
-                                : '复制原 PDF'}
-                            </span>
-                          </button>
-                        ) : null}
-                      </div>
-
-                      <div className="flex flex-wrap items-center gap-2">
-                        {workbenchMode === 'api' && (
-                          <>
-                            <button
-                              type="button"
-                              onClick={() => handleGenerateSingleSectionApi(slot.dayIndex, 'stage1')}
-                              disabled={isGenThis || isGeneratingBatch}
-                              className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors whitespace-nowrap disabled:opacity-50"
-                              title="单次请求仅执行阶段一（教学内容与图示规格）"
-                            >
-                              <RefreshCw
-                                className={`w-3.5 h-3.5 ${isGenThis ? 'animate-spin' : ''}`}
-                              />
-                              <span>API 步骤一：生成内容</span>
-                            </button>
-                            {(slot.stage1Draft || slot.lesson) && (
-                              <button
-                                type="button"
-                                onClick={() => handleGenerateSingleSectionApi(slot.dayIndex, 'stage2')}
-                                disabled={isGenThis || isGeneratingBatch}
-                                className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-sky-800/80 hover:border-sky-500 text-sky-300 hover:text-white rounded transition-colors whitespace-nowrap disabled:opacity-50"
-                                title="单次请求仅基于阶段一规格生成/重跑阶段二 SVG（不清除阶段一）"
-                              >
-                                <RefreshCw
-                                  className={`w-3.5 h-3.5 ${isGenThis ? 'animate-spin' : ''}`}
-                                />
-                                <span>API 步骤二：生成 SVG</span>
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              onClick={() => handleGenerateSingleSectionApi(slot.dayIndex, 'all')}
-                              disabled={isGenThis || isGeneratingBatch}
-                              className="inline-flex items-center gap-1 px-3 py-1.5 border border-neutral-800 hover:border-neutral-600 text-neutral-200 hover:text-white rounded transition-colors whitespace-nowrap disabled:opacity-50"
-                              title="依次发起步骤一和步骤二两个独立请求完成本节课件"
-                            >
-                              <RefreshCw
-                                className={`w-3.5 h-3.5 ${isGenThis ? 'animate-spin' : ''}`}
-                              />
-                              <span>
-                                {isGenThis
-                                  ? `生成中 ${generatingDayProgress?.percent ?? 0}%`
-                                  : hasLesson
-                                    ? 'API 分步重生成 (1➔2)'
-                                    : 'API 分步生成本节 (1➔2)'}
-                              </span>
-                            </button>
-                          </>
-                        )}
-
-                        {(hasLesson || slot.stage1Draft) && (
-                          <button
-                            type="button"
-                            onClick={() => handleResetSectionToOutline(slot, workbenchMode === 'api')}
-                            disabled={deletingLessonDay === slot.dayIndex || isGeneratingBatch}
-                            className={`inline-flex items-center gap-1 px-2.5 py-1.5 border rounded transition-colors whitespace-nowrap disabled:opacity-50 ${
-                              duplicateLessonDaysByDay.has(slot.dayIndex)
-                                ? 'border-amber-600/80 bg-amber-950/30 text-amber-200 hover:border-amber-400'
-                                : 'border-neutral-800 hover:border-amber-600/70 text-neutral-300 hover:text-amber-200'
-                            }`}
-                            title="清空当前课件并恢复大纲原标题，从阶段一重新生成"
-                          >
-                            <RotateCcw className="w-3.5 h-3.5" />
-                            <span>
-                              {deletingLessonDay === slot.dayIndex
-                                ? '重置中...'
-                                : duplicateLessonDaysByDay.has(slot.dayIndex)
-                                  ? `与 ${duplicateLessonDaysByDay.get(slot.dayIndex)!.join('/')} 重复 · 从大纲重生成`
-                                  : '从大纲重新生成'}
-                            </span>
-                          </button>
-                        )}
-
-                        {hasLesson && (
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteSingleLesson(slot)}
-                            disabled={deletingLessonDay === slot.dayIndex || isGeneratingBatch}
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-800 hover:border-red-700 text-neutral-400 hover:text-red-400 rounded transition-colors whitespace-nowrap disabled:opacity-50"
-                            title={`从磁盘删除 lessons/${secId}.json 课件`}
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                            <span>{deletingLessonDay === slot.dayIndex ? '删除中...' : '删除课件'}</span>
-                          </button>
-                        )}
-
-                        <button
-                          type="button"
-                          onClick={() => {
-                            onClose();
-                            onOpenLesson(course.id, slot.dayIndex);
-                          }}
-                          className="inline-flex items-center gap-1 px-3 py-1.5 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors whitespace-nowrap"
-                        >
-                          <BookOpen className="w-3.5 h-3.5" />
-                          <span>{hasLesson ? '阅读课件' : '进入独立工作台'}</span>
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-            )}
+            ) : null}
           </div>
         )}
 
@@ -4824,7 +4858,8 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                             </div>
 
                             <div className="flex items-center gap-2 shrink-0">
-                              <button
+                              {workbenchMode !== 'api' && (
+<button
                                 type="button"
                                 onClick={() => handleCopyCourseFile(file.relPath, copyFileKey)}
                                 className="inline-flex items-center gap-1 px-2.5 py-1 border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors"
@@ -4837,6 +4872,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                                 )}
                                 <span>{copiedKey === copyFileKey ? '已复制' : '复制文件'}</span>
                               </button>
+)}
                               <a
                                 href={`/api/courses/${course.id}/files/download?path=${encodeURIComponent(file.relPath)}`}
                                 target="_blank"

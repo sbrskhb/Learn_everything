@@ -901,7 +901,7 @@ export function buildAgentExecutionPrompt(params: {
       const status = slot.lesson
         ? '✅ 已完成（默认跳过，避免覆盖）'
         : slot.stage1Draft
-          ? `📝 阶段一已完成（已存 lessons/${sectionId}.stage1.json，仅需执行阶段二 SVG 组装 -> lessons/${sectionId}.json）`
+          ? `📝 阶段一已完成（已存 lessons/${sectionId}.stage1.json，仅需执行阶段二图表生成与组装 -> lessons/${sectionId}.json）`
           : '⏳ 待从阶段一开始生成';
       const wordsNote =
         slot.assignedWords && slot.assignedWords.length > 0
@@ -923,12 +923,8 @@ export function buildAgentExecutionPrompt(params: {
               })
               .join('')
           : '';
-      const assessedNote =
-        slot.lesson?.estimatedMinutes && slot.lesson.estimatedMinutes > 0
-          ? ` | 已评估学时：${slot.lesson.estimatedMinutes} 分钟`
-          : '';
       const promptDirNote = `\n  - 独立提示词目录：\`${workspaceDir}/prompts/${sectionId}/\`（阶段一：\`prompts/${sectionId}/agent-stage1-prompt.md\`，阶段二：\`prompts/${sectionId}/agent-stage2-prompt.md\`）`;
-      return `- **小节 \`${sectionId}\`（第 ${slot.dayIndex} 节）** -> 输出文件：\`${workspaceDir}/lessons/${sectionId}.json\` | 状态：${status}${assessedNote}\n  - 标题：${slot.title}\n  - 目标：${slot.objective}\n  - 教学范围与知识点：${slot.teachingScope || slot.keyTopics.join('、')}${wordsNote}${promptDirNote}${segNote}`;
+      return `- **小节 \`${sectionId}\`（第 ${slot.dayIndex} 节）** -> 输出文件：\`${workspaceDir}/lessons/${sectionId}.json\` | 状态：${status}\n  - 标题：${slot.title}\n  - 目标：${slot.objective}\n  - 教学范围与知识点：${slot.teachingScope || slot.keyTopics.join('、')}${wordsNote}${promptDirNote}${segNote}`;
     })
     .join('\n');
 
@@ -944,6 +940,7 @@ export function buildAgentExecutionPrompt(params: {
 
   return interpolateTemplate(blocks.templates.agentBatch, {
     courseId: course.id,
+    courseIdEncoded: encodeURIComponent(course.id),
     courseName: course.name,
     profileLabel: PROFILE_LABELS[resolvedProfile],
     levelLabel,
@@ -1127,6 +1124,7 @@ export function buildAgentSectionStagePrompt(params: {
   const sectionId = ensureStableSectionId(slot.dayIndex, slot.id);
   const stage1Path = `${workspaceDir}/lessons/${sectionId}.stage1.json`;
   const finalPath = `${workspaceDir}/lessons/${sectionId}.json`;
+  const validationInstruction = `完成最终课件后，请求本地应用的 \`GET /api/courses/${encodeURIComponent(course.id)}/agent-diagnostics/${encodeURIComponent(sectionId)}\`（应用地址和端口以运行配置为准，默认 http://127.0.0.1:3000）。响应的 report.issues 一次列出检测到的渲染问题及位置，report.hasErrors 指示是否有错误。直接修改文件并重复请求直到没有错误，尽可能处理警告。无需等待用户反馈或再次提问；若请求失败或问题无法修复，明确报告原因及剩余问题，不要声称通过。完成后提示用户同步本地文件。`;
 
   if (stage === 'stage2') {
     const stage2Core = buildLessonStage2DiagramsPrompt({
@@ -1137,9 +1135,11 @@ export function buildAgentSectionStagePrompt(params: {
     return [
       `# Agent 模式单节阶段二执行指令（${sectionId}）`,
       `- **读取阶段一产物**：\`${stage1Path}\`（如尚不存在，可对照本地已导入的规格）`,
-      `- **禁止改写阶段一正文与练习**：请只依据规格生成 SVG，并将其 \`svgCode\` 填入对应 \`diagrams\`（及对应练习的 \`diagramId\`），将完整合并后的 JSON（设 \`"generationStage": "complete"\`）保存为 \`${finalPath}\`。`,
+      `- **禁止改写阶段一正文与练习**：请只依据规格**优先生成 5 类零坐标结构化 \`diagramSpec\`**（\`grid-annot\` | \`plot2d\` | \`graph\` | \`wavedrom\` | \`circuit\`）；**仅当 5 类均不符合教学表达需求时**，才省略 \`diagramSpec\` 并回退生成深色高对比自由图表 \`svgCode\`（两者二选一）。将结果填入对应 \`diagrams\` 及关联练习题的 \`diagramId\`，设 \`"generationStage": "complete"\` 写入 \`${finalPath}\`。`,
       '',
       stage2Core,
+      '',
+      validationInstruction,
     ].join('\n');
   }
 
@@ -1170,6 +1170,9 @@ export function buildAgentSectionStagePrompt(params: {
     `- **输出文件路径**：请将阶段一结果写入 \`${stage1Path}\`（若本节无需任何配图，可直接设 \`"generationStage": "complete"\` 同时写入 \`${finalPath}\`）。`,
     '',
     chatStage1,
+    '',
+    `同一轮对话继续完成阶段二：读取阶段一的图示描述规格，优先生成 5 类结构化 diagramSpec（均不符合需求时再回退自由图表 svgCode）并合并写入 \`${finalPath}\`，将 generationStage 设为 complete；无需图示时直接写入最终文件。`,
+    validationInstruction,
   ].join('\n');
 }
 

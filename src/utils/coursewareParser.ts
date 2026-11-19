@@ -2,6 +2,7 @@ import type {
   CourseGenerationMode,
   DailyLessonContent,
   DailyPlanSlot,
+  DiagramSpec,
   ExerciseQuestion,
   ExerciseVariantCheck,
   KnowledgeCatalogNode,
@@ -10,8 +11,14 @@ import type {
   PdfSplitPlanItem,
 } from '../types';
 import {
+  isValidDiagramSpec,
+  normalizeRawDiagramSpecInput,
+  validateDiagramSpec,
+} from '../diagrams/schema';
+import {
   allocateSectionsToDays,
   ensureStableSectionId,
+  estimateWrittenLessonMinutes,
   extractReferencedRegionIds,
 } from './learningLogic';
 
@@ -268,26 +275,6 @@ export function resolveLessonAssetReferences(
   };
 }
 
-function estimateWrittenLessonMinutes(params: {
-  markdownBody: string;
-  diagramsCount: number;
-  exercisesCount: number;
-  heuristicsCount: number;
-  paragraphsCount?: number;
-}): number {
-  const textLen = (params.markdownBody || '').replace(/\s+/g, '').length;
-  const formulaCount = ((params.markdownBody || '').match(/\$\$[\s\S]*?\$\$|\$[^$\n]+\$/g) || [])
-    .length;
-  const proseMin = Math.min(45, Math.max(8, Math.round(textLen / 180)));
-  const formulaMin = Math.min(20, Math.round(formulaCount * 0.6));
-  const diagramMin = Math.min(18, params.diagramsCount * 4);
-  const exerciseMin = Math.min(35, params.exercisesCount * 5);
-  const heuristicMin = Math.min(15, params.heuristicsCount * 3);
-  const englishMin = Math.min(20, (params.paragraphsCount || 0) * 3);
-  const total = proseMin + formulaMin + diagramMin + exerciseMin + heuristicMin + englishMin;
-  return Math.max(20, Math.min(120, total));
-}
-
 /**
  * Repair common unescaped LaTeX backslashes and literal control characters inside JSON string literals.
  * Leaves already-valid escaped sequences (`\\alpha`, `\n`, `\"`, `\/`, `\uXXXX`) untouched, while
@@ -503,7 +490,10 @@ export function detectPastedCoursewareInputKind(
         (item) =>
           item &&
           typeof item === 'object' &&
-          (typeof item.svgCode === 'string' || typeof item.svg === 'string' || typeof item.id === 'string')
+          (typeof item.svgCode === 'string' ||
+            typeof item.svg === 'string' ||
+            Boolean(item.diagramSpec) ||
+            typeof item.id === 'string')
       );
       if (looksLikeDiagrams) {
         return options?.hasStage1Draft ? 'stage2' : options?.hasBaseLesson ? 'patch' : 'stage2';
@@ -540,15 +530,23 @@ export function detectPastedCoursewareInputKind(
       if (hasBody) {
         const diagPending =
           Array.isArray(parsed.diagrams) &&
-          parsed.diagrams.some((d: any) => d && !hasValidSvgMarkup(d.svgCode || d.svg));
+          parsed.diagrams.some(
+            (d: any) => d && !hasValidSvgMarkup(d.svgCode || d.svg) && !isValidDiagramSpec(d.diagramSpec)
+          );
         const exPending =
           Array.isArray(parsed.exercises) &&
           parsed.exercises.some(
-            (ex: any) => ex && (ex.diagramId || ex.topologySpec) && !hasValidSvgMarkup(ex.svgCode || ex.svg)
+            (ex: any) =>
+              ex &&
+              (ex.diagramId || ex.topologySpec) &&
+              !hasValidSvgMarkup(ex.svgCode || ex.svg) &&
+              !isValidDiagramSpec(ex.diagramSpec)
           );
         const anySvg =
           Array.isArray(parsed.diagrams) &&
-          parsed.diagrams.some((d: any) => d && hasValidSvgMarkup(d.svgCode || d.svg));
+          parsed.diagrams.some(
+            (d: any) => d && (hasValidSvgMarkup(d.svgCode || d.svg) || isValidDiagramSpec(d.diagramSpec))
+          );
         if ((diagPending && !anySvg) || ((diagPending || exPending) && parsed.generationStage !== 'complete')) {
           return 'stage1';
         }
@@ -567,6 +565,22 @@ export function detectPastedCoursewareInputKind(
 export function hasValidSvgMarkup(svgCode?: string): boolean {
   const code = (svgCode || '').trim();
   return Boolean(code && /<svg\b/i.test(code) && /<\/svg>/i.test(code));
+}
+
+export function normalizeDiagramSpecField(raw: unknown): DiagramSpec | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const res = validateDiagramSpec(raw);
+  if (res.success) return res.data;
+  return normalizeRawDiagramSpecInput(raw) as DiagramSpec;
+}
+
+export function hasValidDiagramContent(
+  d?: { svgCode?: string; svg?: string; diagramSpec?: unknown } | null
+): boolean {
+  if (!d) return false;
+  if (hasValidSvgMarkup(d.svgCode || d.svg)) return true;
+  if (d.diagramSpec && isValidDiagramSpec(d.diagramSpec)) return true;
+  return false;
 }
 
 export interface DiagramSpecItem {
@@ -605,7 +619,7 @@ export function extractPendingDiagramSpecs(lesson?: DailyLessonContent | null): 
     const diagId = (d.id || `diag-${i + 1}`).trim();
     const key = diagId.toLowerCase();
     if (seen.has(key)) continue;
-    if (!hasValidSvgMarkup(d.svgCode)) {
+    if (!hasValidDiagramContent(d)) {
       seen.add(key);
       specs.push({
         id: diagId,
@@ -620,15 +634,15 @@ export function extractPendingDiagramSpecs(lesson?: DailyLessonContent | null): 
 
   for (let i = 0; i < (lesson.exercises || []).length; i++) {
     const ex = lesson.exercises![i];
-    if (!ex || hasValidSvgMarkup(ex.svgCode)) continue;
+    if (!ex || hasValidDiagramContent(ex)) continue;
     const diagId = (ex.diagramId || '').trim();
     if (!diagId && !ex.topologySpec) continue;
     const resolvedId = diagId || `diag-${ex.id || `ex-${i + 1}`}`;
     const key = resolvedId.toLowerCase();
     if (seen.has(key)) continue;
-    // Check if diagrams already provides valid SVG for this ID
+    // Check if diagrams already provides valid SVG or diagramSpec for this ID
     const existingDiag = (lesson.diagrams || []).find(
-      (d) => (d.id || '').trim().toLowerCase() === key && hasValidSvgMarkup(d.svgCode)
+      (d) => (d.id || '').trim().toLowerCase() === key && hasValidDiagramContent(d)
     );
     if (existingDiag) continue;
     seen.add(key);
@@ -693,6 +707,7 @@ export function parseImportedLessonContent(
             d &&
             (typeof d.svgCode === 'string' ||
               typeof d.svg === 'string' ||
+              (d.diagramSpec && typeof d.diagramSpec === 'object') ||
               typeof d.topologySpec === 'string' ||
               typeof d.id === 'string' ||
               typeof d.title === 'string')
@@ -704,6 +719,7 @@ export function parseImportedLessonContent(
               : typeof d.svg === 'string' && d.svg.trim()
                 ? d.svg.trim()
                 : undefined;
+          const diagramSpec = normalizeDiagramSpecField(d.diagramSpec);
           return {
             id: d.id || `diag-${idx + 1}`,
             title: d.title || `图 ${slot.dayIndex}.${idx + 1}`,
@@ -713,6 +729,7 @@ export function parseImportedLessonContent(
                 ? d.topologySpec.trim()
                 : undefined,
             caption: d.caption || '',
+            ...(diagramSpec ? { diagramSpec } : {}),
             svgCode: rawSvg,
           };
         })
@@ -758,12 +775,14 @@ export function parseImportedLessonContent(
               ? ex.diagramId.trim()
               : undefined;
 
+          const rawDiagramSpec = normalizeDiagramSpecField(ex.diagramSpec);
+
           const rawTopologySpec =
             typeof ex.topologySpec === 'string' && ex.topologySpec.trim()
               ? ex.topologySpec.trim()
               : undefined;
 
-          if (rawSvgCode || (resolvedDiagramId && rawTopologySpec)) {
+          if (rawSvgCode || rawDiagramSpec || (resolvedDiagramId && rawTopologySpec)) {
             if (!resolvedDiagramId) {
               resolvedDiagramId = `diag-${id}`;
             }
@@ -779,6 +798,7 @@ export function parseImportedLessonContent(
                 topologySpec: rawTopologySpec,
                 caption:
                   typeof ex.diagramCaption === 'string' ? ex.diagramCaption.trim() : '',
+                ...(rawDiagramSpec ? { diagramSpec: rawDiagramSpec } : {}),
                 svgCode: rawSvgCode,
               });
             }
@@ -815,6 +835,7 @@ export function parseImportedLessonContent(
                 ? ex.topologySpec.trim()
                 : undefined,
             diagramId: resolvedDiagramId,
+            ...(rawDiagramSpec ? { diagramSpec: rawDiagramSpec } : {}),
             svgCode: rawSvgCode,
             diagramTitle:
               typeof ex.diagramTitle === 'string' && ex.diagramTitle.trim()
@@ -947,28 +968,13 @@ export function parseImportedLessonContent(
         connectionNote: slot.connectionNote || '',
       };
 
-    const rawLessonMinutes = Number(
-      parsedJson.estimatedMinutes ?? parsedJson.studyMinutes ?? parsedJson.durationMinutes
-    );
-    const evaluatedMinutes =
-      Number.isFinite(rawLessonMinutes) && rawLessonMinutes > 0
-        ? Math.max(10, Math.min(300, Math.round(rawLessonMinutes)))
-        : estimateWrittenLessonMinutes({
-          markdownBody,
-          diagramsCount: diagrams.length,
-          exercisesCount: exercises.length,
-          heuristicsCount: heuristicQuestions.length,
-          paragraphsCount: Array.isArray(parsedJson.englishPayload?.paragraphs)
-            ? parsedJson.englishPayload.paragraphs.length
-            : 0,
-        });
-
-    const hasPendingSpecs = diagrams.some((d) => !hasValidSvgMarkup(d.svgCode));
+    const hasPendingSpecs = diagrams.some((d) => !hasValidDiagramContent(d));
     const isStage1Draft =
       options?.stageMode === 'stage1' ||
       (options?.stageMode !== 'complete' &&
         (parsedJson.generationStage === 'stage1_content' ||
-          (hasPendingSpecs && diagrams.some((d) => Boolean(d.topologySpec) && !hasValidSvgMarkup(d.svgCode)))));
+          (hasPendingSpecs &&
+            diagrams.some((d) => Boolean(d.topologySpec) && !hasValidDiagramContent(d)))));
 
     const baseLesson: DailyLessonContent = {
       sectionId,
@@ -982,7 +988,6 @@ export function parseImportedLessonContent(
         typeof parsedJson.summary === 'string' && parsedJson.summary.trim()
           ? parsedJson.summary.trim()
           : slot.objective,
-      estimatedMinutes: evaluatedMinutes,
       ...(isStage1Draft
         ? { generationStage: 'stage1_content' as const }
         : parsedJson.generationStage === 'complete'
@@ -1006,6 +1011,7 @@ export function parseImportedLessonContent(
     };
 
     const sanitizedLesson = sanitizeLessonCitations(baseLesson);
+    sanitizedLesson.estimatedMinutes = estimateWrittenLessonMinutes(sanitizedLesson);
     const resolvedLesson = resolveLessonAssetReferences(sanitizedLesson, existingAssets);
     const unresolvedImageRefs = detectUnresolvedImageRefs(
       resolvedLesson.markdownBody,
@@ -1032,27 +1038,12 @@ export function parseImportedLessonContent(
     svgIdx++;
   }
 
-  const explicitMinuteMatch =
-    trimmed.match(/"estimatedMinutes"\s*:\s*(\d{1,3})/i) ||
-    trimmed.match(/(?:预计学习(?:时间|时长)|预计耗时)\s*[：:]\s*(\d{1,3})\s*(?:分钟|min)/i);
-  const explicitMinutes = explicitMinuteMatch ? Number(explicitMinuteMatch[1]) : NaN;
-  const fallbackMinutes =
-    Number.isFinite(explicitMinutes) && explicitMinutes > 0
-      ? Math.max(10, Math.min(300, Math.round(explicitMinutes)))
-      : estimateWrittenLessonMinutes({
-        markdownBody: trimmed,
-        diagramsCount: extractedDiagrams.length,
-        exercisesCount: 0,
-        heuristicsCount: 0,
-      });
-
   const baseLesson: DailyLessonContent = {
     sectionId,
     dayIndex: slot.dayIndex,
     date: slot.date,
     title: extractedTitle,
     summary: slot.objective,
-    estimatedMinutes: fallbackMinutes,
     keyPoints: slot.keyTopics,
     teachingContext: {
       prerequisites: slot.prerequisites || [],
@@ -1068,6 +1059,7 @@ export function parseImportedLessonContent(
   };
 
   const sanitizedLesson = sanitizeLessonCitations(baseLesson);
+  sanitizedLesson.estimatedMinutes = estimateWrittenLessonMinutes(sanitizedLesson);
   const resolvedLesson = resolveLessonAssetReferences(sanitizedLesson, existingAssets);
   const unresolvedImageRefs = detectUnresolvedImageRefs(
     resolvedLesson.markdownBody,
@@ -1220,7 +1212,7 @@ export function mergeStage2DiagramsIntoStage1(
 } {
   const trimmed = (rawStage2Input || '').trim();
   if (!trimmed) {
-    throw new Error('阶段二图示内容为空，请粘贴 Stage 2 输出的 SVG 图示 JSON。');
+    throw new Error('阶段二图示内容为空，请粘贴 Stage 2 输出的图表 JSON（diagramSpec 或自由 SVG）。');
   }
 
   let incomingDiags: any[] = [];
@@ -1278,7 +1270,10 @@ export function mergeStage2DiagramsIntoStage1(
         : typeof raw.svg === 'string' && raw.svg.trim()
           ? raw.svg.trim()
           : '';
-    if (!hasValidSvgMarkup(svgCode)) continue;
+    const diagramSpec = normalizeDiagramSpecField(raw.diagramSpec);
+    const hasSvg = hasValidSvgMarkup(svgCode);
+    const hasSpecObject = Boolean(diagramSpec && typeof diagramSpec === 'object' && !Array.isArray(diagramSpec));
+    if (!hasSvg && !hasSpecObject) continue;
 
     const rawId = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : '';
     const normIncoming = normalizeDiagKey(rawId);
@@ -1287,7 +1282,7 @@ export function mergeStage2DiagramsIntoStage1(
       ? mergedDiagrams.findIndex((d) => normalizeDiagKey(d.id) === normIncoming)
       : -1;
     if (targetIdx === -1 && mergedDiagrams.length > 0 && !rawId) {
-      targetIdx = mergedDiagrams.findIndex((d) => !hasValidSvgMarkup(d.svgCode));
+      targetIdx = mergedDiagrams.findIndex((d) => !hasValidDiagramContent(d));
     }
 
     if (targetIdx >= 0) {
@@ -1309,7 +1304,8 @@ export function mergeStage2DiagramsIntoStage1(
           prev.caption || (typeof raw.caption === 'string' && raw.caption.trim())
             ? prev.caption || String(raw.caption).trim()
             : '',
-        svgCode,
+        diagramSpec: hasSpecObject ? diagramSpec : undefined,
+        svgCode: hasSvg ? svgCode : undefined,
       };
       matchedCount++;
     } else {
@@ -1323,14 +1319,15 @@ export function mergeStage2DiagramsIntoStage1(
             ? raw.topologySpec.trim()
             : undefined,
         caption: typeof raw.caption === 'string' ? raw.caption.trim() : '',
-        svgCode,
+        ...(hasSpecObject ? { diagramSpec } : {}),
+        ...(hasSvg ? { svgCode } : {}),
       });
       addedCount++;
     }
   }
 
   if (matchedCount === 0 && addedCount === 0) {
-    throw new Error('阶段二输出中未包含合法闭合的 <svg>...</svg> 图形代码。');
+    throw new Error('阶段二输出中未包含合法的 diagramSpec 或闭合 <svg>...</svg> 图形代码。');
   }
 
   const updatedExercises = (stage1Lesson.exercises || []).map((ex) => {
@@ -1338,10 +1335,14 @@ export function mergeStage2DiagramsIntoStage1(
     const matchDiag = mergedDiagrams.find(
       (d) => normalizeDiagKey(d.id) === normalizeDiagKey(ex.diagramId)
     );
-    if (!matchDiag || !hasValidSvgMarkup(matchDiag.svgCode)) return ex;
+    if (!matchDiag) return ex;
+    const hasMatchSvg = hasValidSvgMarkup(matchDiag.svgCode);
+    const hasMatchSpec = Boolean(matchDiag.diagramSpec);
+    if (!hasMatchSvg && !hasMatchSpec) return ex;
     return {
       ...ex,
-      svgCode: matchDiag.svgCode,
+      diagramSpec: hasMatchSpec ? matchDiag.diagramSpec : undefined,
+      svgCode: hasMatchSvg ? matchDiag.svgCode : undefined,
       diagramTitle: ex.diagramTitle || matchDiag.title,
       diagramCaption: ex.diagramCaption || matchDiag.caption || undefined,
     };

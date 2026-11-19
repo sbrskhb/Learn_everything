@@ -1,5 +1,6 @@
 import {
   Course,
+  DailyLessonContent,
   DailyPlanSlot,
   DailyScheduleDay,
   ExerciseQuestion,
@@ -808,22 +809,42 @@ export function getSlotExerciseSubmission(
   return undefined;
 }
 
-/**
- * Return explicitly assessed study minutes (written lesson's `estimatedMinutes` first,
- * then explicit slot `estimatedMinutes`) WITHOUT falling back to pre-lesson heuristics.
- */
-export function getEvaluatedSectionMinutes(
-  slot: Partial<DailyPlanSlot>
-): number | undefined {
-  const lessonMinutes = Number(slot.lesson?.estimatedMinutes);
-  if (Number.isFinite(lessonMinutes) && lessonMinutes > 0) {
-    return Math.max(10, Math.min(300, Math.round(lessonMinutes)));
+/** Estimate study time from finished courseware, without trusting imported estimates. */
+export function estimateWrittenLessonMinutes(lesson: DailyLessonContent): number {
+  const body = (lesson.markdownBody || '')
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/<svg\b[\s\S]*?<\/svg>/gi, '')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\{\{[^}]+\}\}/g, '');
+  const displayMath = /\$\$([\s\S]*?)\$\$|\\\[([\s\S]*?)\\\]/g;
+  let derivationMinutes = 0;
+  for (const match of body.matchAll(displayMath)) {
+    const formula = match[1] ?? match[2];
+    const steps = formula.split(/\\\\|\\(?:Rightarrow|Longrightarrow|implies)/).filter((step) => step.trim()).length;
+    if (steps >= 2) derivationMinutes += steps > 4 ? 4 : 2;
   }
-  const raw = Number(slot.estimatedMinutes);
-  if (Number.isFinite(raw) && raw > 0) {
-    return Math.max(10, Math.min(300, Math.round(raw)));
-  }
-  return undefined;
+  const paragraphs = Array.isArray(lesson.englishPayload?.paragraphs) ? lesson.englishPayload.paragraphs : [];
+  const prose = [
+    body.replace(displayMath, '').replace(/\$[^$\n]+\$|\\\([^\n]*?\\\)/g, ''),
+    ...paragraphs.map(({ english, chinese }) => `${english || ''} ${chinese || ''}`),
+    lesson.englishPayload?.grammarAndUsageNotes || '',
+  ].join(' ');
+  const readingMinutes = (prose.match(/\p{Script=Han}/gu)?.length || 0) / 200
+    + (prose.match(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g)?.length || 0) / 150;
+  const concepts = new Set((lesson.keyPoints || []).map((point) => point.trim()).filter(Boolean));
+  const exerciseWeights = { basic: 2, application: 5, comprehensive: 10 };
+  const exerciseMinutes = (lesson.exercises || []).reduce((total, exercise) =>
+    total + (exercise.difficulty ? exerciseWeights[exercise.difficulty] ?? 5 : 5), 0);
+  const minutes = readingMinutes + concepts.size * 2 + derivationMinutes
+    + (lesson.diagrams?.length || 0) * 1.5 + exerciseMinutes
+    + (lesson.heuristicQuestions?.length || 0) * 2 + (lesson.reverseChecks?.length || 0) * 2;
+  return Math.max(1, Math.ceil(minutes));
+}
+
+export function getEvaluatedSectionMinutes(slot: Partial<DailyPlanSlot>): number | undefined {
+  return slot.lesson && slot.lesson.generationStage !== 'stage1_content'
+    ? estimateWrittenLessonMinutes(slot.lesson)
+    : undefined;
 }
 
 /**

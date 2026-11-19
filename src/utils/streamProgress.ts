@@ -1,3 +1,5 @@
+import type { CoursewareDiagnosticReport } from './coursewareDiagnostics';
+
 export type GenerationStage =
   | 'connecting'
   | 'preparing'
@@ -26,6 +28,7 @@ export interface GenerationProgressEvent {
   lesson?: any;
   stage1Draft?: any;
   pendingDiagramsCount?: number;
+  diagnosticReport?: CoursewareDiagnosticReport;
   error?: string;
 }
 
@@ -107,7 +110,7 @@ export function analyzeStreamedLessonBuffer(
   } else if (hasVisualsOrHeuristics) {
     step = 3;
     currentSectionLabel = detectedFields.includes('diagrams')
-      ? '同步绘制 SVG 原理图与标注 (diagrams)'
+      ? '正在生成教学图表与规格说明 (diagrams)'
       : '生成“先思考，后讲解”启发式问题 (heuristicQuestions)';
     basePercent = 56;
   } else if (hasBody) {

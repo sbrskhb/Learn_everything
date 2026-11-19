@@ -11,7 +11,7 @@ This file defines the copy-paste prompt templates for **Chat Mode** loaded by `s
 ## 1. Chat Mode Stage 1 Prompt — Teaching Content & Diagram Specs (`template: chat-lesson-stage1-prompt`)
 
 ````text
-请为我的课程《{{courseName}}》独立编写 **第 {{dayIndex}} 节（小节 ID：`{{sectionId}}`）：{{slotTitle}}** 的**阶段一课件（完整教学内容 + 图示规格，不生成 SVG）**。
+请为我的课程《{{courseName}}》独立编写 **第 {{dayIndex}} 节（小节 ID：`{{sectionId}}`）：{{slotTitle}}** 的**阶段一课件（完整教学内容 + 图表描述规格，不生成图表代码）**。
 （注：如有随附教材 PDF 或切分 PDF，请直接以多模态方式阅读 PDF 原文件本身，不依赖 OCR 文本。）
 
 ### 一、本节课程与资料上下文
@@ -29,14 +29,17 @@ This file defines the copy-paste prompt templates for **Chat Mode** loaded by `s
 
 ### 二、教学质量规范
 
+讲解例题、自测和练习必须按教材考点改编。重新组织题干，并至少改变数值、条件、所求量或情境之一，重新校验答案。定义、定理、通用公式和标准证明保持准确。
+
 {{teachingSystemPrompt}}
 
 ---
 
 ### 三、阶段一输出边界与 JSON 格式规则
-1. **不写 `<svg>` 代码**：专心把先修铺垫、正文直觉与连续推导、例题、启发题（`{{heuristic:hq-X}}`）和练习（`{{exercise:ex-X}}`）写深写透；**凡需要配图的位置**（正文 `{{diagram:diag-X}}` 或题目 `diagramId`），只在 `diagrams` 数组里提供清晰的 `id`、`title`、`topologySpec`（写明拓扑连接、元件参数、坐标刻度、参考方向、极性与关键状态）和 `caption`，**不要输出 `svgCode`**！导入 Learn_everything 后，第 2 阶段会自动提取这些规格生成专项绘图提示词（且阶段二**无需再上传 PDF**）。
+1. **禁止输出 `diagramSpec` 图表代码或 `<svg>` 源码**：专心把先修铺垫、正文直觉与连续推导、例题、启发题（`{{heuristic:hq-X}}`）和练习（`{{exercise:ex-X}}`）写深写透；**凡需要配图的位置**（正文 `{{diagram:diag-X}}` 或题目 `diagramId`），只在 `diagrams` 数组里提供清晰的 `id`、`title`、`topologySpec` 与 `caption`，**不要输出 `diagramSpec` 或 `svgCode`**。
+   - 请在 `topologySpec` 开头写明推荐图表类别 `[推荐类型: grid-annot | plot2d | graph | wavedrom | circuit | 自由图表(svgCode)]`，并写明阶段二所需全部参数（矩阵/格子与高亮对角线；函数表达式与坐标区间/阴影；节点与有向边；时序波形或寄存器位域；电路连接/参数/极性/电流方向；若 5 类均不符合需求则标为 `自由图表(svgCode)` 并详述几何构型）。导入 Learn_everything 后，第 2 阶段会自动提取这些规格生成专项图表提示词——优先生成 5 类结构化图表 `diagramSpec`，均不适用再回退自由图表 SVG（且阶段二**无需再上传 PDF**）。
 2. **扩展交互字段按需编写**：除练习 `question`/`answer` 等核心项外，`hint`、`explanation`、`wrongOptionsAnalysis`、`remediation`、`variantCheck`、`reverseChecks` 仅在具有实质教学价值时生成，勿机械凑数。
-3. **格式约定**：只输出一个合法 `json` 代码块；字符串内 LaTeX 反斜杠双写为 `\\`（如 `\\frac`、`\\text`）；`\text{...}` 内禁写裸下划线；正文中引用图号直接写 `图 diag-1`（勿加反引号）；全部内容完成后在 JSON 最后输出整数 `"estimatedMinutes"`。
+3. **格式约定**：只输出一个合法 `json` 代码块；字符串内 LaTeX 反斜杠双写为 `\\`（如 `\\frac`、`\\text`）；`\text{...}` 内禁写裸下划线；正文中引用图号直接写 `图 diag-1`（勿加反引号）。
 
 ```json
 {
@@ -60,7 +63,7 @@ This file defines the copy-paste prompt templates for **Chat Mode** loaded by `s
       "id": "diag-1",
       "title": "图 1：图示标题",
       "stageLabel": "阶段说明（可选）",
-      "topologySpec": "详细绘图规格：节点连接、元件参数、电流电压参考方向/极性、坐标系或工作状态标注",
+      "topologySpec": "[推荐类型: grid-annot | plot2d | graph | wavedrom | circuit | 自由图表(svgCode)] 详细图表描述规格：节点连接、元件参数/函数式/矩阵格子、电流电压参考方向/极性、坐标系或工作状态标注（阶段一禁止输出 diagramSpec 或 svgCode）",
       "caption": "详细教学图注"
     }
   ],
@@ -75,7 +78,7 @@ This file defines the copy-paste prompt templates for **Chat Mode** loaded by `s
       "difficulty": "basic",
       "categoryLabel": "概念辨析",
       "diagramId": "diag-ex-1",
-      "topologySpec": "若本题需配图在此说明规格，无图省略",
+      "topologySpec": "[推荐类型: ...] 若本题需配图在此说明规格，无图省略",
       "question": "练习题干",
       "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
       "answer": "A",
@@ -88,8 +91,7 @@ This file defines the copy-paste prompt templates for **Chat Mode** loaded by `s
   ],
   "reverseChecks": [
     { "id": "rc-1", "topic": "核心概念（按价值选填）", "prompt": "不用公式解释成立原因与适用条件", "keyPoints": ["要点1"], "referenceExplanation": "参考解释" }
-  ]{{englishPayloadField}},
-  "estimatedMinutes": 45
+  ]{{englishPayloadField}}
 }
 ```
 ````
@@ -117,14 +119,16 @@ This file defines the copy-paste prompt templates for **Chat Mode** loaded by `s
 
 ### 二、教学质量规范
 
+讲解例题、自测和练习必须按教材考点改编。重新组织题干，并至少改变数值、条件、所求量或情境之一，重新校验答案。定义、定理、通用公式和标准证明保持准确。
+
 {{teachingSystemPrompt}}
 
 ---
 
 ### 三、输出数据结构与格式规则（请只输出一个 `json` 代码块）
 - 扩展字段（`hint`、`explanation`、`wrongOptionsAnalysis`、`remediation`、`variantCheck`、`reverseChecks`）按实际教学价值选择性生成，勿机械凑数。
-- 每幅 SVG 先在 `topologySpec` 明确连接、参数与参考方向后再输出 `<svg viewBox="0 0 680 320" ...>...</svg>`（含题目专属配图 `diagramId`）。
-- JSON 字符串内 LaTeX 反斜杠双写 `\\`；`\text{...}` 内禁写裸下划线；正文中图号直接写 `图 diag-1`；在 JSON 最后一个字段输出整数 `"estimatedMinutes"`。
+- 每幅配图先在 `topologySpec` 明确推荐图表类型与连接/参数/参考方向后，**优先输出零坐标结构化 `diagramSpec`**（`grid-annot` / `plot2d` / `graph` / `wavedrom` / `circuit`）；**仅当这 5 类结构化图表均不符合需求时**，才省略 `diagramSpec` 并回退输出手写深色高对比自由图表 `svgCode`（`<svg viewBox="0 0 680 320" ...>...</svg>`，两者二选一；含题目专属配图 `diagramId`）。
+- JSON 字符串内 LaTeX 反斜杠双写 `\\`；`\text{...}` 内禁写裸下划线；正文中图号直接写 `图 diag-1`。
 
 ```json
 {
@@ -147,9 +151,12 @@ This file defines the copy-paste prompt templates for **Chat Mode** loaded by `s
       "id": "diag-1",
       "title": "图 1：图示标题",
       "stageLabel": "阶段一（可选）",
-      "topologySpec": "先明确节点连接、元件参数、电流电压参考方向与深色高对比样式",
+      "topologySpec": "[推荐类型: grid-annot | plot2d | graph | wavedrom | circuit | 自由图表(svgCode)] 先明确节点连接、元件参数、电流电压参考方向",
       "caption": "详细教学图注",
-      "svgCode": "<svg viewBox=\"0 0 680 320\" xmlns=\"http://www.w3.org/2000/svg\">...</svg>"
+      "diagramSpec": {
+        "type": "grid-annot | plot2d | graph | wavedrom | circuit"
+      },
+      "svgCode": "可选兜底（二选一）：仅当 5 类 diagramSpec 均不符合需求时省略 diagramSpec 并填写手写自由图表 <svg ...>...</svg>"
     }
   ],
   "heuristicQuestions": [
@@ -176,8 +183,7 @@ This file defines the copy-paste prompt templates for **Chat Mode** loaded by `s
   ],
   "reverseChecks": [
     { "id": "rc-1", "topic": "核心概念（按价值选填）", "prompt": "用自己的话解释成立原因与适用条件", "keyPoints": ["要点1"], "referenceExplanation": "参考解释" }
-  ]{{englishPayloadField}},
-  "estimatedMinutes": 45
+  ]{{englishPayloadField}}
 }
 ```
 ````
@@ -187,7 +193,7 @@ This file defines the copy-paste prompt templates for **Chat Mode** loaded by `s
 ## 3. Chat Mode Syllabus Prompt (`template: chat-syllabus-prompt`)
 
 ````text
-请为我的课程《{{courseName}}》制定一份完整课程大纲（当前为第 2 步：基于第 1 步教材切分结果划分为适合 AI 单节完整生成的教学小节；本步骤暂不按天排期，后续写完具体课件再由本地程序按 `estimatedMinutes` 自动排入学习日程）。
+请为我的课程《{{courseName}}》制定一份完整课程大纲（当前为第 2 步：基于第 1 步教材切分结果划分为适合 AI 单节完整生成的教学小节；本步骤暂不按天排期，后续写完具体课件再由本地程序按程序计算的学时 自动排入学习日程）。
 - **学科与水平**：{{profileLabel}}（{{levelLabel}}）
 - **课程目标**：{{courseGoal}}
 - **补充要求**：{{extraRequirements}}

@@ -1,15 +1,17 @@
 import katex from 'katex';
-import type { Course, DailyLessonContent, DailyPlanSlot } from '../types';
+import type { Course, DailyLessonContent, DailyPlanSlot, LessonDiagram } from '../types';
 import { resolveLearnerProfile } from './learnerProfile';
-import { ensureStableSectionId } from './learningLogic';
+import { ensureStableSectionId, estimateWrittenLessonMinutes } from './learningLogic';
 import {
   detectUnresolvedImageRefs,
+  normalizeDiagramSpecField,
   parseImportedLessonContent,
   repairUnescapedLatexInJsonString,
   resolveLessonAssetReferences,
   stripAiCitationArtifacts,
   tryParseJsonWithLatexRepair,
 } from './coursewareParser';
+import { validateDiagramSpec } from '../diagrams/schema';
 import {
   normalizeBareMathForMarkdown,
   normalizeMathUnicodeToLatex,
@@ -479,7 +481,11 @@ ${issueLines.join('\n\n')}
       "id": "缺失或需修复的图示 ID（如 diag-3b）",
       "title": "图示标题",
       "caption": "详细教学图注（公式用 $...$ 包裹）",
-      "svgCode": "<svg viewBox=\\"0 0 680 320\\" xmlns=\\"http://www.w3.org/2000/svg\\">...</svg>"
+      "diagramSpec": {
+        "type": "grid-annot | plot2d | graph | wavedrom | circuit",
+        "...": "推荐优先提供 5 类零坐标结构化 diagramSpec"
+      },
+      "svgCode": "二者二选一：仅当上述 5 类 diagramSpec 均不符合需求时，省略 diagramSpec 并退回提供自由图表 <svg viewBox=\\"0 0 680 320\\" xmlns=\\"http://www.w3.org/2000/svg\\">...</svg>"
     }
   ]`);
   }
@@ -532,6 +538,22 @@ export function auditCoursewareRendering(
     index: idx + 1,
   }));
 
+  (resolved.exercises || []).forEach((ex, exIdx) => {
+    if (ex.diagramSpec !== undefined || (ex.svgCode && ex.svgCode.includes('<svg'))) {
+      const exDiagId = (ex.diagramId || `diag-${ex.id || `ex-${exIdx + 1}`}`).trim();
+      if (!visuals.some((v) => v.id.toLowerCase() === exDiagId.toLowerCase())) {
+        visuals.push({
+          id: exDiagId,
+          title: stripAiCitationArtifacts(ex.diagramTitle || `练习题 #${exIdx + 1} 配图`),
+          caption: ex.diagramCaption ? stripAiCitationArtifacts(ex.diagramCaption) : undefined,
+          kind: 'svg',
+          svgCode: ex.svgCode,
+          index: visuals.length + 1,
+        });
+      }
+    }
+  });
+
   const rawBody = resolved.markdownBody || '';
   const imgRegex = /!\[([^\]]*)\]\(([^)\s]+)\)/g;
   let imgMatch: RegExpExecArray | null;
@@ -548,10 +570,28 @@ export function auditCoursewareRendering(
     });
   }
 
-  // 1. Audit SVG diagrams structure (Stage 1 allows diagram specs without svgCode)
+  // 1. Audit SVG diagrams & structured diagramSpec (Stage 1 allows diagram specs without svgCode/diagramSpec)
   (resolved.diagrams || []).forEach((d, idx) => {
     const diagId = (d.id || `diag-${idx + 1}`).trim();
     const code = (d.svgCode || '').trim();
+
+    if (d.diagramSpec !== undefined) {
+      const specResult = validateDiagramSpec(d.diagramSpec);
+      if (!specResult.success) {
+        issues.push({
+          id: `diagramspec-invalid-${issues.length + 1}`,
+          severity: 'error',
+          category: 'svg_error',
+          categoryLabel: '结构化图表 diagramSpec 校验失败',
+          locationLabel: `diagrams[${idx}] (${diagId})`,
+          rawSnippet: truncateSnippet(JSON.stringify(d.diagramSpec)),
+          detail: `图示 ${diagId} 的 diagramSpec 字段未通过确定性引擎校验：${specResult.error}。`,
+          fixInstruction: `修复 ${diagId} 的 diagramSpec 结构或必填字段（${specResult.error}），支持的图表类型为 grid-annot、plot2d、graph、wavedrom、circuit。`,
+        });
+      }
+      return;
+    }
+
     if (isStage1 && !code) {
       if (!d.topologySpec?.trim() && !d.caption?.trim()) {
         issues.push({
@@ -562,12 +602,23 @@ export function auditCoursewareRendering(
           locationLabel: `diagrams[${idx}] (${diagId})`,
           rawSnippet: truncateSnippet(d.title || diagId),
           detail: `阶段一图示 ${diagId} 尚未包含 topologySpec 或 caption 绘图规格，阶段二可能缺少足够绘图依据。`,
-          fixInstruction: `为 ${diagId} 补充 topologySpec（节点连接、元件参数、物理量与参考方向说明）。`,
+          fixInstruction: `为 ${diagId} 补充 topologySpec（标明推荐图表类型 grid-annot/plot2d/graph/wavedrom/circuit/自由图表，并写清节点连接、元件参数、函数范围、物理量与参考方向说明；阶段一无需输出 diagramSpec 或 svgCode）。`,
         });
       }
       return;
     }
-    if (!code || !/<svg\b/i.test(code) || !/<\/svg>/i.test(code)) {
+    if (code && (code.includes('\\<') || code.includes('\\"'))) {
+      issues.push({
+        id: `svg-escaped-${issues.length + 1}`,
+        severity: 'error',
+        category: 'svg_error',
+        categoryLabel: 'SVG 源码含非法反斜杠转义',
+        locationLabel: `diagrams[${idx}] (${diagId})`,
+        rawSnippet: truncateSnippet(code.slice(0, 120)),
+        detail: `图示 ${diagId} 的 SVG 源码包含 \\< 或 \\" 转义符，浏览器会将其视为无效标记，导致矢量图无法渲染。`,
+        fixInstruction: `清理 ${diagId} 的 svgCode 中所有多余的反斜杠转义（如 \\<、\\"、\\:、\\.），保留标准 XML/SVG 标签与双引号。`,
+      });
+    } else if (!code || !/<svg\b/i.test(code) || !/<\/svg>/i.test(code)) {
       issues.push({
         id: `svg-broken-${issues.length + 1}`,
         severity: 'error',
@@ -575,8 +626,8 @@ export function auditCoursewareRendering(
         categoryLabel: 'SVG 图示代码不完整',
         locationLabel: `diagrams[${idx}] (${diagId})`,
         rawSnippet: truncateSnippet(code || '(空 SVG)'),
-        detail: `图示 ${diagId} 缺少完整的 <svg ...>...</svg> 闭合标签，无法正确绘制原理图。`,
-        fixInstruction: `补全 ${diagId} 的完整合法 <svg viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg">...</svg> 矢量代码。`,
+        detail: `图示 ${diagId} 缺少合法的 diagramSpec 或完整的 <svg ...>...</svg> 闭合标签，无法正确绘制原理图。`,
+        fixInstruction: `为 ${diagId} 补充结构化 diagramSpec（推荐），或补全合法的 <svg viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg">...</svg> 矢量代码。`,
       });
     } else if (!/viewBox\s*=/i.test(code)) {
       issues.push({
@@ -591,6 +642,41 @@ export function auditCoursewareRendering(
       });
     }
   });
+
+  // 1b. Audit any fenced ```diagram[:type] blocks inside markdownBody
+  const diagFenceRe = /```diagram(?:\s*:\s*([a-z0-9_-]+))?\r?\n([\s\S]*?)```/gi;
+  let dfMatch: RegExpExecArray | null;
+  while ((dfMatch = diagFenceRe.exec(rawBody)) !== null) {
+    const fenceType = dfMatch[1]?.trim().toLowerCase();
+    const bodyJson = (dfMatch[2] || '').trim();
+    const parsedFence = tryParseJsonWithLatexRepair(bodyJson);
+    if (!parsedFence || typeof parsedFence !== 'object' || Array.isArray(parsedFence)) {
+      issues.push({
+        id: `fenced-diagram-json-${issues.length + 1}`,
+        severity: 'error',
+        category: 'svg_error',
+        categoryLabel: 'Markdown 内联图表代码块 JSON 解析失败',
+        locationLabel: `课件正文（第 ${findLineNumber(rawBody, dfMatch.index)} 行附近）`,
+        rawSnippet: truncateSnippet(dfMatch[0]),
+        detail: '检测到 ```diagram 代码块内容不是合法 JSON 对象。',
+        fixInstruction: '请检查并修复该 ```diagram 代码块内的 JSON 语法。',
+      });
+      continue;
+    }
+    const fenceCheck = validateDiagramSpec(parsedFence, fenceType);
+    if (!fenceCheck.success) {
+      issues.push({
+        id: `fenced-diagram-spec-${issues.length + 1}`,
+        severity: 'error',
+        category: 'svg_error',
+        categoryLabel: 'Markdown 内联图表规格校验失败',
+        locationLabel: `课件正文（第 ${findLineNumber(rawBody, dfMatch.index)} 行附近）`,
+        rawSnippet: truncateSnippet(dfMatch[0]),
+        detail: `内联 \`\`\`diagram 代码块未通过校验：${fenceCheck.error}。`,
+        fixInstruction: `修复该内联图表代码块的参数：${fenceCheck.error}。`,
+      });
+    }
+  }
 
   // 2. Audit math/LaTeX across all text fields
   auditFieldMath({
@@ -753,6 +839,28 @@ export function auditCoursewareRendering(
   });
   (resolved.exercises || []).forEach((ex, idx) => {
     const label = `练习题 #${idx + 1} (${ex.id})`;
+    if (ex.diagramSpec !== undefined) {
+      const matchingDiag = ex.diagramId
+        ? (resolved.diagrams || []).find(
+            (d) => (d.id || '').trim().toLowerCase() === ex.diagramId!.trim().toLowerCase()
+          )
+        : undefined;
+      if (!matchingDiag || matchingDiag.diagramSpec === undefined) {
+        const exSpecCheck = validateDiagramSpec(ex.diagramSpec);
+        if (!exSpecCheck.success) {
+          issues.push({
+            id: `ex-diagramspec-invalid-${issues.length + 1}`,
+            severity: 'error',
+            category: 'svg_error',
+            categoryLabel: '练习题配图 diagramSpec 校验失败',
+            locationLabel: `${label} · diagramSpec`,
+            rawSnippet: truncateSnippet(JSON.stringify(ex.diagramSpec)),
+            detail: `练习题 ${ex.id} 的 diagramSpec 未通过校验：${exSpecCheck.error}。`,
+            fixInstruction: `修复练习题 ${ex.id} 的 diagramSpec 参数（${exSpecCheck.error}）。`,
+          });
+        }
+      }
+    }
     if (ex.diagramId && !resolveVisualRefByToken(ex.diagramId, visuals)) {
       const dedupKey = `ex-diag:${ex.diagramId.toLowerCase()}`;
       if (!reportedMissingDiagIds.has(dedupKey)) {
@@ -1436,30 +1544,62 @@ export function applyCoursewareRepairPatch(
           for (const rawD of diagsInput) {
             if (!rawD || typeof rawD !== 'object') continue;
             const id = String(rawD.id || `diag-${existingDiags.length + 1}`).trim();
-            const svgCode = String(rawD.svgCode || '').trim();
-            if (!svgCode) continue;
-            const newDiag = {
+            const svgCode =
+              typeof rawD.svgCode === 'string' && rawD.svgCode.trim()
+                ? rawD.svgCode.trim()
+                : typeof rawD.svg === 'string' && rawD.svg.trim()
+                  ? rawD.svg.trim()
+                  : '';
+            const diagramSpec = normalizeDiagramSpecField(rawD.diagramSpec);
+            if (!svgCode && !diagramSpec) continue;
+
+            const idx = existingDiags.findIndex((d) => (d.id || '').toLowerCase() === id.toLowerCase());
+            const prev = idx >= 0 ? existingDiags[idx] : undefined;
+            const newDiag: LessonDiagram = {
               id,
-              title: stripAiCitationArtifacts(String(rawD.title || id)),
+              title: stripAiCitationArtifacts(String(rawD.title || prev?.title || id)),
               stageLabel: rawD.stageLabel
                 ? stripAiCitationArtifacts(String(rawD.stageLabel))
-                : undefined,
+                : prev?.stageLabel,
               topologySpec: rawD.topologySpec
                 ? stripAiCitationArtifacts(String(rawD.topologySpec))
-                : undefined,
-              caption: stripAiCitationArtifacts(String(rawD.caption || rawD.title || '')),
-              svgCode,
+                : prev?.topologySpec,
+              caption: stripAiCitationArtifacts(
+                String(rawD.caption || prev?.caption || rawD.title || '')
+              ),
+              diagramSpec: diagramSpec
+                ? diagramSpec
+                : svgCode
+                  ? undefined
+                  : prev?.diagramSpec,
+              svgCode: svgCode
+                ? svgCode
+                : diagramSpec
+                  ? undefined
+                  : prev?.svgCode,
             };
-            const idx = existingDiags.findIndex((d) => (d.id || '').toLowerCase() === id.toLowerCase());
             if (idx >= 0) {
               existingDiags[idx] = newDiag;
             } else {
               existingDiags.push(newDiag);
             }
-            // Also sync to any exercise that references this diagramId
+            // Also sync to any exercise that references this diagramId (clearing stale dual field on mode switch)
             cloned.exercises = (cloned.exercises || []).map((ex) =>
               ex.diagramId && ex.diagramId.toLowerCase() === id.toLowerCase()
-                ? { ...ex, svgCode, diagramTitle: ex.diagramTitle || newDiag.title }
+                ? {
+                    ...ex,
+                    diagramSpec: diagramSpec
+                      ? diagramSpec
+                      : svgCode
+                        ? undefined
+                        : ex.diagramSpec,
+                    svgCode: svgCode
+                      ? svgCode
+                      : diagramSpec
+                        ? undefined
+                        : ex.svgCode,
+                    diagramTitle: ex.diagramTitle || newDiag.title,
+                  }
                 : ex
             );
             upsertedDiagrams++;
@@ -1542,13 +1682,6 @@ export function applyCoursewareRepairPatch(
           replacementHits++;
         }
 
-        const explicitPatchMinutes = Number(
-          parsedObj.estimatedMinutes ?? parsedObj.studyMinutes ?? parsedObj.durationMinutes
-        );
-        if (Number.isFinite(explicitPatchMinutes) && explicitPatchMinutes > 0) {
-          cloned.estimatedMinutes = Math.max(10, Math.min(300, Math.round(explicitPatchMinutes)));
-        }
-
         const summaryParts: string[] = [];
         if (updatedContext > 0) summaryParts.push('更新先修诊断与教学上下文');
         if (replacementHits > 0) summaryParts.push(`局部替换 ${replacementHits} 处公式/文本片段`);
@@ -1556,6 +1689,7 @@ export function applyCoursewareRepairPatch(
         if (upsertedExercises > 0) summaryParts.push(`增量更新 ${upsertedExercises} 道练习题`);
         if (upsertedHeuristics > 0) summaryParts.push(`增量更新 ${upsertedHeuristics} 个启发思考节点`);
 
+        cloned.estimatedMinutes = estimateWrittenLessonMinutes(cloned);
         return {
           mergedLesson: cloned,
           appliedMode: 'patch_json',
@@ -1609,6 +1743,7 @@ export function applyCoursewareRepairPatch(
       }
     });
     cloned.diagrams = existingDiags;
+    cloned.estimatedMinutes = estimateWrittenLessonMinutes(cloned);
     return {
       mergedLesson: cloned,
       appliedMode: 'bare_svg',
@@ -1637,6 +1772,7 @@ export function applyCoursewareRepairPatch(
         ? parsedFull.lesson.symbolGlossary
         : cloned.symbolGlossary,
   };
+  mergedFull.estimatedMinutes = estimateWrittenLessonMinutes(mergedFull);
   return {
     mergedLesson: mergedFull,
     appliedMode: 'full_replace',
@@ -1750,9 +1886,9 @@ export function buildStageRepairPrompt(params: {
 \`\`\``;
   }
 
-  return `请仅局部修复或重绘 ${contextLine} 的**【电路/几何拓扑规范与 SVG 图示阶段】**（无需重生成全文）：${issueNote}
+  return `请仅局部修复或重绘 ${contextLine} 的**【电路/几何拓扑规范与图示阶段】**（无需重生成全文）：${issueNote}
 - 已有图示 ID：\`${existingDiagIds}\`
-- 硬性要求：先在每项 \`"topologySpec"\` 明确写出**节点连接、元件参数、电流/电压参考方向（箭头/+ -）或坐标系边界**，再严格按此拓扑生成适配**深色背景**的高对比 \`<svg viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg">...</svg>\`，确保图中符号与正文公式 100% 一致（长文本请拆行并留足边距）。
+- 推荐方式（两者二选一）：**优先**输出 5 类零坐标结构化 \`"diagramSpec"\`（\`grid-annot\` | \`plot2d\` | \`graph\` | \`wavedrom\` | \`circuit\`）；**仅当上述 5 类均不符合需求时**，才省略 \`"diagramSpec"\` 并写 \`"topologySpec"\` 后回退生成适配**深色背景**的自由图表 \`<svg viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg">...</svg>\` 填入 \`"svgCode"\`。
 
 请严格只输出增量 JSON 补丁：
 \`\`\`json
@@ -1763,7 +1899,9 @@ export function buildStageRepairPrompt(params: {
       "title": "图 1：图示标题",
       "topologySpec": "节点连接、元件参数与参考方向完整定义",
       "caption": "图示与正文公式符号对照说明（公式用 $...$）",
-      "svgCode": "<svg viewBox=\\"0 0 680 320\\" xmlns=\\"http://www.w3.org/2000/svg\\">...</svg>"
+      "diagramSpec": {
+        "type": "grid-annot | plot2d | graph | wavedrom | circuit"
+      }
     }
   ]
 }

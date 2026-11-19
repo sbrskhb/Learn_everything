@@ -1,3 +1,7 @@
+import type { DiagramSpec } from './diagrams/schema';
+
+export type { DiagramSpec };
+
 export type CourseCategory = 'general' | 'stem' | 'english';
 
 export type SubjectProfile =
@@ -71,6 +75,7 @@ export interface ExerciseQuestion {
   categoryLabel?: string;          // 例如：概念辨析 / 直接应用 / 错误分析 / 知识迁移
   diagramId?: string;              // 关联的题目配图 ID（如 "diag-ex-1"），当题目需要复杂描述才能画出的电路/几何/物理图时内嵌展示
   topologySpec?: string;           // 复杂题设配图生成 SVG 前确定的电路拓扑、节点连接、元件参数与参考方向说明
+  diagramSpec?: DiagramSpec;       // 可选：结构化确定性图表规格（优先于手写 svgCode 编译为矢量 SVG）
   svgCode?: string;                // 可选：直接内联在练习题对象上的 SVG 代码
   diagramTitle?: string;           // 可选：题目配图标题
   diagramCaption?: string;         // 可选：题目配图图注说明
@@ -90,6 +95,7 @@ export interface LessonDiagram {
   stageLabel?: string;             // 例如：阶段一：静态工作点建立 / 阶段二：交流小信号叠加
   topologySpec?: string;           // 绘图规格：拓扑连接、元件参数、物理量、参考方向及坐标系要求
   caption: string;                 // 图示与正文的对应说明（标明部件、物理量、方向及相互关系）
+  diagramSpec?: DiagramSpec;       // 可选：结构化确定性图表规格（优先于手写 svgCode 编译为矢量 SVG）
   svgCode?: string;                // 内联 SVG 代码（阶段一仅输出规格时可为空，由阶段二组装补全）
 }
 
@@ -191,7 +197,7 @@ export interface DailyLessonContent {
   date: string;                    // YYYY-MM-DD
   title: string;
   summary: string;
-  estimatedMinutes?: number;       // 写完本节具体课件后评估的预计学习时长（分钟，唯一负荷指标）
+  estimatedMinutes?: number;       // 程序根据完整课件计算的预计学习时长（分钟）
   generationStage?: 'stage1_content' | 'complete'; // 两阶段生成状态（省略则视为 complete）
   keyPoints: string[];
   teachingContext?: LessonTeachingContext;
@@ -348,6 +354,7 @@ export interface AppSettings {
   defaultCustomLearnerBaseline?: string;
   defaultLearningDepth?: LearningDepthPreset;
   defaultCustomLearningDepth?: string;
+  showLessonTools?: boolean;
   showAdvancedWorkflowDetails?: boolean;
   showContentCategoryBadges?: boolean;
   remoteAccessEnabled?: boolean;

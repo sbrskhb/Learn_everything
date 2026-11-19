@@ -65,16 +65,23 @@ import {
   detectPastedCoursewareInputKind,
   detectUnresolvedImageRefs,
   extractPendingDiagramSpecs,
+  hasValidDiagramContent,
   mergeStage2DiagramsIntoStage1,
   parseImportedLessonContent,
   resolveLessonAssetReferences,
   stripAiCitationArtifacts,
 } from '../utils/coursewareParser';
 import {
+  DiagramRenderer,
+  hydrateAsyncMarkdownDiagrams,
+  useCompiledLessonDiagrams,
+} from './DiagramRenderer';
+import {
   applyCoursewareRepairPatch,
   auditCoursewareRendering,
   auditRawCoursewareInput,
   buildStageRepairPrompt,
+  type CoursewareDiagnosticReport,
   type LessonGenerationStage,
 } from '../utils/coursewareDiagnostics';
 import {
@@ -85,10 +92,72 @@ import {
 } from '../utils/latexSymbols';
 import {
   copyCourseFileToClipboard,
+  copyPromptText,
   copyPromptMarkdownFileToClipboard,
 } from '../utils/clipboardFile';
 import { generateLessonWithProgressStream } from '../utils/streamLessonClient';
 import type { GenerationProgressEvent } from '../utils/streamProgress';
+
+const SAFE_EMPTY_AUDIT_REPORT: CoursewareDiagnosticReport = {
+  hasErrors: false,
+  errorCount: 0,
+  warningCount: 0,
+  issues: [],
+  repairPrompt: '',
+  summaryText: '',
+};
+
+function safeAuditCoursewareRendering(
+  lesson: DailyLessonContent,
+  customAssets?: Record<string, string>,
+  options?: { stage?: 'stage1' | 'complete' }
+): CoursewareDiagnosticReport {
+  try {
+    return auditCoursewareRendering(lesson, customAssets, options);
+  } catch (err) {
+    console.warn('[LessonView] auditCoursewareRendering fallback:', err);
+    return SAFE_EMPTY_AUDIT_REPORT;
+  }
+}
+
+function hasMathPreviewSignal(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  return /[\\^_${}()[\]|√=<>+*/α-ωΑ-Ω]/.test(trimmed);
+}
+
+function renderLiveMathPreview(value: string, visuals?: VisualAssetRef[]): string {
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  const normalized =
+    !trimmed.includes('$') && /\\[A-Za-z]+|[_^]/.test(trimmed) && !/[\u4e00-\u9fff]/.test(trimmed)
+      ? `$${trimmed}$`
+      : trimmed;
+  return renderInlineMathWithLatex(normalized, visuals);
+}
+
+function renderInputMathPreviewBox(
+  value: string,
+  visuals: VisualAssetRef[],
+  testId: string,
+  surfaceClass = 'bg-neutral-950/80'
+): React.ReactNode {
+  if (!hasMathPreviewSignal(value)) return null;
+  return (
+    <div
+      data-testid={testId}
+      className={`px-2.5 py-1.5 rounded border border-sky-900/50 ${surfaceClass} text-xs text-neutral-200 flex items-center gap-2 overflow-x-auto`}
+    >
+      <span className="text-[11px] font-mono text-sky-400 shrink-0">公式预览：</span>
+      <span
+        className="[&>p]:m-0"
+        dangerouslySetInnerHTML={{
+          __html: renderLiveMathPreview(value, visuals),
+        }}
+      />
+    </div>
+  );
+}
 
 interface LessonViewProps {
   course: Course;
@@ -97,13 +166,13 @@ interface LessonViewProps {
   onBack: (e?: React.MouseEvent) => void;
   onSelectDayIndex?: (dayIndex: number) => void;
   onCourseUpdated: (updatedCourse: Course) => void;
-  onOpenAgentModal: (course: Course) => void;
   onOpenOutlineModal?: (
     course: Course,
     step?: OutlineWorkbenchStep
   ) => void;
   onLiveStudySecondsChange?: (seconds: number) => void;
   onStudyStatsUpdated?: (stats: StudyStats) => void;
+  showLessonTools?: boolean;
   showContentCategoryBadges?: boolean;
 }
 
@@ -120,10 +189,10 @@ export const LessonView: React.FC<LessonViewProps> = ({
   onBack,
   onSelectDayIndex,
   onCourseUpdated,
-  onOpenAgentModal,
   onOpenOutlineModal,
   onLiveStudySecondsChange,
   onStudyStatsUpdated,
+  showLessonTools = false,
   showContentCategoryBadges = false,
 }) => {
   const [isRegenerating, setIsRegenerating] = useState(false);
@@ -143,6 +212,14 @@ export const LessonView: React.FC<LessonViewProps> = ({
   const [isChatWorkbenchOpen, setIsChatWorkbenchOpen] = useState<boolean>(
     !slot.lesson && (course.generationMode === 'chat' || course.generationMode === 'agent')
   );
+  useEffect(() => {
+    if (!isChatWorkbenchOpen) return;
+    const close = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !event.defaultPrevented) setIsChatWorkbenchOpen(false);
+    };
+    window.addEventListener('keydown', close);
+    return () => window.removeEventListener('keydown', close);
+  }, [isChatWorkbenchOpen]);
   const [workbenchTab, setWorkbenchTab] = useState<'chat' | 'agent' | 'edit'>(
     course.generationMode === 'agent' ? 'agent' : 'chat'
   );
@@ -150,7 +227,13 @@ export const LessonView: React.FC<LessonViewProps> = ({
   const [chatStage1Prompt, setChatStage1Prompt] = useState<string>('');
   const [chatStage2Prompt, setChatStage2Prompt] = useState<string>('');
   const [isLoadingChatPrompt, setIsLoadingChatPrompt] = useState(false);
-  const [copiedPrompt, setCopiedPrompt] = useState(false);
+  const [copiedChatPromptKey, setCopiedChatPromptKey] = useState<
+    'stage1' | 'stage2' | 'quick-stage2' | 'manual' | null
+  >(null);
+  const [chatPromptCopyNotice, setChatPromptCopyNotice] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
   const [copiedMdKey, setCopiedMdKey] = useState<string | null>(null);
   const [showChatManualPaste, setShowChatManualPaste] = useState(false);
 
@@ -170,6 +253,14 @@ export const LessonView: React.FC<LessonViewProps> = ({
   const [rawImportInput, setRawImportInput] = useState<string>('');
   const [pendingAssets, setPendingAssets] = useState<Record<string, string>>({});
   const [previewLesson, setPreviewLesson] = useState<DailyLessonContent | null>(null);
+  const [latchedImportAudit, setLatchedImportAudit] = useState<{
+    report: ReturnType<typeof auditCoursewareRendering>;
+    parsedLesson: DailyLessonContent | null;
+  } | null>(null);
+  const [manualPromptPreview, setManualPromptPreview] = useState<{
+    title: string;
+    text: string;
+  } | null>(null);
   const [unresolvedImages, setUnresolvedImages] = useState<string[]>([]);
   const [importError, setImportError] = useState<string | null>(null);
   const [importSuccessMsg, setImportSuccessMsg] = useState<string | null>(null);
@@ -179,6 +270,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
   const [editTitle, setEditTitle] = useState(slot.lesson?.title || slot.title);
   const [editSummary, setEditSummary] = useState(slot.lesson?.summary || slot.objective);
   const [editMarkdown, setEditMarkdown] = useState(slot.lesson?.markdownBody || '');
+  const [showEditPreview, setShowEditPreview] = useState(false);
   const [isSavingEdit, setIsSavingEdit] = useState(false);
 
   // English reading interactive states (100% offline-capable)
@@ -257,6 +349,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
   const [floatingOffset, setFloatingOffset] = useState<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
   const dragStateRef = useRef<{
     dragging: boolean;
+    pointerId?: number;
     startX: number;
     startY: number;
     origDx: number;
@@ -265,6 +358,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
   // Interactive LaTeX symbol explanation popover states (for symbols explained earlier in the lesson)
   const articleRef = useRef<HTMLElement | null>(null);
+  const editPreviewRef = useRef<HTMLDivElement | null>(null);
   const [activeSymbolPopover, setActiveSymbolPopover] = useState<{
     entry: ResolvedLessonSymbol;
     rect: { left: number; top: number; bottom: number; width: number };
@@ -313,11 +407,16 @@ export const LessonView: React.FC<LessonViewProps> = ({
   useEffect(() => {
     setRawImportInput('');
     setPreviewLesson(null);
+    setLatchedImportAudit(null);
+    setManualPromptPreview(null);
     setUnresolvedImages([]);
     setImportError(null);
     setImportSuccessMsg(null);
     setPendingAssets({});
     setPdfCopyNotice(null);
+    setChatPromptCopyNotice(null);
+    setCopiedChatPromptKey(null);
+    setCopiedQuickPrompt(false);
     setRegenError(null);
     setRegenProgress(null);
     setRegenSuccessSummary(null);
@@ -432,7 +531,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
       }
     };
     const handlePointerMove = (e: PointerEvent) => {
-      if (!dragStateRef.current.dragging) return;
+      if (!dragStateRef.current.dragging || dragStateRef.current.pointerId !== e.pointerId) return;
       const nextDx = dragStateRef.current.origDx + (e.clientX - dragStateRef.current.startX);
       const nextDy = dragStateRef.current.origDy + (e.clientY - dragStateRef.current.startY);
       setFloatingOffset({
@@ -440,16 +539,18 @@ export const LessonView: React.FC<LessonViewProps> = ({
         dy: Math.max(-window.innerHeight + 120, Math.min(24, nextDy)),
       });
     };
-    const handlePointerUp = () => {
-      dragStateRef.current.dragging = false;
+    const handlePointerUp = (e: PointerEvent) => {
+      if (dragStateRef.current.pointerId === e.pointerId) dragStateRef.current.dragging = false;
     };
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('pointermove', handlePointerMove);
     window.addEventListener('pointerup', handlePointerUp);
+      window.addEventListener('pointercancel', handlePointerUp);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('pointercancel', handlePointerUp);
     };
   }, [floatingVisualId]);
 
@@ -502,7 +603,13 @@ export const LessonView: React.FC<LessonViewProps> = ({
       });
   }, [course.id, slot.dayIndex]);
 
-  const isStage2PendingChat = Boolean(slot.stage1Draft && !slot.lesson && chatStage2Prompt);
+  const pendingLessonSpecs = useMemo(
+    () => extractPendingDiagramSpecs(previewLesson || slot.stage1Draft || slot.lesson),
+    [previewLesson, slot.stage1Draft, slot.lesson]
+  );
+  const isStage2PendingChat = Boolean(
+    (pendingLessonSpecs.length > 0 || (slot.stage1Draft && !slot.lesson)) && chatStage2Prompt
+  );
   const effectiveChatStepPrompt = isStage2PendingChat
     ? chatStage2Prompt
     : chatStage1Prompt || chatLessonPrompt;
@@ -517,32 +624,41 @@ export const LessonView: React.FC<LessonViewProps> = ({
     try {
       const result = await copyPromptMarkdownFileToClipboard(course.id, fileName, content);
       setCopiedMdKey(feedbackKey);
+      setManualPromptPreview(null);
       window.setTimeout(
         () => setCopiedMdKey((prev) => (prev === feedbackKey ? null : prev)),
         2500
       );
-      if (result.copiedToOsClipboard) {
-        setImportReplaceHint(
-          `已将 ${result.fileName || fileName} 作为文件复制到系统剪贴板，可直接 Ctrl+V 发送给 AI。`
-        );
-      } else {
-        setImportReplaceHint(
-          result.reason || `当前环境已触发下载 ${result.fileName || fileName}。`
-        );
-      }
+      const okMsg = result.copiedToOsClipboard
+        ? `已将 ${result.fileName || fileName} 作为文件复制到系统剪贴板，可直接 Ctrl+V 发送给 AI。`
+        : result.reason || `已复制/触发下载 ${result.fileName || fileName}。`;
+      setImportReplaceHint(okMsg);
+      setChatPromptCopyNotice({ ok: true, message: `✅ ${okMsg}` });
+      if (!isChatWorkbenchOpen) setPdfCopyNotice(`✅ ${okMsg}`);
     } catch (err: any) {
-      setImportError(err?.message || '复制 .md 提示词文件失败');
+      setManualPromptPreview({
+        title: `${fileName}（剪贴板受限，请点击一键复制或长按全选）`,
+        text: content,
+      });
+      const failMsg = err?.message || '复制 .md 提示词失败，已在下方展开文本供手动复制。';
+      setImportError(failMsg);
+      setChatPromptCopyNotice({ ok: false, message: failMsg });
     }
   };
 
   const handleQuickCopySectionPrompt = async () => {
+    setImportError(null);
     try {
       let promptToCopy = effectiveChatStepPrompt;
+      let isStage2 = isStage2PendingChat;
       if (!promptToCopy) {
         const res = await fetch(`/api/courses/${course.id}/days/${slot.dayIndex}/chat-prompt`);
+        if (!res.ok) throw new Error('获取本节提示词失败');
         const data = await res.json();
+        const useStage2 = Boolean(slot.stage1Draft && !slot.lesson && data.stage2Prompt);
+        isStage2 = useStage2;
         promptToCopy =
-          (slot.stage1Draft && !slot.lesson && data.stage2Prompt) ||
+          (useStage2 && data.stage2Prompt) ||
           data.stage1Prompt ||
           data.lessonPrompt ||
           '';
@@ -550,13 +666,26 @@ export const LessonView: React.FC<LessonViewProps> = ({
         if (data.stage1Prompt) setChatStage1Prompt(data.stage1Prompt);
         if (data.stage2Prompt) setChatStage2Prompt(data.stage2Prompt);
       }
-      if (promptToCopy) {
-        await navigator.clipboard.writeText(promptToCopy);
-        setCopiedQuickPrompt(true);
-        setTimeout(() => setCopiedQuickPrompt(false), 2000);
+      if (!promptToCopy) {
+        throw new Error('未能获取当前小节提示词');
       }
-    } catch {
-      // ignore
+      try {
+        await copyPromptText(promptToCopy);
+        setCopiedQuickPrompt(true);
+        setManualPromptPreview(null);
+        setPdfCopyNotice(
+          `✅ 已复制${isStage2 ? '阶段二图表提示词' : '本节提示词'}（${promptToCopy.length} 字符），可直接切换到 AI 对话框粘贴。`
+        );
+        setTimeout(() => setCopiedQuickPrompt(false), 2500);
+      } catch {
+        setManualPromptPreview({
+          title: isStage2 ? '阶段二图表提示词（请点击一键复制或长按全选）' : '本节提示词（请点击一键复制或长按全选）',
+          text: promptToCopy,
+        });
+      }
+    } catch (err: any) {
+      setPdfCopyNotice(null);
+      setImportError(err?.message || '获取本节提示词失败，请稍后重试。');
     }
   };
 
@@ -606,7 +735,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
     try {
       const result = await copyCourseFileToClipboard(course.id, relPath);
-      setCopiedQuickPdfKey(copyKey);
+      if (result.copiedToOsClipboard) setCopiedQuickPdfKey(copyKey);
       setTimeout(() => {
         setCopiedQuickPdfKey((prev) => (prev === copyKey ? null : prev));
       }, 2500);
@@ -633,79 +762,109 @@ export const LessonView: React.FC<LessonViewProps> = ({
   const importAuditResult = useMemo(() => {
     const trimmed = rawImportInput.trim();
     if (!trimmed) return null;
-    const baseForPatch = slot.stage1Draft || slot.lesson || previewLesson || null;
-    const kind = detectPastedCoursewareInputKind(trimmed, {
-      hasStage1Draft: Boolean(slot.stage1Draft && !slot.lesson),
-      hasBaseLesson: Boolean(baseForPatch),
-    });
-    if (kind === 'stage2' && slot.stage1Draft) {
-      try {
-        const merged = mergeStage2DiagramsIntoStage1(slot.stage1Draft, trimmed, combinedAssets);
-        return {
-          report: auditCoursewareRendering(merged.mergedLesson, combinedAssets, {
-            stage: 'complete',
-          }),
-          parsedLesson: merged.mergedLesson,
-        };
-      } catch {
-        // fallback below
+    try {
+      const baseForPatch = previewLesson || slot.stage1Draft || slot.lesson || null;
+      const stage1BaseForPreview =
+        (previewLesson && extractPendingDiagramSpecs(previewLesson).length > 0
+          ? previewLesson
+          : slot.stage1Draft) ||
+        previewLesson ||
+        null;
+      const kind = detectPastedCoursewareInputKind(trimmed, {
+        hasStage1Draft: Boolean(
+          (slot.stage1Draft && !slot.lesson) ||
+            (previewLesson && extractPendingDiagramSpecs(previewLesson).length > 0)
+        ),
+        hasBaseLesson: Boolean(baseForPatch),
+      });
+      if (kind === 'stage2' && stage1BaseForPreview) {
+        try {
+          const merged = mergeStage2DiagramsIntoStage1(
+            stage1BaseForPreview,
+            trimmed,
+            combinedAssets
+          );
+          return {
+            report: safeAuditCoursewareRendering(merged.mergedLesson, combinedAssets, {
+              stage: 'complete',
+            }),
+            parsedLesson: merged.mergedLesson,
+          };
+        } catch {
+          // fallback below
+        }
       }
-    }
-    if (kind === 'patch' && baseForPatch) {
-      try {
-        const patched = applyCoursewareRepairPatch(baseForPatch, trimmed, slot, combinedAssets);
-        const stillStage1 =
-          !slot.lesson && extractPendingDiagramSpecs(patched.mergedLesson).length > 0;
-        return {
-          report: auditCoursewareRendering(patched.mergedLesson, combinedAssets, {
-            stage: stillStage1 ? 'stage1' : 'complete',
-          }),
-          parsedLesson: patched.mergedLesson,
-        };
-      } catch {
-        // fallback below
+      if (kind === 'patch' && baseForPatch) {
+        try {
+          const patched = applyCoursewareRepairPatch(baseForPatch, trimmed, slot, combinedAssets);
+          const hasAnySvgAfterPatch = (patched.mergedLesson.diagrams || []).some((d) =>
+            hasValidDiagramContent(d)
+          );
+          const stillStage1 =
+            !slot.lesson &&
+            extractPendingDiagramSpecs(patched.mergedLesson).length > 0 &&
+            !hasAnySvgAfterPatch;
+          return {
+            report: safeAuditCoursewareRendering(patched.mergedLesson, combinedAssets, {
+              stage: stillStage1 ? 'stage1' : 'complete',
+            }),
+            parsedLesson: patched.mergedLesson,
+          };
+        } catch {
+          // fallback below
+        }
       }
+      return auditRawCoursewareInput(trimmed, slot, combinedAssets, {
+        stage: kind === 'stage1' ? 'stage1' : 'complete',
+      });
+    } catch (err) {
+      console.warn('[LessonView] importAuditResult fallback:', err);
+      return null;
     }
-    return auditRawCoursewareInput(trimmed, slot, combinedAssets, {
-      stage: kind === 'stage1' ? 'stage1' : 'complete',
-    });
   }, [rawImportInput, slot, previewLesson, combinedAssets]);
+
+  const displayedImportAudit = importAuditResult || latchedImportAudit;
 
   const quickRepairAuditResult = useMemo(() => {
     const trimmed = quickRepairInput.trim();
     if (!trimmed) return null;
-    if (activeLesson) {
-      try {
-        const { mergedLesson, appliedSummary, appliedMode } = applyCoursewareRepairPatch(
-          activeLesson,
-          trimmed,
-          slot,
-          combinedAssets
-        );
-        const report = auditCoursewareRendering(mergedLesson, combinedAssets);
-        return {
-          report,
-          parsedLesson: mergedLesson,
-          appliedSummary,
-          appliedMode,
-        };
-      } catch {
-        // Fallback to raw input audit so JSON syntax errors are reported clearly
-      }
-    }
-    const rawAudit = auditRawCoursewareInput(trimmed, slot, combinedAssets);
-    return rawAudit
-      ? {
-          ...rawAudit,
-          appliedSummary: undefined,
-          appliedMode: undefined,
+    try {
+      if (activeLesson) {
+        try {
+          const { mergedLesson, appliedSummary, appliedMode } = applyCoursewareRepairPatch(
+            activeLesson,
+            trimmed,
+            slot,
+            combinedAssets
+          );
+          const report = safeAuditCoursewareRendering(mergedLesson, combinedAssets);
+          return {
+            report,
+            parsedLesson: mergedLesson,
+            appliedSummary,
+            appliedMode,
+          };
+        } catch {
+          // Fallback to raw input audit so JSON syntax errors are reported clearly
         }
-      : null;
+      }
+      const rawAudit = auditRawCoursewareInput(trimmed, slot, combinedAssets);
+      return rawAudit
+        ? {
+            ...rawAudit,
+            appliedSummary: undefined,
+            appliedMode: undefined,
+          }
+        : null;
+    } catch (err) {
+      console.warn('[LessonView] quickRepairAuditResult fallback:', err);
+      return null;
+    }
   }, [quickRepairInput, activeLesson, slot, combinedAssets]);
 
   const activeLessonAudit = useMemo(() => {
     if (!activeLesson) return null;
-    return auditCoursewareRendering(activeLesson, combinedAssets);
+    return safeAuditCoursewareRendering(activeLesson, combinedAssets);
   }, [activeLesson, combinedAssets]);
 
   const existingLessonUnresolvedRefs = useMemo(() => {
@@ -718,6 +877,8 @@ export const LessonView: React.FC<LessonViewProps> = ({
     return resolveLessonAssetReferences(activeLesson, combinedAssets);
   }, [activeLesson, combinedAssets]);
 
+  const compiledDiagramSvgs = useCompiledLessonDiagrams(resolvedActiveLesson || activeLesson);
+
   // Unified list of all SVG diagrams + Markdown images in this lesson for cross-referencing & mini-window
   const lessonVisuals = useMemo<VisualAssetRef[]>(() => {
     if (!resolvedActiveLesson) return [];
@@ -725,27 +886,30 @@ export const LessonView: React.FC<LessonViewProps> = ({
     const diagrams = resolvedActiveLesson.diagrams || [];
     diagrams.forEach((d, idx) => {
       const id = (d.id || `diag-${idx + 1}`).trim();
+      const compiledSvg = compiledDiagramSvgs[id] || compiledDiagramSvgs[id.toLowerCase()];
       visuals.push({
         id,
         title: stripAiCitationArtifacts(d.title || `图 ${idx + 1}`),
         stageLabel: d.stageLabel ? stripAiCitationArtifacts(d.stageLabel) : undefined,
         caption: d.caption ? stripAiCitationArtifacts(d.caption) : undefined,
         kind: 'svg',
-        svgCode: enhanceDiagramSvg(d.svgCode || ''),
+        svgCode: compiledSvg || enhanceDiagramSvg(d.svgCode || ''),
         index: idx + 1,
       });
     });
 
     (resolvedActiveLesson.exercises || []).forEach((ex, exIdx) => {
-      if (ex.svgCode && ex.svgCode.includes('<svg')) {
+      if (ex.diagramSpec !== undefined || (ex.svgCode && ex.svgCode.includes('<svg'))) {
         const exDiagId = (ex.diagramId || `diag-${ex.id || `ex-${exIdx + 1}`}`).trim();
         if (!visuals.some((v) => v.id.toLowerCase() === exDiagId.toLowerCase())) {
+          const compiledSvg =
+            compiledDiagramSvgs[exDiagId] || compiledDiagramSvgs[exDiagId.toLowerCase()];
           visuals.push({
             id: exDiagId,
             title: stripAiCitationArtifacts(ex.diagramTitle || `练习题 #${exIdx + 1} 配图`),
             caption: ex.diagramCaption ? stripAiCitationArtifacts(ex.diagramCaption) : undefined,
             kind: 'svg',
-            svgCode: enhanceDiagramSvg(ex.svgCode),
+            svgCode: compiledSvg || enhanceDiagramSvg(ex.svgCode || ''),
             index: visuals.length + 1,
           });
         }
@@ -782,7 +946,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
     });
 
     return visuals;
-  }, [resolvedActiveLesson, activeLesson?.markdownBody]);
+  }, [resolvedActiveLesson, activeLesson?.markdownBody, compiledDiagramSvgs]);
 
   const activeFloatingVisual = useMemo(() => {
     if (!floatingVisualId) return null;
@@ -1031,11 +1195,12 @@ export const LessonView: React.FC<LessonViewProps> = ({
       if (matchedDiagIdx !== -1 && diagrams[matchedDiagIdx]) {
         exerciseDiagramsByExId[exId] = diagrams[matchedDiagIdx];
         usedDiagIndices.add(matchedDiagIdx);
-      } else if (ex.svgCode && ex.svgCode.includes('<svg')) {
+      } else if ((ex.svgCode && ex.svgCode.includes('<svg')) || ex.diagramSpec) {
         exerciseDiagramsByExId[exId] = {
           id: ex.diagramId || `diag-${exId}`,
           title: ex.diagramTitle || `练习题 #${exIdx + 1} 配图`,
           caption: ex.diagramCaption || '',
+          ...(ex.diagramSpec ? { diagramSpec: ex.diagramSpec } : {}),
           svgCode: ex.svgCode,
         };
       }
@@ -1177,10 +1342,15 @@ export const LessonView: React.FC<LessonViewProps> = ({
     return { blocks, comprehensiveExerciseIndices, exerciseDiagramsByExId };
   }, [activeLesson, combinedAssets, lessonVisuals]);
 
-  // Annotate rendered KaTeX symbols that were explained earlier in the lesson
+  // Annotate rendered KaTeX symbols that were explained earlier in the lesson & hydrate async markdown diagrams
   useEffect(() => {
-    if (!articleRef.current) return;
-    annotateKatexSymbolsInContainer(articleRef.current, symbolIndex);
+    if (articleRef.current) {
+      annotateKatexSymbolsInContainer(articleRef.current, symbolIndex);
+      hydrateAsyncMarkdownDiagrams(articleRef.current);
+    }
+    if (editPreviewRef.current && showEditPreview) {
+      hydrateAsyncMarkdownDiagrams(editPreviewRef.current);
+    }
   }, [
     symbolIndex,
     interleavedLessonFlow,
@@ -1192,6 +1362,8 @@ export const LessonView: React.FC<LessonViewProps> = ({
     revealedSingleExercises,
     revealedReverseChecks,
     hideQualityCheck,
+    showEditPreview,
+    editMarkdown,
   ]);
 
   const renderedGrammarNotes = useMemo(() => {
@@ -1268,11 +1440,15 @@ export const LessonView: React.FC<LessonViewProps> = ({
   const handleCopyAgentPromptInline = async () => {
     if (!effectiveAgentInlinePrompt) return;
     try {
-      await navigator.clipboard.writeText(effectiveAgentInlinePrompt);
+      await copyPromptText(effectiveAgentInlinePrompt);
       setCopiedAgentPrompt(true);
-      setTimeout(() => setCopiedAgentPrompt(false), 2000);
+      setManualPromptPreview(null);
+      setTimeout(() => setCopiedAgentPrompt(false), 2500);
     } catch {
-      // ignore
+      setManualPromptPreview({
+        title: agentInlineStage === 'stage2' ? 'Agent 阶段二图表指令（请点击一键复制或长按全选）' : 'Agent 本节指令（请点击一键复制或长按全选）',
+        text: effectiveAgentInlinePrompt,
+      });
     }
   };
 
@@ -1384,39 +1560,189 @@ export const LessonView: React.FC<LessonViewProps> = ({
     }
   };
 
-  const handleCopyChatPrompt = async (stageOverride?: 'stage1' | 'stage2') => {
-    const textToCopy =
+  const handleCopyChatPrompt = async (
+    stageOverride?: 'stage1' | 'stage2',
+    feedbackKey?: 'stage1' | 'stage2' | 'quick-stage2'
+  ) => {
+    const isTargetStage2 =
+      stageOverride === 'stage2' || (stageOverride === undefined && isStage2PendingChat);
+    const resolvedKey: 'stage1' | 'stage2' | 'quick-stage2' =
+      feedbackKey || (isTargetStage2 ? 'stage2' : 'stage1');
+    setImportError(null);
+    setChatPromptCopyNotice(null);
+
+    let textToCopy =
       stageOverride === 'stage1'
         ? chatStage1Prompt || chatLessonPrompt
         : stageOverride === 'stage2'
         ? chatStage2Prompt
         : effectiveChatStepPrompt;
-    if (!textToCopy) return;
+
+    if (!textToCopy) {
+      try {
+        const res = await fetch(`/api/courses/${course.id}/days/${slot.dayIndex}/chat-prompt`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.lessonPrompt) setChatLessonPrompt(data.lessonPrompt);
+          if (data.stage1Prompt) setChatStage1Prompt(data.stage1Prompt);
+          if (data.stage2Prompt) setChatStage2Prompt(data.stage2Prompt);
+          textToCopy =
+            stageOverride === 'stage1'
+              ? String(data.stage1Prompt || data.lessonPrompt || '')
+              : stageOverride === 'stage2'
+              ? String(data.stage2Prompt || '')
+              : String(
+                  (slot.stage1Draft && !slot.lesson && data.stage2Prompt) ||
+                    data.stage1Prompt ||
+                    data.lessonPrompt ||
+                    ''
+                );
+        }
+      } catch {
+        // handled below via !textToCopy
+      }
+    }
+
+    if (!textToCopy) {
+      const missingMsg = isTargetStage2
+        ? '当前小节尚未生成阶段二图表规格，请先完成并导入阶段一内容。'
+        : '提示词尚未加载完成，请稍后重试。';
+      setImportError(missingMsg);
+      setChatPromptCopyNotice({ ok: false, message: missingMsg });
+      return;
+    }
+
     try {
-      await navigator.clipboard.writeText(textToCopy);
-      setCopiedPrompt(true);
-      setTimeout(() => setCopiedPrompt(false), 2000);
+      await copyPromptText(textToCopy);
+      setCopiedChatPromptKey(resolvedKey);
+      setManualPromptPreview((prev) => (prev && prev.text === textToCopy ? prev : null));
+      const label = isTargetStage2 ? '阶段二图表提示词' : '阶段一提示词';
+      const okMsg = `✅ 已复制${label}（${textToCopy.length} 字符），可直接切换到 AI 对话框粘贴。`;
+      setChatPromptCopyNotice({ ok: true, message: okMsg });
+      if (!isChatWorkbenchOpen) {
+        setPdfCopyNotice(okMsg);
+      }
+      setTimeout(
+        () => setCopiedChatPromptKey((prev) => (prev === resolvedKey ? null : prev)),
+        2500
+      );
     } catch {
-      // ignore
+      const failTitle = isTargetStage2
+        ? '阶段二图表提示词（剪贴板受限，请点击一键复制或长按全选）'
+        : '阶段一提示词（剪贴板受限，请点击一键复制或长按全选）';
+      setManualPromptPreview({
+        title: failTitle,
+        text: textToCopy,
+      });
+      const failMsg = '自动写入剪贴板受限，已展开完整提示词文本框，请点击“一键复制全文”或长按全选复制。';
+      setChatPromptCopyNotice({ ok: false, message: failMsg });
+      if (isChatWorkbenchOpen) {
+        setImportError(failMsg);
+      }
+    }
+  };
+
+  const persistStage1DraftToBackend = async (lessonToSave: DailyLessonContent): Promise<boolean> => {
+    try {
+      const res = await fetch(`/api/courses/${course.id}/days/${slot.dayIndex}/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          rawContent: JSON.stringify(lessonToSave, null, 2),
+          lessonData: lessonToSave,
+          uploadedAssets: pendingAssets,
+          sourceMode: 'chat',
+          importStage: 'stage1',
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (typeof data.stage2Prompt === 'string' && data.stage2Prompt) {
+          setChatStage2Prompt(data.stage2Prompt);
+        }
+        onCourseUpdated(data.course);
+        return true;
+      }
+    } catch {
+      // preserve local previewLesson even if background save fails
+    }
+    return false;
+  };
+
+  const latchCurrentImportBaseAndClearInput = async (customHint?: string) => {
+    const currentAudit = importAuditResult || latchedImportAudit;
+    if (!currentAudit) {
+      setRawImportInput('');
+      setShowChatManualPaste(true);
+      setImportReplaceHint(
+        customHint || '已清空粘贴框，请在此直接粘贴 AI 输出的修复补丁或内容。'
+      );
+      window.setTimeout(() => chatImportBoxRef.current?.focus(), 30);
+      return;
+    }
+
+    setLatchedImportAudit(currentAudit);
+    const baseLesson = currentAudit.parsedLesson;
+    if (baseLesson) {
+      setPreviewLesson(baseLesson);
+      setUnresolvedImages(
+        detectUnresolvedImageRefs(baseLesson.markdownBody || '', combinedAssets)
+      );
+    }
+    setRawImportInput('');
+    setShowChatManualPaste(true);
+    setImportReplaceHint(
+      customHint ||
+        (baseLesson
+          ? '已暂存阶段一底稿并清空粘贴框，请在此直接粘贴 AI 输出的增量修复补丁或阶段二 SVG。'
+          : '已保留下方修复诊断并清空粘贴框，请在此直接粘贴 AI 修复后的完整内容。')
+    );
+    window.setTimeout(() => chatImportBoxRef.current?.focus(), 30);
+
+    if (baseLesson) {
+      const hasStage1 = Boolean(slot.stage1Draft && !slot.lesson);
+      const trimmed = rawImportInput.trim();
+      const kind = trimmed
+        ? detectPastedCoursewareInputKind(trimmed, {
+            hasStage1Draft: hasStage1,
+            hasBaseLesson: Boolean(previewLesson || slot.stage1Draft || slot.lesson),
+          })
+        : extractPendingDiagramSpecs(baseLesson).length > 0
+        ? 'stage1'
+        : 'complete';
+      if (kind === 'stage1' || (!slot.lesson && extractPendingDiagramSpecs(baseLesson).length > 0)) {
+        await persistStage1DraftToBackend(baseLesson);
+      }
     }
   };
 
   const handleProcessChatImportText = async (
     rawTextInput: string,
-    autoSaveIfClean = true
+    autoSaveIfClean = true,
+    advanceToNext = false
   ) => {
     const trimmed = rawTextInput.trim();
     if (!trimmed) {
       setImportError('粘贴的 AI 输出内容为空，请先复制 AI 回复。');
       return;
     }
+    const wasManualPasteOpen = showChatManualPaste;
     setImportError(null);
     setImportSuccessMsg(null);
     setImportReplaceHint(null);
 
     try {
-      const hasStage1 = Boolean(slot.stage1Draft && !slot.lesson);
+      const hasStage1 = Boolean(
+        (slot.stage1Draft && !slot.lesson) ||
+          (previewLesson && extractPendingDiagramSpecs(previewLesson).length > 0)
+      );
       const baseForPatch = previewLesson || slot.stage1Draft || slot.lesson || null;
+      const stage1Base =
+        (previewLesson && extractPendingDiagramSpecs(previewLesson).length > 0
+          ? previewLesson
+          : slot.stage1Draft) ||
+        previewLesson ||
+        null;
       const kind = detectPastedCoursewareInputKind(trimmed, {
         hasStage1Draft: hasStage1,
         hasBaseLesson: Boolean(baseForPatch),
@@ -1424,32 +1750,40 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
       let targetLesson: DailyLessonContent | null = null;
       let issuesCount = 0;
+      let preservedAuditReport: ReturnType<typeof auditCoursewareRendering> | null = null;
       let importStageToSave: 'stage1' | 'stage2_merge' | 'complete' = 'complete';
       let note = '';
 
       if (kind === 'stage2') {
-        if (!slot.stage1Draft) {
+        if (!stage1Base) {
           setRawImportInput(trimmed);
           setImportError('检测到阶段二 SVG 输出，但本节尚未保存阶段一底稿，请先导入阶段一内容。');
           return;
         }
-        const merged = mergeStage2DiagramsIntoStage1(slot.stage1Draft, trimmed, combinedAssets);
+        const merged = mergeStage2DiagramsIntoStage1(stage1Base, trimmed, combinedAssets);
         const report = auditCoursewareRendering(merged.mergedLesson, combinedAssets, {
           stage: 'complete',
         });
         targetLesson = merged.mergedLesson;
         issuesCount = report.issues.length;
+        preservedAuditReport = report;
         importStageToSave = 'stage2_merge';
         note = `自动识别为阶段二 SVG · 组装 ${merged.matchedCount + merged.addedCount} 张图示`;
       } else if (kind === 'patch' && baseForPatch) {
         const patched = applyCoursewareRepairPatch(baseForPatch, trimmed, slot, combinedAssets);
+        const hasAnySvgAfterPatch = (patched.mergedLesson.diagrams || []).some((d) =>
+          hasValidDiagramContent(d)
+        );
         const isStage1Remaining =
-          !slot.lesson && extractPendingDiagramSpecs(patched.mergedLesson).length > 0;
+          !slot.lesson &&
+          extractPendingDiagramSpecs(patched.mergedLesson).length > 0 &&
+          !hasAnySvgAfterPatch;
         const report = auditCoursewareRendering(patched.mergedLesson, combinedAssets, {
           stage: isStage1Remaining ? 'stage1' : 'complete',
         });
         targetLesson = patched.mergedLesson;
         issuesCount = report.issues.length;
+        preservedAuditReport = report;
         importStageToSave = isStage1Remaining ? 'stage1' : 'complete';
         note = patched.appliedSummary;
       } else {
@@ -1459,6 +1793,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
         if (check) {
           targetLesson = check.parsedLesson;
           issuesCount = check.report.issues.length;
+          preservedAuditReport = check.report;
         } else {
           const parsedFallback = parseImportedLessonContent(trimmed, slot, 'chat', combinedAssets, {
             stageMode: kind === 'stage1' ? 'stage1' : 'auto',
@@ -1467,8 +1802,10 @@ export const LessonView: React.FC<LessonViewProps> = ({
         }
         if (
           targetLesson &&
-          kind === 'stage1' &&
-          extractPendingDiagramSpecs(targetLesson).length > 0
+          (kind === 'stage1' ||
+            (!slot.lesson &&
+              extractPendingDiagramSpecs(targetLesson).length > 0 &&
+              !(targetLesson.diagrams || []).some((d) => hasValidDiagramContent(d))))
         ) {
           importStageToSave = 'stage1';
           note = '自动识别为阶段一正文与图示规格';
@@ -1481,12 +1818,42 @@ export const LessonView: React.FC<LessonViewProps> = ({
       }
 
       if (issuesCount > 0 || !targetLesson) {
-        setRawImportInput(trimmed);
-        setImportReplaceHint(
-          targetLesson
-            ? `检测到 ${issuesCount} 处可局部修复的问题，可复制下方增量修复提示词（或 .md 文件），修复后再次点击粘贴。`
-            : '检测到 JSON 语法错误，请复制下方修复提示词（或 .md 文件）让 AI 修复后再粘贴。'
-        );
+        const reportForLatch =
+          preservedAuditReport ||
+          (targetLesson
+            ? auditCoursewareRendering(targetLesson, combinedAssets, {
+                stage:
+                  kind === 'stage1' ||
+                  (!slot.lesson && extractPendingDiagramSpecs(targetLesson).length > 0)
+                    ? 'stage1'
+                    : 'complete',
+              })
+            : null);
+        if (reportForLatch) {
+          setLatchedImportAudit({
+            report: reportForLatch,
+            parsedLesson: targetLesson,
+          });
+        }
+        if (targetLesson) {
+          if (
+            kind === 'stage1' ||
+            (!slot.lesson && extractPendingDiagramSpecs(targetLesson).length > 0)
+          ) {
+            await persistStage1DraftToBackend(targetLesson);
+          }
+          setRawImportInput('');
+          setShowChatManualPaste(true);
+          setImportReplaceHint(
+            `已暂存阶段一底稿（检测到 ${issuesCount} 处待修问题），请复制下方修复提示词后，在此直接粘贴 AI 输出的增量修复补丁或阶段二 SVG。`
+          );
+        } else {
+          setRawImportInput(trimmed);
+          setShowChatManualPaste(true);
+          setImportReplaceHint(
+            '检测到 JSON 语法错误，请复制下方修复提示词（或 .md 文件）让 AI 修复后再粘贴。'
+          );
+        }
         return;
       }
 
@@ -1512,15 +1879,30 @@ export const LessonView: React.FC<LessonViewProps> = ({
         throw new Error(data.error || '导入保存本节课件失败');
       }
       setRawImportInput('');
-      setShowChatManualPaste(false);
+      setLatchedImportAudit(null);
       onCourseUpdated(data.course);
       if (importStageToSave === 'stage1') {
+        if (typeof data.stage2Prompt === 'string' && data.stage2Prompt) {
+          setChatStage2Prompt(data.stage2Prompt);
+        }
         setPreviewLesson(null);
-        setImportSuccessMsg(
-          `已自动识别并保存阶段一成果，请继续复制上方「阶段二 SVG」提示词或 .md 文件发给 AI（无需重传 PDF）。`
+        setShowChatManualPaste(
+          Boolean(
+            wasManualPasteOpen ||
+              typeof navigator === 'undefined' ||
+              !navigator.clipboard?.readText
+          )
         );
+        setImportSuccessMsg(
+          `已自动识别并保存阶段一成果，请继续复制上方「阶段二图表」提示词或 .md 文件发给 AI（无需重传 PDF）。`
+        );
+      } else if (advanceToNext && nextSlot && onSelectDayIndex) {
+        setPreviewLesson(null);
+        setShowChatManualPaste(false);
+        onSelectDayIndex(nextSlot.dayIndex);
       } else {
         setPreviewLesson(null);
+        setShowChatManualPaste(false);
         setIsChatWorkbenchOpen(false);
         setImportSuccessMsg(
           note ? `已自动识别并保存本节课件（${note}）。` : '本节课件已保存并同步到本地文件夹。'
@@ -1602,6 +1984,24 @@ export const LessonView: React.FC<LessonViewProps> = ({
   };
 
   const handleConfirmSaveImport = async (advanceToNext = false) => {
+    const trimmed = rawImportInput.trim();
+    if (trimmed) {
+      const hasStage1 = Boolean(
+        (slot.stage1Draft && !slot.lesson) ||
+          (previewLesson && extractPendingDiagramSpecs(previewLesson).length > 0)
+      );
+      const baseForPatch = previewLesson || slot.stage1Draft || slot.lesson || null;
+      const kind = detectPastedCoursewareInputKind(trimmed, {
+        hasStage1Draft: hasStage1,
+        hasBaseLesson: Boolean(baseForPatch),
+      });
+      if (kind === 'stage1' || kind === 'stage2' || kind === 'patch') {
+        await handleProcessChatImportText(trimmed, true, advanceToNext);
+        return;
+      }
+    }
+
+    const wasManualPasteOpen = showChatManualPaste;
     setIsSavingImport(true);
     setImportError(null);
     setImportSuccessMsg(null);
@@ -1609,15 +2009,23 @@ export const LessonView: React.FC<LessonViewProps> = ({
       const parsed =
         previewLesson ||
         parseImportedLessonContent(rawImportInput, slot, 'chat', combinedAssets).lesson;
+      const pendingSpecs = extractPendingDiagramSpecs(parsed);
+      const hasAnyDrawnSvg = (parsed.diagrams || []).some((d) =>
+        hasValidDiagramContent(d)
+      );
+      const isStage1Only =
+        pendingSpecs.length > 0 &&
+        (!hasAnyDrawnSvg || parsed.generationStage === 'stage1_content');
 
       const res = await fetch(`/api/courses/${course.id}/days/${slot.dayIndex}/import`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          rawContent: rawImportInput,
+          rawContent: trimmed || JSON.stringify(parsed, null, 2),
           lessonData: parsed,
           uploadedAssets: pendingAssets,
           sourceMode: 'chat',
+          importStage: isStage1Only ? 'stage1' : 'complete',
         }),
       });
       const data = await res.json();
@@ -1625,11 +2033,25 @@ export const LessonView: React.FC<LessonViewProps> = ({
         throw new Error(data.error || '保存导入课件失败');
       }
       setPreviewLesson(null);
+      setLatchedImportAudit(null);
       setRawImportInput('');
       onCourseUpdated(data.course);
-      if (advanceToNext && nextSlot && onSelectDayIndex) {
+      if (isStage1Only) {
+        setShowChatManualPaste(
+          Boolean(
+            wasManualPasteOpen ||
+              typeof navigator === 'undefined' ||
+              !navigator.clipboard?.readText
+          )
+        );
+        setImportSuccessMsg(
+          '已自动识别并保存阶段一成果，请继续复制上方「阶段二 SVG」提示词或 .md 文件发给 AI（无需重传 PDF）。'
+        );
+      } else if (advanceToNext && nextSlot && onSelectDayIndex) {
+        setShowChatManualPaste(false);
         onSelectDayIndex(nextSlot.dayIndex);
       } else {
+        setShowChatManualPaste(false);
         setIsChatWorkbenchOpen(false);
         setImportSuccessMsg('本节课件已保存并同步到本地文件夹。');
       }
@@ -2019,15 +2441,23 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     })}
                   </div>
                 ) : (
-                  <input
-                    type="text"
-                    value={currentVariantVal}
-                    onChange={(e) =>
-                      setVariantAnswers((prev) => ({ ...prev, [q.id]: e.target.value }))
-                    }
-                    placeholder="输入变式题答案或核心表达式..."
-                    className="w-full bg-black border border-neutral-800 rounded px-2.5 py-1.5 text-xs font-mono text-white focus:outline-none focus:border-sky-600"
-                  />
+                  <div className="space-y-1.5">
+                    <input
+                      type="text"
+                      value={currentVariantVal}
+                      onChange={(e) =>
+                        setVariantAnswers((prev) => ({ ...prev, [q.id]: e.target.value }))
+                      }
+                      placeholder="输入变式题答案或核心表达式..."
+                      className="w-full bg-black border border-neutral-800 rounded px-2.5 py-1.5 text-xs font-mono text-white focus:outline-none focus:border-sky-600"
+                    />
+                    {renderInputMathPreviewBox(
+                      currentVariantVal,
+                      lessonVisuals,
+                      `variant-input-latex-preview-${q.id}`,
+                      'bg-black/70'
+                    )}
+                  </div>
                 )}
 
                 <div className="flex flex-wrap items-center justify-between gap-2">
@@ -2134,6 +2564,74 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
   const currentMode: CourseGenerationMode = course.generationMode || 'api';
 
+  const renderManualPromptPreviewBox = () => {
+    if (!manualPromptPreview) return null;
+    const isCopied = copiedChatPromptKey === 'manual';
+    return (
+      <div
+        data-testid="manual-prompt-preview-box"
+        className="border border-sky-800/70 bg-black rounded p-3 space-y-2 text-xs"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="font-medium text-sky-200">{manualPromptPreview.title}</span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  await copyPromptText(manualPromptPreview.text);
+                  setCopiedChatPromptKey('manual');
+                  setChatPromptCopyNotice({
+                    ok: true,
+                    message: `✅ 已复制完整提示词（${manualPromptPreview.text.length} 字符），可直接粘贴到 AI 对话框。`,
+                  });
+                  if (!isChatWorkbenchOpen) {
+                    setPdfCopyNotice(
+                      `✅ 已复制完整提示词（${manualPromptPreview.text.length} 字符），可直接粘贴到 AI 对话框。`
+                    );
+                  }
+                  setTimeout(
+                    () => setCopiedChatPromptKey((prev) => (prev === 'manual' ? null : prev)),
+                    2500
+                  );
+                } catch {
+                  setImportError('仍无法调用系统剪贴板，请直接长按下方文本框内容全选复制。');
+                }
+              }}
+              className="px-2.5 py-1 rounded bg-white text-black hover:bg-neutral-200 font-medium inline-flex items-center gap-1"
+            >
+              {isCopied ? (
+                <>
+                  <Check className="w-3 h-3 text-emerald-600" />
+                  <span>已复制全文</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3 h-3" />
+                  <span>一键复制全文</span>
+                </>
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => setManualPromptPreview(null)}
+              className="text-neutral-400 hover:text-white px-2 py-0.5 border border-neutral-800 rounded"
+            >
+              收起
+            </button>
+          </div>
+        </div>
+        <textarea
+          readOnly
+          rows={5}
+          value={manualPromptPreview.text}
+          onFocus={(e) => e.currentTarget.select()}
+          className="w-full bg-neutral-950 border border-neutral-800 rounded p-2 font-mono text-[11px] text-neutral-200 focus:outline-none focus:border-sky-500"
+        />
+      </div>
+    );
+  };
+
   return (
     <div
       className={`min-h-screen bg-black text-neutral-100 pb-24 ${
@@ -2164,7 +2662,11 @@ export const LessonView: React.FC<LessonViewProps> = ({
                   type="button"
                   onClick={() => prevSlot && onSelectDayIndex(prevSlot.dayIndex)}
                   disabled={!prevSlot}
-                  title={prevSlot ? `上一讲：${stripAiCitationArtifacts(prevSlot.title)}` : '已是第 1 讲'}
+                  title={
+                    prevSlot
+                      ? `上一讲：${normalizeSvgLatexCommands(stripAiCitationArtifacts(prevSlot.title).replace(/\$/g, ''))}`
+                      : '已是第 1 讲'
+                  }
                   aria-label="上一讲"
                   className="p-1 border border-neutral-800 hover:border-neutral-600 rounded text-neutral-300 hover:text-white disabled:opacity-30 transition-colors"
                 >
@@ -2193,7 +2695,11 @@ export const LessonView: React.FC<LessonViewProps> = ({
                   type="button"
                   onClick={() => nextSlot && onSelectDayIndex(nextSlot.dayIndex)}
                   disabled={!nextSlot}
-                  title={nextSlot ? `下一讲：${stripAiCitationArtifacts(nextSlot.title)}` : '已是最后一讲'}
+                  title={
+                    nextSlot
+                      ? `下一讲：${normalizeSvgLatexCommands(stripAiCitationArtifacts(nextSlot.title).replace(/\$/g, ''))}`
+                      : '已是最后一讲'
+                  }
                   aria-label="下一讲"
                   className="p-1 border border-neutral-800 hover:border-neutral-600 rounded text-neutral-300 hover:text-white disabled:opacity-30 transition-colors"
                 >
@@ -2233,9 +2739,11 @@ export const LessonView: React.FC<LessonViewProps> = ({
             )}
 
             {/* 统一的 Chat / Agent / 直接编辑同级工作台入口 */}
-            <button
+            {(currentMode !== 'api' || slot.lesson) && (
+<button
               type="button"
               onClick={() => {
+                if (currentMode === 'api') setWorkbenchTab('edit');
                 setIsChatWorkbenchOpen((v) => !v);
               }}
               className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium border rounded transition-colors whitespace-nowrap ${
@@ -2249,12 +2757,13 @@ export const LessonView: React.FC<LessonViewProps> = ({
                 {slot.lesson
                   ? isChatWorkbenchOpen
                     ? '收起更新 / 编辑'
-                    : '更新 / 编辑课件 (Chat · Agent · 编辑)'
+                    : currentMode === 'api' ? '编辑课件' : '更新 / 编辑课件 (Chat · Agent · 编辑)'
                   : isChatWorkbenchOpen
                     ? '收起 Chat / Agent 工作台'
                     : 'Chat / Agent 生成工作台'}
               </span>
             </button>
+)}
 
             {slot.lesson && (
               <button
@@ -2489,7 +2998,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
           </div>
         )}
 
-        {/* 小节资料快速获取栏 (Quick Section Material Access) */}
+        {(showLessonTools || Boolean(activeLessonAudit?.issues.length)) && (
         <section
           aria-label="本节输入材料与提示词快速获取"
           className="mb-6 border border-neutral-900 rounded p-4 bg-neutral-950/50 space-y-3"
@@ -2543,7 +3052,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                 </button>
               )}
 
-              {!isChatWorkbenchOpen && (
+              {currentMode !== 'api' && !isChatWorkbenchOpen && (
                 <>
                   <button
                     type="button"
@@ -2552,14 +3061,14 @@ export const LessonView: React.FC<LessonViewProps> = ({
                   >
                     {copiedQuickPrompt ? (
                       <>
-                        <Check className="w-3.5 h-3.5" />
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
                         <span>已复制本节提示词</span>
                       </>
                     ) : (
                       <>
                         <Copy className="w-3.5 h-3.5" />
                         <span>
-                          {isStage2PendingChat ? '复制阶段二 SVG 提示词' : '复制本节生成提示词'}
+                          {isStage2PendingChat ? '复制阶段二图表提示词' : '复制本节生成提示词'}
                         </span>
                       </>
                     )}
@@ -2589,6 +3098,60 @@ export const LessonView: React.FC<LessonViewProps> = ({
                       </>
                     )}
                   </button>
+                  {!isStage2PendingChat && Boolean(chatStage2Prompt) && (
+                    <>
+                      <button
+                        type="button"
+                        data-testid="quick-copy-stage2-prompt-btn"
+                        onClick={() => handleCopyChatPrompt('stage2', 'quick-stage2')}
+                        className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border rounded transition-colors whitespace-nowrap ${
+                          copiedChatPromptKey === 'quick-stage2'
+                            ? 'border-emerald-600 bg-emerald-950/50 text-emerald-200'
+                            : 'border-sky-800/80 hover:border-sky-500 text-sky-200 hover:text-white'
+                        }`}
+                      >
+                        {copiedChatPromptKey === 'quick-stage2' ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            <span>已复制阶段二提示词</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5" />
+                            <span>复制阶段二图表提示词</span>
+                          </>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleCopyMdPromptFile(
+                            'quick-stage2-md',
+                            `${slot.id}-stage2-prompt.md`,
+                            chatStage2Prompt
+                          )
+                        }
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-200 hover:text-white rounded transition-colors whitespace-nowrap"
+                      >
+                        <FileText className="w-3.5 h-3.5" />
+                        <span>{copiedMdKey === 'quick-stage2-md' ? '已复制阶段二 .md' : '复制阶段二 .md'}</span>
+                      </button>
+                    </>
+                  )}
+                  <button
+                    type="button"
+                    data-testid="quick-open-manual-paste-btn"
+                    onClick={() => {
+                      setWorkbenchTab('chat');
+                      setIsChatWorkbenchOpen(true);
+                      setShowChatManualPaste(true);
+                      window.setTimeout(() => chatImportBoxRef.current?.focus(), 60);
+                    }}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 hover:text-white rounded transition-colors whitespace-nowrap"
+                  >
+                    <Upload className="w-3.5 h-3.5" />
+                    <span>粘贴 AI 输出 / 补丁</span>
+                  </button>
 
                   {slicedBoundSegments.length > 0 ? (
                     slicedBoundSegments.map((seg) => {
@@ -2598,7 +3161,8 @@ export const LessonView: React.FC<LessonViewProps> = ({
                       const isMulti = slicedBoundSegments.length > 1;
                       return (
                         <React.Fragment key={segId}>
-                          <button
+                          {currentMode === 'chat' && (
+<button
                             type="button"
                             onClick={() => handleCopyPdfFileToClipboard(seg, copyKey)}
                             className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 hover:text-white rounded transition-colors whitespace-nowrap"
@@ -2616,6 +3180,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                               </>
                             )}
                           </button>
+)}
                           <a
                             href={`/api/courses/${course.id}/segments/${segId}/pdf?download=1`}
                             target="_blank"
@@ -2630,7 +3195,8 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     })
                   ) : firstPdfMaterial ? (
                     <>
-                      <button
+                      {currentMode === 'chat' && (
+<button
                         type="button"
                         onClick={() => handleCopyPdfFileToClipboard(undefined, 'quick-src')}
                         className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 hover:text-white rounded transition-colors whitespace-nowrap"
@@ -2648,6 +3214,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                           </>
                         )}
                       </button>
+)}
                       <a
                         href={`/api/courses/${course.id}/files/download?path=${encodeURIComponent(`sources/${firstPdfMaterial.fileName}`)}&download=1`}
                         className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-200 hover:text-white rounded transition-colors whitespace-nowrap"
@@ -2667,6 +3234,14 @@ export const LessonView: React.FC<LessonViewProps> = ({
               {pdfCopyNotice}
             </div>
           )}
+
+          {!isChatWorkbenchOpen && importError && (
+            <div className="text-xs text-red-400 border border-red-900/60 bg-red-950/25 rounded px-3 py-2">
+              {importError}
+            </div>
+          )}
+
+          {!isChatWorkbenchOpen && renderManualPromptPreviewBox()}
 
           <div className="text-xs text-neutral-500 flex flex-wrap items-center gap-x-4 gap-y-1">
             <span>
@@ -2690,12 +3265,13 @@ export const LessonView: React.FC<LessonViewProps> = ({
             )}
           </div>
         </section>
+        )}
 
         {/* 统一同级工作台：Chat 模式提示词粘贴导入 · Agent 本地工作区同步 · 直接编辑正文与配图 */}
-        {isChatWorkbenchOpen && (
+        {isChatWorkbenchOpen && (currentMode !== 'api' || slot.lesson) && (
           <section
             aria-label="本节课件生成、导入更新与直接编辑工作台"
-            className="glow-border mb-8 border border-neutral-800 rounded p-5 bg-neutral-950/60 space-y-5"
+            className="lesson-workbench-enter glow-border mb-8 border border-neutral-800 rounded p-5 bg-neutral-950/60 space-y-5"
           >
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-neutral-900 pb-3">
               <div>
@@ -2709,7 +3285,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                   />
                 </h2>
                 <p className="text-xs text-neutral-500 mt-0.5">
-                  {workbenchTab === 'edit' && slot.lesson
+                  {(currentMode === 'api' || workbenchTab === 'edit') && slot.lesson
                     ? '直接调整当前课件的标题、导读摘要、正文 Markdown / LaTeX 或补充上传本地插图'
                     : workbenchTab === 'agent'
                       ? `复制 Agent 提示词交给本地 AI Agent 将课件写入 lessons/${slot.id}.json，完成后点击下方“扫描并同步本地课程文件夹”即可生效`
@@ -2719,7 +3295,8 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
               <div className="flex flex-wrap items-center gap-2">
                 <div className="inline-flex flex-wrap rounded border border-neutral-800 bg-black p-0.5 text-xs">
-                  <button
+                  {currentMode !== 'api' && (<>
+<button
                     type="button"
                     onClick={() => {
                       setWorkbenchTab('chat');
@@ -2749,6 +3326,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     <FolderSync className="w-3.5 h-3.5" />
                     <span>Agent 本地工作区同步</span>
                   </button>
+</>)}
                   {slot.lesson && (
                     <button
                       type="button"
@@ -2775,7 +3353,43 @@ export const LessonView: React.FC<LessonViewProps> = ({
               </div>
             </div>
 
-            {slot.lesson && workbenchTab === 'edit' ? (
+            {onSelectDayIndex && sortedSlots.length > 1 && (
+              <div
+                data-testid="lesson-workbench-section-tabs"
+                className="flex flex-wrap items-center gap-1.5 pb-2 border-b border-neutral-900/80"
+              >
+                <span className="text-[11px] font-mono text-neutral-500 mr-1">切换小节：</span>
+                {sortedSlots.map((s) => {
+                  const sId = s.id || `sec-${String(s.dayIndex).padStart(2, '0')}`;
+                  const isSelected = s.dayIndex === slot.dayIndex;
+                  return (
+                    <button
+                      key={sId}
+                      type="button"
+                      data-testid={`lesson-workbench-tab-${s.dayIndex}`}
+                      onClick={() => onSelectDayIndex(s.dayIndex)}
+                      className={`px-2 py-1 rounded font-mono text-[11px] border transition-colors inline-flex items-center gap-1 ${
+                        isSelected
+                          ? 'bg-white text-black border-white font-semibold'
+                          : s.lesson
+                          ? 'bg-emerald-950/30 text-emerald-300 border-emerald-800/60 hover:border-emerald-500'
+                          : s.stage1Draft
+                          ? 'bg-sky-950/30 text-sky-300 border-sky-800/60 hover:border-sky-500'
+                          : 'bg-black text-neutral-300 border-neutral-800 hover:border-neutral-600'
+                      }`}
+                      title={s.title}
+                    >
+                      <span>{sId}</span>
+                      <span>{s.lesson ? '✓' : s.stage1Draft ? '①' : '·'}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {renderManualPromptPreviewBox()}
+
+            {slot.lesson && (currentMode === 'api' || workbenchTab === 'edit') ? (
               <div className="space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-xs text-neutral-400">
@@ -2828,6 +3442,14 @@ export const LessonView: React.FC<LessonViewProps> = ({
                       onChange={(e) => setEditTitle(e.target.value)}
                       className="w-full bg-black border border-neutral-800 rounded px-3 py-1.5 text-xs text-white"
                     />
+                    {hasMathPreviewSignal(editTitle) && (
+                      <div
+                        className="mt-1 px-2.5 py-1 rounded border border-neutral-800 bg-neutral-950/70 text-[11px] text-neutral-200 [&>p]:m-0 overflow-x-auto"
+                        dangerouslySetInnerHTML={{
+                          __html: renderInlineMathWithLatex(editTitle, lessonVisuals),
+                        }}
+                      />
+                    )}
                   </div>
                   <div>
                     <label className="block text-xs text-neutral-400 mb-1">本节导读摘要</label>
@@ -2837,19 +3459,46 @@ export const LessonView: React.FC<LessonViewProps> = ({
                       onChange={(e) => setEditSummary(e.target.value)}
                       className="w-full bg-black border border-neutral-800 rounded px-3 py-1.5 text-xs text-white"
                     />
+                    {hasMathPreviewSignal(editSummary) && (
+                      <div
+                        className="mt-1 px-2.5 py-1 rounded border border-neutral-800 bg-neutral-950/70 text-[11px] text-neutral-300 [&>p]:m-0 overflow-x-auto"
+                        dangerouslySetInnerHTML={{
+                          __html: renderInlineMathWithLatex(editSummary, lessonVisuals),
+                        }}
+                      />
+                    )}
                   </div>
                 </div>
 
                 <div>
-                  <label className="block text-xs text-neutral-400 mb-1">
-                    课件正文（支持 Markdown、LaTeX 公式 $...$ / $$...$$ 与图片引用 ![说明](文件名.png)）
-                  </label>
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <label className="block text-xs text-neutral-400">
+                      课件正文（支持 Markdown、LaTeX 公式 $...$ / $$...$$ 与图片引用 ![说明](文件名.png)）
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => setShowEditPreview((prev) => !prev)}
+                      className="text-[11px] font-mono px-2 py-0.5 rounded border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white transition-colors"
+                    >
+                      {showEditPreview ? '隐藏实时公式预览' : '预览 LaTeX 与排版效果'}
+                    </button>
+                  </div>
                   <textarea
                     rows={10}
                     value={editMarkdown}
                     onChange={(e) => setEditMarkdown(e.target.value)}
                     className="w-full bg-black border border-neutral-800 rounded p-3 text-xs font-mono text-neutral-200 leading-relaxed"
                   />
+                  {showEditPreview && (
+                    <div
+                      ref={editPreviewRef}
+                      data-testid="edit-markdown-latex-preview"
+                      className="mt-2 p-3 rounded border border-neutral-800 bg-neutral-950/80 lesson-prose text-xs max-h-72 overflow-y-auto"
+                      dangerouslySetInnerHTML={{
+                        __html: renderMarkdownWithLatex(editMarkdown, lessonVisuals),
+                      }}
+                    />
+                  )}
                 </div>
 
                 <div className="flex justify-end gap-2">
@@ -2918,7 +3567,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                         htmlFor="agent-inline-prompt-box"
                         className="text-xs font-medium text-neutral-300"
                       >
-                        第一步：复制本节独立 Agent 提示词（prompts/{slot.id}/agent-{agentInlineStage}-prompt.md）
+                        第一步：复制本节 Agent 提示词；Agent 将在同一次对话中生成、检查并修复课件
                       </label>
                       <div className="inline-flex items-center gap-1 border border-neutral-800 rounded p-0.5 bg-black">
                         <button
@@ -2942,7 +3591,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                               : 'text-neutral-400 hover:text-white'
                           }`}
                         >
-                          阶段二 SVG
+                          阶段二图表
                         </button>
                       </div>
                     </div>
@@ -3122,19 +3771,20 @@ export const LessonView: React.FC<LessonViewProps> = ({
                         <>
                           <button
                             type="button"
-                            onClick={() => handleCopyChatPrompt('stage2')}
+                            data-testid="chat-copy-stage2-prompt-btn"
+                            onClick={() => handleCopyChatPrompt('stage2', 'stage2')}
                             disabled={isLoadingChatPrompt}
                             className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors whitespace-nowrap"
                           >
-                            {copiedPrompt ? (
+                            {copiedChatPromptKey === 'stage2' ? (
                               <>
-                                <Check className="w-3.5 h-3.5" />
+                                <Check className="w-3.5 h-3.5 text-emerald-600" />
                                 <span>已复制阶段二提示词</span>
                               </>
                             ) : (
                               <>
                                 <Copy className="w-3.5 h-3.5" />
-                                <span>复制阶段二 SVG 提示词</span>
+                                <span>复制阶段二图表提示词</span>
                               </>
                             )}
                           </button>
@@ -3159,24 +3809,28 @@ export const LessonView: React.FC<LessonViewProps> = ({
                           </button>
                           <button
                             type="button"
-                            onClick={() => handleCopyChatPrompt('stage1')}
+                            onClick={() => handleCopyChatPrompt('stage1', 'stage1')}
                             disabled={isLoadingChatPrompt}
                             className="inline-flex items-center gap-1 px-2 py-1 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-400 hover:text-neutral-200 rounded transition-colors whitespace-nowrap"
                           >
-                            <span>重复制阶段一</span>
+                            {copiedChatPromptKey === 'stage1' ? (
+                              <span className="text-emerald-300">已复制阶段一</span>
+                            ) : (
+                              <span>重复制阶段一</span>
+                            )}
                           </button>
                         </>
                       ) : (
                         <>
                           <button
                             type="button"
-                            onClick={() => handleCopyChatPrompt('stage1')}
+                            onClick={() => handleCopyChatPrompt('stage1', 'stage1')}
                             disabled={isLoadingChatPrompt}
                             className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors whitespace-nowrap"
                           >
-                            {copiedPrompt ? (
+                            {copiedChatPromptKey === 'stage1' ? (
                               <>
-                                <Check className="w-3.5 h-3.5" />
+                                <Check className="w-3.5 h-3.5 text-emerald-600" />
                                 <span>已复制提示词</span>
                               </>
                             ) : (
@@ -3205,10 +3859,67 @@ export const LessonView: React.FC<LessonViewProps> = ({
                             )}
                             <span>{copiedMdKey === 'chat-stage1-md' ? '已复制 .md' : '复制阶段一 .md'}</span>
                           </button>
+                          {Boolean(chatStage2Prompt) && (
+                            <>
+                              <button
+                                type="button"
+                                data-testid="chat-copy-stage2-prompt-btn"
+                                onClick={() => handleCopyChatPrompt('stage2', 'stage2')}
+                                disabled={isLoadingChatPrompt}
+                                className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border rounded transition-colors whitespace-nowrap ${
+                                  copiedChatPromptKey === 'stage2'
+                                    ? 'border-emerald-600 bg-emerald-950/50 text-emerald-200'
+                                    : 'border-sky-800/80 hover:border-sky-500 text-sky-200'
+                                }`}
+                              >
+                                {copiedChatPromptKey === 'stage2' ? (
+                                  <>
+                                    <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                    <span>已复制阶段二提示词</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy className="w-3.5 h-3.5" />
+                                    <span>复制阶段二图表提示词</span>
+                                  </>
+                                )}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleCopyMdPromptFile(
+                                    'chat-stage2-md',
+                                    `${slot.id}-stage2-prompt.md`,
+                                    chatStage2Prompt
+                                  )
+                                }
+                                disabled={isLoadingChatPrompt}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
+                              >
+                                {copiedMdKey === 'chat-stage2-md' ? (
+                                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                ) : (
+                                  <FileText className="w-3.5 h-3.5" />
+                                )}
+                                <span>{copiedMdKey === 'chat-stage2-md' ? '已复制 .md' : '复制阶段二 .md'}</span>
+                              </button>
+                            </>
+                          )}
                         </>
                       )}
                     </div>
                   </div>
+                  {chatPromptCopyNotice && (
+                    <div
+                      className={`text-xs rounded border px-3 py-2 ${
+                        chatPromptCopyNotice.ok
+                          ? 'border-emerald-800/70 bg-emerald-950/30 text-emerald-200'
+                          : 'border-red-800/70 bg-red-950/30 text-red-200'
+                      }`}
+                    >
+                      {chatPromptCopyNotice.message}
+                    </div>
+                  )}
                 </div>
 
                 {/* 步骤 2：一键粘贴 AI 输出（自动识别阶段一 / 阶段二 / 修复补丁） */}
@@ -3216,7 +3927,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <span className="text-xs font-medium text-neutral-300">
                       第二步：{isStage2PendingChat
-                        ? '阶段一已就绪，点击下方按钮粘贴阶段二 SVG 输出并自动组装完成：'
+                        ? '阶段一已就绪，点击下方按钮粘贴阶段二图表输出并自动组装完成：'
                         : '点击粘贴 AI 输出（自动识别阶段一 / 阶段二 / 修复补丁 / 完整课件）：'}
                     </span>
 
@@ -3230,6 +3941,27 @@ export const LessonView: React.FC<LessonViewProps> = ({
                       >
                         <Check className="w-3.5 h-3.5" />
                         <span>{isSavingImport ? '识别保存中...' : '粘贴 AI 输出并自动识别导入'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        data-testid="chat-step2-toggle-manual-paste-btn"
+                        onClick={() => {
+                          setShowChatManualPaste((v) => {
+                            const next = !v;
+                            if (next) {
+                              window.setTimeout(() => chatImportBoxRef.current?.focus(), 30);
+                            }
+                            return next;
+                          });
+                        }}
+                        className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs border rounded transition-colors whitespace-nowrap ${
+                          showChatManualPaste
+                            ? 'border-sky-500/70 bg-sky-950/40 text-sky-200'
+                            : 'border-neutral-700 hover:border-neutral-500 text-neutral-200 hover:text-white'
+                        }`}
+                      >
+                        <span>{showChatManualPaste ? '收起粘贴框' : '手动粘贴框 / 补丁'}</span>
                       </button>
 
                       <label className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded cursor-pointer transition-colors whitespace-nowrap">
@@ -3260,15 +3992,34 @@ export const LessonView: React.FC<LessonViewProps> = ({
                   {showChatManualPaste && (
                     <div className="bg-neutral-950 border border-neutral-800 rounded p-2.5 space-y-2">
                       <div className="flex items-center justify-between text-[11px] text-neutral-400">
-                        <span>临时粘贴框（按 Ctrl+V 粘贴后点击识别导入）：</span>
-                        <button
-                          type="button"
-                          onClick={() => setShowChatManualPaste(false)}
-                          className="text-neutral-500 hover:text-neutral-300"
-                        >
-                          收起
-                        </button>
+                        <span>在此手动粘贴阶段一 JSON / 阶段二图表 / 局部修复补丁后点击识别导入：</span>
+                        <div className="flex items-center gap-2 shrink-0">
+                          {rawImportInput && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setRawImportInput('');
+                                chatImportBoxRef.current?.focus();
+                              }}
+                              className="text-neutral-400 hover:text-white"
+                            >
+                              清空
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => setShowChatManualPaste(false)}
+                            className="text-neutral-500 hover:text-neutral-300"
+                          >
+                            收起
+                          </button>
+                        </div>
                       </div>
+                      {!displayedImportAudit && importReplaceHint && (
+                        <div className="text-[11px] text-sky-300 font-mono">
+                          {importReplaceHint}
+                        </div>
+                      )}
                       <textarea
                         ref={chatImportBoxRef}
                         id="chat-import-box"
@@ -3278,7 +4029,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                           setRawImportInput(e.target.value);
                           if (importReplaceHint) setImportReplaceHint(null);
                         }}
-                        placeholder="按 Ctrl+V 粘贴外部 AI 输出的阶段一 JSON / 阶段二 SVG / 补丁 / Markdown..."
+                        placeholder="按 Ctrl+V 或长按粘贴外部 AI 输出的阶段一 JSON / 阶段二 SVG / 增量修复补丁 / Markdown..."
                         className="w-full bg-black border border-neutral-800 rounded p-2.5 text-xs font-mono text-neutral-200 leading-relaxed focus:outline-none focus:border-sky-500"
                       />
                       <div className="flex justify-end">
@@ -3295,50 +4046,50 @@ export const LessonView: React.FC<LessonViewProps> = ({
                   )}
 
                   {/* 自动渲染与图示引用自检面板（输入课件内容后实时检测失败部分并生成修改提示词） */}
-                  {importAuditResult && (
+                  {displayedImportAudit && (
                     <div
                       data-testid="import-render-audit"
                       className={`rounded border p-3.5 space-y-2.5 text-xs ${
-                        importAuditResult.report.issues.length > 0
+                        displayedImportAudit.report.issues.length > 0
                           ? 'border-red-900/70 bg-red-950/25 text-neutral-200'
                           : 'border-emerald-900/60 bg-emerald-950/20 text-emerald-300'
                       }`}
                     >
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <div className="flex items-center gap-2 font-medium">
-                          {importAuditResult.report.issues.length > 0 ? (
+                          {displayedImportAudit.report.issues.length > 0 ? (
                             <>
                               <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
                               <span className="text-red-200">
-                                {importAuditResult.report.summaryText}
+                                {displayedImportAudit.report.summaryText}
                               </span>
                             </>
                           ) : (
                             <>
                               <Check className="w-4 h-4 text-emerald-400 shrink-0" />
-                              <span>{importAuditResult.report.summaryText}</span>
+                              <span>{displayedImportAudit.report.summaryText}</span>
                             </>
                           )}
                         </div>
 
-                        {importAuditResult.report.issues.length > 0 ? (
+                        {displayedImportAudit.report.issues.length > 0 ? (
                           <div className="flex flex-wrap items-center gap-2">
                             <button
                               type="button"
                               onClick={async () => {
+                                const repairText = displayedImportAudit.report.repairPrompt;
                                 try {
-                                  await navigator.clipboard.writeText(
-                                    importAuditResult.report.repairPrompt
-                                  );
+                                  await copyPromptText(repairText);
                                   setCopiedImportRepairPrompt(true);
                                   setTimeout(() => setCopiedImportRepairPrompt(false), 2000);
                                 } catch {
                                   await handleCopyMdPromptFile(
                                     'import-repair-md',
                                     `${slot.id}-repair-prompt.md`,
-                                    importAuditResult.report.repairPrompt
+                                    repairText
                                   );
                                 }
+                                await latchCurrentImportBaseAndClearInput();
                               }}
                               className="inline-flex items-center gap-1.5 px-3 py-1 bg-white text-black hover:bg-neutral-200 font-medium rounded transition-colors"
                             >
@@ -3356,13 +4107,14 @@ export const LessonView: React.FC<LessonViewProps> = ({
                             </button>
                             <button
                               type="button"
-                              onClick={() =>
-                                handleCopyMdPromptFile(
+                              onClick={async () => {
+                                await handleCopyMdPromptFile(
                                   'import-repair-md',
                                   `${slot.id}-repair-prompt.md`,
-                                  importAuditResult.report.repairPrompt
-                                )
-                              }
+                                  displayedImportAudit.report.repairPrompt
+                                );
+                                await latchCurrentImportBaseAndClearInput();
+                              }}
                               className="inline-flex items-center gap-1.5 px-2.5 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors"
                             >
                               {copiedMdKey === 'import-repair-md' ? (
@@ -3379,6 +4131,14 @@ export const LessonView: React.FC<LessonViewProps> = ({
                               className="px-2.5 py-1 border border-sky-700/80 hover:border-sky-400 bg-sky-950/40 text-sky-200 hover:text-white rounded transition-colors"
                             >
                               重新从剪贴板粘贴
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="import-clear-for-patch-btn"
+                              onClick={() => void latchCurrentImportBaseAndClearInput()}
+                              className="px-2.5 py-1 border border-neutral-700 hover:border-sky-500 text-neutral-200 hover:text-white rounded transition-colors"
+                            >
+                              清空并粘贴补丁
                             </button>
                           </div>
                         ) : (
@@ -3399,10 +4159,10 @@ export const LessonView: React.FC<LessonViewProps> = ({
                         </div>
                       )}
 
-                      {importAuditResult.report.issues.length > 0 && (
+                      {displayedImportAudit.report.issues.length > 0 && (
                         <>
                           <ul className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
-                            {importAuditResult.report.issues.map((iss) => (
+                            {displayedImportAudit.report.issues.map((iss) => (
                               <li
                                 key={iss.id}
                                 className="border border-red-900/40 bg-black/70 rounded px-3 py-2 space-y-1"
@@ -3422,9 +4182,12 @@ export const LessonView: React.FC<LessonViewProps> = ({
                                 <div className="text-[11px] font-mono text-red-300/90 break-all bg-neutral-950 border border-neutral-900 rounded px-2 py-1">
                                   {iss.rawSnippet}
                                 </div>
-                                <div className="text-[11px] text-neutral-400">
-                                  {iss.detail}
-                                </div>
+                                <div
+                                  className="text-[11px] text-neutral-400 [&>p]:m-0"
+                                  dangerouslySetInnerHTML={{
+                                    __html: renderInlineMathWithLatex(iss.detail, lessonVisuals),
+                                  }}
+                                />
                               </li>
                             ))}
                           </ul>
@@ -3532,7 +4295,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
         )}
 
         {!activeLesson ? (
-          !isChatWorkbenchOpen ? (
+          (currentMode === 'api' || !isChatWorkbenchOpen) ? (
             <div className="border border-neutral-800 rounded p-8 my-8 space-y-4">
               <div className="text-xs font-mono text-neutral-500">
                 {slot.date} · {slot.id} · 第 {slot.dayIndex} 讲（排程第 {slot.scheduledDay || slot.dayIndex}/{course.durationDays} 天 ·{' '}
@@ -3593,7 +4356,8 @@ export const LessonView: React.FC<LessonViewProps> = ({
                   </button>
                 )}
 
-                <button
+                {currentMode !== 'api' && (<>
+<button
                   type="button"
                   onClick={() => {
                     setWorkbenchTab('chat');
@@ -3616,6 +4380,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                   <FolderSync className="w-3.5 h-3.5" />
                   <span>Agent 本地工作区同步</span>
                 </button>
+</>)}
               </div>
             </div>
           ) : null
@@ -3740,13 +4505,14 @@ export const LessonView: React.FC<LessonViewProps> = ({
                         onClick={() => setShowActiveAuditDetails((v) => !v)}
                         className="px-2.5 py-1 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors"
                       >
-                        {showActiveAuditDetails ? '收起错误详情与提示词' : `查看 ${activeLessonAudit.issues.length} 处详情`}
+                        {showActiveAuditDetails ? '收起诊断详情' : `查看 ${activeLessonAudit.issues.length} 处详情`}
                       </button>
-                      <button
+                      {currentMode !== 'api' && (<>
+<button
                         type="button"
                         onClick={async () => {
                           try {
-                            await navigator.clipboard.writeText(activeLessonAudit.repairPrompt);
+                            await copyPromptText(activeLessonAudit.repairPrompt);
                             setCopiedActiveRepairPrompt(true);
                             setTimeout(() => setCopiedActiveRepairPrompt(false), 2000);
                           } catch {
@@ -3798,6 +4564,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                       >
                         {isApplyingQuickRepair ? '合并修复中...' : '粘贴增量修复补丁'}
                       </button>
+</>)}
                       <button
                         type="button"
                         onClick={() =>
@@ -3813,7 +4580,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     </div>
                   </div>
 
-                  {showQuickRepairBox && (
+                  {currentMode !== 'api' && showQuickRepairBox && (
                     <div
                       data-testid="quick-repair-box"
                       className="border border-sky-900/60 bg-black/80 rounded p-3 space-y-2.5"
@@ -3926,11 +4693,17 @@ export const LessonView: React.FC<LessonViewProps> = ({
                             <div className="text-[11px] font-mono text-red-300/90 break-all bg-neutral-950 border border-neutral-900 rounded px-2 py-1">
                               {iss.rawSnippet}
                             </div>
-                            <div className="text-[11px] text-neutral-400">{iss.detail}</div>
+                            <div
+                              className="text-[11px] text-neutral-400 [&>p]:m-0"
+                              dangerouslySetInnerHTML={{
+                                __html: renderInlineMathWithLatex(iss.detail, lessonVisuals),
+                              }}
+                            />
                           </li>
                         ))}
                       </ul>
-                      <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                      {currentMode !== 'api' && (
+<div className="flex flex-wrap items-center justify-between gap-2 pt-1">
                         <span className="text-[11px] font-mono text-neutral-400">
                           分阶段局部重生成 / 修复提示词（不重生成整节）：
                         </span>
@@ -3940,7 +4713,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                               { stage: 'planning_prereq', label: '先修与规划' },
                               { stage: 'prose_derivation', label: '正文与推导' },
                               { stage: 'exercises_feedback', label: '练习与反馈' },
-                              { stage: 'diagrams_topology', label: '拓扑与SVG图示' },
+                              { stage: 'diagrams_topology', label: '拓扑与图表代码' },
                             ] as const
                           ).map(({ stage, label }) => (
                             <button
@@ -3958,7 +4731,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                                 setStageRepairPreview({ stage, prompt: promptText });
                                 setShowQuickRepairBox(true);
                                 try {
-                                  await navigator.clipboard.writeText(promptText);
+                                  await copyPromptText(promptText);
                                   setCopiedStageKey(stage);
                                   setTimeout(() => setCopiedStageKey(null), 2000);
                                 } catch {
@@ -3994,6 +4767,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                           </button>
                         </div>
                       </div>
+)}
                     </div>
                   )}
                 </section>
@@ -4208,23 +4982,39 @@ export const LessonView: React.FC<LessonViewProps> = ({
                                 <span
                                   className={`text-sm ${
                                     hideVocabMeaning
-                                      ? 'bg-neutral-900 text-transparent select-none rounded px-2 cursor-pointer hover:text-neutral-200'
+                                      ? 'bg-neutral-900 text-transparent select-none rounded px-2 cursor-pointer hover:text-neutral-200 [&_*]:!text-transparent'
                                       : 'text-neutral-200'
-                                  }`}
+                                  } [&>p]:m-0`}
                                   onClick={() => hideVocabMeaning && setHideVocabMeaning(false)}
-                                >
-                                  {stripAiCitationArtifacts(item.meaning)}
-                                </span>
+                                  dangerouslySetInnerHTML={{
+                                    __html: renderInlineMathWithLatex(
+                                      stripAiCitationArtifacts(item.meaning),
+                                      lessonVisuals
+                                    ),
+                                  }}
+                                />
                               </div>
                               {item.example && (
                                 <div className="text-xs text-neutral-400 space-y-0.5 pt-1">
-                                  <p className="font-serif-reading text-neutral-300 text-sm">
-                                    {stripAiCitationArtifacts(item.example)}
-                                  </p>
+                                  <p
+                                    className="font-serif-reading text-neutral-300 text-sm [&>p]:m-0"
+                                    dangerouslySetInnerHTML={{
+                                      __html: renderInlineMathWithLatex(
+                                        stripAiCitationArtifacts(item.example),
+                                        lessonVisuals
+                                      ),
+                                    }}
+                                  />
                                   {!hideVocabMeaning && item.exampleTranslation && (
-                                    <p className="text-neutral-500">
-                                      {stripAiCitationArtifacts(item.exampleTranslation)}
-                                    </p>
+                                    <p
+                                      className="text-neutral-500 [&>p]:m-0"
+                                      dangerouslySetInnerHTML={{
+                                        __html: renderInlineMathWithLatex(
+                                          stripAiCitationArtifacts(item.exampleTranslation),
+                                          lessonVisuals
+                                        ),
+                                      }}
+                                    />
                                   )}
                                 </div>
                               )}
@@ -4252,11 +5042,29 @@ export const LessonView: React.FC<LessonViewProps> = ({
                   <div className="flex flex-wrap items-center justify-between gap-4 border-b border-neutral-900 pb-3">
                     <div>
                       <h2 className="text-base font-semibold text-white">
-                        二、文章阅读：{stripAiCitationArtifacts(activeLesson.englishPayload.articleTitle)}
+                        二、文章阅读：
+                        <span
+                          className="[&>p]:m-0"
+                          dangerouslySetInnerHTML={{
+                            __html: renderInlineMathWithLatex(
+                              stripAiCitationArtifacts(activeLesson.englishPayload.articleTitle),
+                              lessonVisuals
+                            ),
+                          }}
+                        />
                       </h2>
                       {activeLesson.englishPayload.sourceReference && (
                         <p className="text-xs text-neutral-500 mt-0.5">
-                          {stripAiCitationArtifacts(activeLesson.englishPayload.sourceReference)} · 点击文中下划线词汇可查看释义
+                          <span
+                            className="[&>p]:m-0"
+                            dangerouslySetInnerHTML={{
+                              __html: renderInlineMathWithLatex(
+                                stripAiCitationArtifacts(activeLesson.englishPayload.sourceReference),
+                                lessonVisuals
+                              ),
+                            }}
+                          />{' '}
+                          · 点击文中下划线词汇可查看释义
                         </p>
                       )}
                     </div>
@@ -4280,10 +5088,26 @@ export const LessonView: React.FC<LessonViewProps> = ({
                           <span className="font-mono text-neutral-400">
                             {activeWordCard.phonetic}
                           </span>
-                          <span className="text-neutral-200">{activeWordCard.meaning}</span>
+                          <span
+                            className="text-neutral-200 [&>p]:m-0"
+                            dangerouslySetInnerHTML={{
+                              __html: renderInlineMathWithLatex(
+                                stripAiCitationArtifacts(activeWordCard.meaning),
+                                lessonVisuals
+                              ),
+                            }}
+                          />
                         </div>
                         {activeWordCard.example && (
-                          <p className="text-neutral-400">{activeWordCard.example}</p>
+                          <p
+                            className="text-neutral-400 [&>p]:m-0"
+                            dangerouslySetInnerHTML={{
+                              __html: renderInlineMathWithLatex(
+                                stripAiCitationArtifacts(activeWordCard.example),
+                                lessonVisuals
+                              ),
+                            }}
+                          />
                         )}
                       </div>
                       <button
@@ -4306,9 +5130,15 @@ export const LessonView: React.FC<LessonViewProps> = ({
                           )}
                         </p>
                         {showTranslation && (
-                          <p className="text-sm leading-relaxed text-neutral-400 pt-1">
-                            {stripAiCitationArtifacts(para.chinese)}
-                          </p>
+                          <p
+                            className="text-sm leading-relaxed text-neutral-400 pt-1 [&>p]:m-0"
+                            dangerouslySetInnerHTML={{
+                              __html: renderInlineMathWithLatex(
+                                stripAiCitationArtifacts(para.chinese),
+                                lessonVisuals
+                              ),
+                            }}
+                          />
                         )}
                       </div>
                     ))}
@@ -4499,8 +5329,9 @@ export const LessonView: React.FC<LessonViewProps> = ({
                           onClick={() => openFloatingVisual(diagId)}
                           aria-label={`点击在小窗中查看图示：${diagTitle}`}
                           className="diagram-svg-frame w-full block text-left overflow-x-auto cursor-zoom-in rounded hover:bg-neutral-900/30 transition-colors focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                          dangerouslySetInnerHTML={{ __html: enhancedSvg }}
-                        />
+                        >
+                          <DiagramRenderer spec={diag.diagramSpec} svgCode={enhancedSvg} />
+                        </button>
                         {diag.caption && (
                           <figcaption
                             className="text-xs text-neutral-400 mt-3 leading-relaxed [&>p]:m-0"
@@ -4630,8 +5461,9 @@ export const LessonView: React.FC<LessonViewProps> = ({
                                 onClick={() => openFloatingVisual(exDiagId)}
                                 aria-label={`点击在小窗中查看题目配图：${exDiagTitle}`}
                                 className="diagram-svg-frame w-full block text-left overflow-x-auto cursor-zoom-in rounded hover:bg-neutral-900/30 transition-colors focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                                dangerouslySetInnerHTML={{ __html: enhancedSvg }}
-                              />
+                              >
+                                <DiagramRenderer spec={exDiag.diagramSpec} svgCode={enhancedSvg} />
+                              </button>
                               {exDiag.caption && (
                                 <figcaption
                                   className="text-xs text-neutral-400 leading-relaxed [&>p]:m-0"
@@ -4700,7 +5532,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                             })}
                           </div>
                         ) : (
-                          <div>
+                          <div className="space-y-1.5 max-w-md">
                             <input
                               type="text"
                               value={currentVal}
@@ -4715,6 +5547,11 @@ export const LessonView: React.FC<LessonViewProps> = ({
                               aria-label={`第 ${qIdx + 1} 题填空答案`}
                               className="w-full max-w-md bg-black border border-neutral-800 rounded px-3 py-2 text-sm font-mono text-white placeholder:text-neutral-600 focus:outline-none focus:border-neutral-500 disabled:opacity-70"
                             />
+                            {renderInputMathPreviewBox(
+                              currentVal,
+                              lessonVisuals,
+                              `exercise-input-latex-preview-${q.id}`
+                            )}
                           </div>
                         )}
 
@@ -4941,8 +5778,9 @@ export const LessonView: React.FC<LessonViewProps> = ({
                                 onClick={() => openFloatingVisual(exDiagId)}
                                 aria-label={`点击在小窗中查看题目配图：${exDiagTitle}`}
                                 className="diagram-svg-frame w-full block text-left overflow-x-auto cursor-zoom-in rounded hover:bg-neutral-900/30 transition-colors focus:outline-none focus:ring-1 focus:ring-neutral-600"
-                                dangerouslySetInnerHTML={{ __html: enhancedSvg }}
-                              />
+                              >
+                                <DiagramRenderer spec={exDiag.diagramSpec} svgCode={enhancedSvg} />
+                              </button>
                               {exDiag.caption && (
                                 <figcaption
                                   className="text-xs text-neutral-400 leading-relaxed [&>p]:m-0"
@@ -5011,7 +5849,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                             })}
                           </div>
                         ) : (
-                          <div className="pl-5">
+                          <div className="pl-5 space-y-1.5 max-w-md">
                             <input
                               type="text"
                               value={currentVal}
@@ -5026,6 +5864,11 @@ export const LessonView: React.FC<LessonViewProps> = ({
                               aria-label={`第 ${qIdx + 1} 题填空答案`}
                               className="w-full max-w-md bg-black border border-neutral-800 rounded px-3 py-2 text-sm font-mono text-white placeholder:text-neutral-600 focus:outline-none focus:border-neutral-500 disabled:opacity-70"
                             />
+                            {renderInputMathPreviewBox(
+                              currentVal,
+                              lessonVisuals,
+                              `exercise-input-latex-preview-${q.id}`
+                            )}
                           </div>
                         )}
 
@@ -5141,9 +5984,29 @@ export const LessonView: React.FC<LessonViewProps> = ({
                               [rc.id]: e.target.value,
                             }))
                           }
-                          placeholder="用自己的话写下你的解释或推导逻辑（保存在本地）..."
+                          placeholder="用自己的话写下你的解释或推导逻辑（支持 Markdown 与 $LaTeX$ 公式，保存在本地）..."
                           className="w-full bg-black border border-neutral-800 rounded p-3 text-xs text-neutral-200 focus:outline-none focus:border-neutral-500"
                         />
+
+                        {(reverseDrafts[rc.id] || '').trim() && (
+                          <div
+                            data-testid={`reverse-check-preview-${rc.id}`}
+                            className="p-3 rounded border border-neutral-800 bg-black/75 space-y-1 text-xs"
+                          >
+                            <div className="text-[11px] font-mono text-sky-400">
+                              我的推导与解释预览：
+                            </div>
+                            <div
+                              className="text-neutral-200 leading-relaxed lesson-prose [&>p]:m-0"
+                              dangerouslySetInnerHTML={{
+                                __html: renderMarkdownWithLatex(
+                                  reverseDrafts[rc.id] || '',
+                                  lessonVisuals
+                                ),
+                              }}
+                            />
+                          </div>
+                        )}
 
                         <div className="flex items-center justify-end gap-2">
                           <button
@@ -5442,16 +6305,18 @@ export const LessonView: React.FC<LessonViewProps> = ({
                 >
           <div
             onPointerDown={(e) => {
-              if ((e.target as HTMLElement).closest('button')) return;
+              if (!e.isPrimary || e.button !== 0 || (e.target as Element).closest('button')) return;
+              e.currentTarget.setPointerCapture(e.pointerId);
               dragStateRef.current = {
                 dragging: true,
+                pointerId: e.pointerId,
                 startX: e.clientX,
                 startY: e.clientY,
                 origDx: floatingOffset.dx,
                 origDy: floatingOffset.dy,
               };
             }}
-            className="flex items-center justify-between gap-2 px-3 py-2 bg-neutral-900/95 border-b border-neutral-800 cursor-move select-none"
+            className="flex items-center justify-between gap-2 px-3 py-2 bg-neutral-900/95 border-b border-neutral-800 cursor-move select-none touch-none"
           >
             <div className="flex items-center gap-2 min-w-0">
               <Move className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
@@ -5538,10 +6403,19 @@ export const LessonView: React.FC<LessonViewProps> = ({
                   <div
                     className="floating-diagram-svg mx-auto"
                     style={{ width: '100%' }}
-                    dangerouslySetInnerHTML={{
-                      __html: activeFloatingVisual.svgCode || '',
-                    }}
-                  />
+                  >
+                    <DiagramRenderer
+                      spec={
+                        activeLesson?.diagrams?.find(
+                          (d) => (d.id || '').trim().toLowerCase() === activeFloatingVisual.id.toLowerCase()
+                        )?.diagramSpec ||
+                        activeLesson?.exercises?.find(
+                          (ex) => (ex.diagramId || `diag-${ex.id}`).trim().toLowerCase() === activeFloatingVisual.id.toLowerCase()
+                        )?.diagramSpec
+                      }
+                      svgCode={activeFloatingVisual.svgCode || ''}
+                    />
+                  </div>
                 ) : activeFloatingVisual.imageUrl ? (
                   <img
                     src={activeFloatingVisual.imageUrl}
@@ -5554,9 +6428,9 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
               {activeFloatingVisual.caption && (
                 <div
-                  className="px-3 py-2 border-t border-neutral-900 bg-neutral-950 text-[11px] text-neutral-400 leading-relaxed"
+                  className="px-3 py-2 border-t border-neutral-900 bg-neutral-950 text-[11px] text-neutral-400 leading-relaxed [&>p]:m-0"
                   dangerouslySetInnerHTML={{
-                    __html: renderInlineMathWithLatex(activeFloatingVisual.caption),
+                    __html: renderMarkdownWithLatex(activeFloatingVisual.caption, lessonVisuals),
                   }}
                 />
               )}
@@ -5607,9 +6481,12 @@ export const LessonView: React.FC<LessonViewProps> = ({
                       }}
                     />
                     <div className="min-w-0">
-                      <div className="text-xs font-semibold text-white truncate">
-                        {entry.name}
-                      </div>
+                      <div
+                        className="text-xs font-semibold text-white truncate [&>p]:m-0"
+                        dangerouslySetInnerHTML={{
+                          __html: renderInlineMathWithLatex(entry.name, lessonVisuals),
+                        }}
+                      />
                       <div className="text-[10px] font-mono text-sky-300/80">
                         {entry.source === 'glossary' ? '上文符号释义表' : '自动识别自上文讲解'}
                       </div>
