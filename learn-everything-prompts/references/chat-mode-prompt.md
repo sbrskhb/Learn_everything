@@ -197,6 +197,7 @@ This file defines the copy-paste prompt templates for **Chat Mode** loaded by `s
 - **学科与水平**：{{profileLabel}}（{{levelLabel}}）
 - **课程目标**：{{courseGoal}}
 - **补充要求**：{{extraRequirements}}
+{{vocabSection}}
 {{splitRegionsSection}}
 {{materialSection}}
 
@@ -224,14 +225,121 @@ This file defines the copy-paste prompt templates for **Chat Mode** loaded by `s
       "id": "sec-01",
       "regionId": "region-01",
       "regionIds": ["region-01"],
+      "topicGroup": "所属主题（语言课程适用，其他可省略）",
       "title": "第 1 节：逻辑完整的知识点块主题",
       "objective": "本节具体可检验的自学目标",
       "prerequisites": ["本节先修知识"],
       "teachingScope": "对应区域 region-01 / 原教材章节及页码范围",
       "connectionNote": "与前后小节的衔接关系",
-      "keyTopics": ["核心知识点1", "核心知识点2"]
+      "keyTopics": ["核心知识点1", "核心知识点2"],
+      "targetWordIds": ["w-001"],
+      "reviewWordIds": []
     }
   ]
+}
+```
+````
+
+---
+
+## 4. Chat Mode Language Reading Prompt (`template: chat-english-lesson-prompt`)
+
+````text
+请为我的语言课程《{{courseName}}》生成 **第 {{dayIndex}} 节（小节 ID：`{{sectionId}}`）：{{slotTitle}}** 的英文阅读课件（以**完整英文文章为主体，词汇理解与实际运用为辅助**，一次输出完整终稿 JSON，无需分两阶段）。
+
+### 一、本节主题、时间窗与学习背景
+- **课程目标**：{{courseGoal}}
+- **本节主题与话题**：{{topicThemeInfo}}
+- **本节学习目标**：{{slotObjective}}
+- **学习者水平与目的**：{{levelLabel}}｜{{learningPurpose}}
+- **文章检索窗口（最近一个月内）**：`{{oneMonthAgoDate}}` ~ `{{currentDate}}`
+- **偏好来源参考**：{{preferredSources}}
+- **篇幅与难度参考**：{{readingLengthHint}}
+- **前后衔接**：前序 {{prevCourseInfo}}；后续 {{nextCourseInfo}}
+- **补充要求**：{{extraRequirements}}
+{{englishWordsSection}}{{materialSection}}
+
+### 二、教学要求与质量规范
+{{teachingSystemPrompt}}
+
+### 三、联网检索优先级与输出 JSON 规范
+1. **严格按三级优先级获取或生成文章正文（检索窗 `{{oneMonthAgoDate}}` ~ `{{currentDate}}`）**：
+   - **① 首选（找到原文章并微调词汇）**：若支持联网检索，优先找最近一个月内与「{{topicThemeInfo}}」相关的真实英文原文，在保持原文章事实与行文基础上自然微调、融入本节目标词与前节复现词；若搜到的单篇原文过短，**可在一节课件中放入两篇同主题近期短文章**（在 `paragraphs` 中分段标注两篇标题与正文，并保留两篇的 `sourceReference`、`publishDate` 与 `sourceUrl`），设 `"contentOrigin": "authentic_article"`，并在 `originNote` 注明是否微调词汇或双篇组合。
+   - **② 次选（根据原文章自己写，加入词汇）**：若无法直接完整展示原文，或目标词较多难以仅靠微调融入，请严格根据检索到的近期真实文章核心内容与结构**自己重写完整文章并自然加入目标词汇**；保留所参考原文的 `sourceReference`、`articleTitle`、`publishDate` 与 `sourceUrl`，设 `"contentOrigin": "adapted_article"`，`originNote` 注明「基于近期真实原文改写并加入词汇」。
+   - **③ 兜底（纯自己编）**：仅当无法检索到合适近期文章（或当前环境无法联网）时，才基于可靠背景纯 AI 原创完整文章，设 `"contentOrigin": "ai_original"`、`sourceUrl: ""`，并在 `originNote` 明确标注 AI 原创（严禁虚构新闻链接或信源）。
+2. `englishPayload.targetWords` 将直接驱动阅读界面的**「点击正文生词弹出释义」**交互，请将本节重点新词、文章中出现的有价值生词以及正文中自然复现的前节生词（标 `"isReview": true`）一并收入其中（写明原型、音标、语境释义、搭配与例句）。**当存在目标词库时，正文中除词库词汇以外的其余用词难度应小于等于词库中的词汇**（避免在词库外引入更生僻的高难词）。
+3. 坚持**先阅读、后讲解、再练习**：`markdownBody` 仅精炼呈现「词汇用法精讲」与「1～3 个长难句解析」，无需逐词罗列全部生词；**「长难句解析」或精讲中引用正文句子时，请使用 `{{quote:P<段落号>:S<句号>}}`（1-based，如 `{{quote:P1:S2}}`）锚点直接引用原文**，确保原文微调时精讲句子与用词同步更新；`exercises` 包含 3～5 道深度阅读理解题 + 2～4 道脱离原文的词汇运用题（语境选词/搭配辨析/句子改写）。**所有选择题的正确选项与错误选项必须保持词数与信息量大致均衡，避免“三短一长选最长”**，且正确选项位置随机分布。无需自行报告词频与覆盖率。
+4. 只输出一个合法 \`\`\`json ... \`\`\` 代码块（中文讲解中货币金额请写「美元」，勿成对使用 `$`）：
+```json
+{
+  "sectionId": "{{sectionId}}",
+  "generationStage": "complete",
+  "title": "{{slotTitle}}",
+  "summary": "本节文章主题与语言学习要点概括",
+  "keyPoints": ["阅读理解重点", "核心词汇与表达收获"],
+  "teachingContext": {
+    "prerequisites": ["前序主题衔接"],
+    "learningObjectives": ["{{slotObjective}}"],
+    "teachingScope": "{{topicThemeInfo}}",
+    "connectionNote": "{{connectionNote}}"
+  },
+  "englishPayload": {
+    "articleTitle": "完整英文文章标题",
+    "contentOrigin": "authentic_article | adapted_article | ai_original",
+    "sourceReference": "来源刊物/网站名称",
+    "publishDate": "YYYY-MM-DD",
+    "sourceUrl": "https://...（仅 ai_original 时留空）",
+    "originNote": "标注：真实原文微调 / 基于近期真实原文改写 / 纯 AI 原创",
+    "articleMode": "{{articleMode}}",
+    "targetWords": [
+      {
+        "id": "w-001",
+        "word": "单词原型或短语",
+        "phonetic": "/.../",
+        "meaning": "语境中文释义",
+        "usageNote": "固定搭配、熟词生义或近义辨析简注",
+        "collocations": ["常用搭配1", "常用搭配2"],
+        "example": "新语境例句",
+        "exampleTranslation": "例句翻译",
+        "isReview": false
+      }
+    ],
+    "paragraphs": [
+      {
+        "english": "完整英文正文段落...",
+        "chinese": "流畅中文译文..."
+      }
+    ],
+    "grammarAndUsageNotes": ""
+  },
+  "markdownBody": "## 词汇用法精讲\n聚焦重点生词的语境义、搭配、熟词生义与近义词区别。\n\n## 长难句解析\n选取 1～3 句正文复杂句，解析关键语法结构与准确句意。",
+  "exercises": [
+    {
+      "id": "ex-1",
+      "stage": "comprehensive",
+      "type": "choice",
+      "difficulty": "application",
+      "categoryLabel": "阅读理解·主旨概括",
+      "question": "阅读理解题目（3～5 题，涵盖主旨、细节、推断、作者观点）",
+      "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
+      "answer": "B",
+      "explanation": "答案依据与干扰项辨析"
+    },
+    {
+      "id": "ex-2",
+      "stage": "comprehensive",
+      "type": "choice",
+      "difficulty": "application",
+      "categoryLabel": "词汇练习·语境选词",
+      "question": "新语境选词/搭配辨析/句子改写题（2～4 题；句子改写可将 type 设为 fill）",
+      "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
+      "answer": "A",
+      "explanation": "用法解析"
+    }
+  ],
+  "diagrams": [],
+  "heuristicQuestions": [],
+  "reverseChecks": []
 }
 ```
 ````

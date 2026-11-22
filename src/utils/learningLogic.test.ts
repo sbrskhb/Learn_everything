@@ -6,7 +6,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { PDFDocument } from 'pdf-lib';
 import {
-  BUILTIN_VOCAB_BANKS,
   addDaysToDateString,
   allocateEnglishWordsRandomly,
   allocateSectionsToDays,
@@ -25,6 +24,19 @@ import {
   parseVocabularyInput,
   sanitizeCourseFolderName,
 } from './learningLogic';
+
+const MOCK_BASE_WORDS = Array.from({ length: 10 }, (_, idx) => ({
+  word: `baseword${idx + 1}`,
+  meaning: `基础词汇${idx + 1}`,
+}));
+
+const MOCK_TARGET_WORDS = [
+  ...MOCK_BASE_WORDS,
+  ...Array.from({ length: 25 }, (_, idx) => ({
+    word: `advanced${idx + 1}`,
+    meaning: `进阶词汇${idx + 1}`,
+  })),
+];
 import {
   analyzePdfBuffer,
   applyPageOffsetToSplitPlan,
@@ -55,23 +67,18 @@ test('sanitizeCourseFolderName handles illegal characters, Chinese names, and du
   assert.equal(sanitizeCourseFolderName('   ', new Set()), 'course_project');
 });
 
-test('vocabulary set difference: CET-6 minus Gaokao yields exact remaining words', () => {
-  const cet6 = BUILTIN_VOCAB_BANKS.cet6.words;
-  const gaokao = BUILTIN_VOCAB_BANKS.gaokao.words;
-
-  const diff = computeVocabSetDifference(cet6, gaokao);
-  assert.equal(diff.overlapCount, gaokao.length);
-  assert.equal(diff.effectiveWords.length, diff.targetTotal - gaokao.length);
-  const gaokaoKeys = new Set(gaokao.map((w) => w.word.toLowerCase()));
+test('vocabulary set difference: target minus base yields exact remaining words', () => {
+  const diff = computeVocabSetDifference(MOCK_TARGET_WORDS, MOCK_BASE_WORDS);
+  assert.equal(diff.overlapCount, MOCK_BASE_WORDS.length);
+  assert.equal(diff.effectiveWords.length, diff.targetTotal - MOCK_BASE_WORDS.length);
+  const baseKeys = new Set(MOCK_BASE_WORDS.map((w) => w.word.toLowerCase()));
   for (const item of diff.effectiveWords) {
-    assert.equal(gaokaoKeys.has(item.word.toLowerCase()), false);
+    assert.equal(baseKeys.has(item.word.toLowerCase()), false);
   }
 });
 
 test('allocateEnglishWordsRandomly & computeVocabCoverageStats: random non-repeating draw and preserving started sections', () => {
-  const cet6 = BUILTIN_VOCAB_BANKS.cet6.words;
-  const gaokao = BUILTIN_VOCAB_BANKS.gaokao.words;
-  const diff = computeVocabSetDifference(cet6, gaokao);
+  const diff = computeVocabSetDifference(MOCK_TARGET_WORDS, MOCK_BASE_WORDS);
 
   const coverageOk = computeVocabCoverageStats(diff.effectiveWords.length, 4, 5);
   assert.equal(coverageOk.isExceedingCapacity, false);
@@ -295,7 +302,7 @@ test('parseVocabularyInput parses multiple formats and deduplicates case-insensi
 });
 
 test('allocateWordsToDays distributes words across N days without losing any item', () => {
-  const sampleWords = BUILTIN_VOCAB_BANKS.gaokao.words.slice(0, 25);
+  const sampleWords = MOCK_TARGET_WORDS.slice(0, 25);
   const buckets = allocateWordsToDays(sampleWords, 5);
   assert.equal(buckets.length, 5);
   const flattened = buckets.flat();
@@ -340,6 +347,15 @@ test('gradeSingleExercise and gradeExerciseSet grade choice and fill questions o
   });
   assert.equal(batchResult.score, 2);
   assert.equal(batchResult.total, 2);
+
+  // Fill question marked "我理解了" (selfUnderstood) passes automatically even with empty or different text,
+  // while choice questions ignore selfUnderstood.
+  assert.equal(gradeSingleExercise(questions[1], '', { selfUnderstood: true }).isCorrect, true);
+  assert.equal(gradeSingleExercise(questions[0], 'B', { selfUnderstood: true }).isCorrect, false);
+  const understoodBatch = gradeExerciseSet(questions, { q1: 'B', q2: '' }, ['q1', 'q2']);
+  assert.equal(understoodBatch.score, 1);
+  assert.equal(understoodBatch.details.q1.isCorrect, false);
+  assert.equal(understoodBatch.details.q2.isCorrect, true);
 });
 
 test('promptLibrary loads modular prompts and PDF split prompts accurately', () => {
@@ -454,8 +470,11 @@ test('promptLibrary loads modular prompts and PDF split prompts accurately', () 
   assert.equal(englishPrompt.includes('estimatedMinutes'), false);
   assert.equal(englishPrompt.includes('2026-11-12'), false);
   assert.equal(englishPrompt.includes('排程第'), false);
-  assert.equal(englishPrompt.includes('{{heuristic:hq-X}}'), true);
-  assert.equal(englishPrompt.includes('{{exercise:ex-X}}'), true);
+  assert.equal(englishPrompt.includes('最近一个月内'), true);
+  assert.equal(englishPrompt.includes('contentOrigin'), true);
+  assert.equal(englishPrompt.includes('sourceUrl'), true);
+  assert.equal(englishPrompt.includes('词汇用法精讲'), true);
+  assert.equal(englishPrompt.includes('长难句解析'), true);
   assert.equal(englishPrompt.includes('englishPayload'), true);
 });
 
@@ -1780,28 +1799,28 @@ test('dual-axis learner baseline + target depth resolves independently and compo
   assert.equal(lessonUser.includes('自定义水平：仅懂欧姆定律，零模电基础'), true);
   assert.equal(lessonUser.includes('深度钻研与高阶拓展'), true);
 
-  // 4. English category dynamically switches baseline/depth option copy and strategy summary
+  // 4. Language category dynamically switches baseline/depth option copy and unified strategy summary
   const { getBaselinePresetOptions, getDepthPresetOptions } = await import(
     '../prompts/promptLibrary'
   );
   const stemBaselines = getBaselinePresetOptions('stem');
   const engBaselines = getBaselinePresetOptions('english');
   assert.notEqual(stemBaselines[1].title, engBaselines[1].title);
-  assert.equal(engBaselines[1].title.includes('四六级'), true);
+  assert.equal(engBaselines[1].title.includes('常规基础'), true);
 
   const stemDepths = getDepthPresetOptions('stem');
   const engDepths = getDepthPresetOptions('english');
   assert.notEqual(stemDepths[1].title, engDepths[1].title);
-  assert.equal(engDepths[1].title.includes('外刊精读'), true);
+  assert.equal(engDepths[1].title.includes('精读教材'), true);
 
   const engProfile = resolveLearnerProfile({
     category: 'english',
     learnerBaseline: 'zero_base',
     learningDepth: 'master_textbook',
   });
-  assert.equal(engProfile.combinedLabel.includes('英语基础薄弱'), true);
-  assert.equal(engProfile.combinedLabel.includes('吃透外刊精读'), true);
-  assert.equal(engProfile.strategySummary.includes('英语跨阶强攀升策略'), true);
+  assert.equal(engProfile.combinedLabel.includes('语言零基础'), true);
+  assert.equal(engProfile.combinedLabel.includes('吃透精读教材'), true);
+  assert.equal(engProfile.strategySummary.includes('语言跨阶强攀升策略'), true);
 });
 
 test('browsingState utilities sanitize, merge local vs server state, and reconcile against courses', async () => {
@@ -3557,6 +3576,97 @@ test('Diagram Engine: all 5 structured engines compile deterministically with da
   assert.equal(rlcDiodeSvg.includes('NaN'), false);
   assert.equal(rlcDiodeSvg.includes('2mH'), true);
   assert.equal(rlcDiodeSvg.includes('>1</tspan>'), true);
+
+  // 5c. circuit: BJT (npn/pnp) and MOSFET (nmos/pmos) primitives
+  const transistorSvg = compileDiagramSpecSync({
+    type: 'circuit',
+    title: 'BJT 与 MOSFET 元件',
+    elements: [
+      { kind: 'node', label: 'u_i', anchor: 'in' },
+      { kind: 'capacitor', label: 'C_1', dir: 'right' },
+      { kind: 'npn', id: 'Q1', label: 'T_1', value: 'β=100' },
+      { kind: 'resistor', label: 'R_C', fromAnchor: 'Q1.c', dir: 'up' },
+      { kind: 'node', label: 'V_{CC}', anchor: 'vcc' },
+      { kind: 'resistor', label: 'R_E', fromAnchor: 'Q1.e', dir: 'down' },
+      { kind: 'ground' },
+      { kind: 'pnp', id: 'Q2', fromAnchor: 'vcc', pin: 'e', dir: 'left', length: 1 },
+      { kind: 'nmos', id: 'M1', label: 'M_1', fromAnchor: 'Q1.c' },
+      { kind: 'pmos', id: 'M2', depletion: true, flip: true },
+      { kind: 'wire', fromAnchor: 'M1.s', toAnchor: 'Q2.c' },
+    ],
+  });
+  assert.ok(transistorSvg);
+  assert.equal(transistorSvg.includes('data-diagram-engine="circuit"'), true);
+  assert.equal(transistorSvg.includes('NaN'), false);
+  assert.equal(transistorSvg.includes('data-ckt-kind="npn"'), true);
+  assert.equal(transistorSvg.includes('data-ckt-kind="pnp"'), true);
+  assert.equal(transistorSvg.includes('data-ckt-kind="nmos"'), true);
+  assert.equal(transistorSvg.includes('data-ckt-kind="pmos"'), true);
+
+  // 5d. circuit: orthogonal auto-routing & junction dot (log-amp diode feedback)
+  const logOpampSvg = compileDiagramSpecSync({
+    type: 'circuit',
+    title: '负输入极性（u_I < 0）二极管对数运算电路',
+    elements: [
+      { kind: 'opamp', label: 'A', dir: 'right', anchor: 'u1' },
+      { kind: 'wire', dir: 'left', fromAnchor: 'in-', anchor: 'N', length: 0.5 },
+      { kind: 'resistor', label: 'R', dir: 'left', fromAnchor: 'N', anchor: 'uI', currentLabel: 'i_R', length: 1.5 },
+      { kind: 'node', label: 'u_I (u_I < 0)', dir: 'right', anchor: 'uI' },
+      { kind: 'wire', dir: 'up', fromAnchor: 'N', anchor: 'fb_left', length: 1.2 },
+      { kind: 'wire', dir: 'up', fromAnchor: 'out', anchor: 'fb_right', length: 1.6 },
+      { kind: 'diode', label: 'D', dir: 'left', fromAnchor: 'fb_right', toAnchor: 'fb_left', currentLabel: 'i_D', polarity: '+-' },
+      { kind: 'wire', dir: 'right', fromAnchor: 'out', anchor: 'uO', length: 0.6 },
+      { kind: 'node', label: 'u_O', dir: 'right', anchor: 'uO' },
+      { kind: 'resistor', label: "R'", dir: 'down', fromAnchor: 'in+', anchor: 'gnd_top', length: 1 },
+      { kind: 'ground', dir: 'down', fromAnchor: 'gnd_top' },
+    ],
+  });
+  assert.ok(logOpampSvg);
+  assert.equal(logOpampSvg.includes('data-ckt-junction="1"'), true);
+  assert.equal(logOpampSvg.includes('NaN'), false);
+
+  const assertOrthogonal = (svg: string) => {
+    const stripped = svg.replace(/<g data-ckt-kind="[^"]*">[\s\S]*?<\/g>/g, '');
+    for (const m of stripped.matchAll(/rotate\((-?[\d.]+)\)/g)) {
+      const angle = Number(m[1]);
+      assert.ok(
+        Math.abs(angle / 90 - Math.round(angle / 90)) < 1e-3,
+        `Expected orthogonal rotation angle, got ${angle}`
+      );
+    }
+    for (const m of stripped.matchAll(/<line\b[^>]*>/g)) {
+      const tag = m[0];
+      const x1 = Number(tag.match(/\bx1="(-?[\d.]+)"/)?.[1]);
+      const y1 = Number(tag.match(/\by1="(-?[\d.]+)"/)?.[1]);
+      const x2 = Number(tag.match(/\bx2="(-?[\d.]+)"/)?.[1]);
+      const y2 = Number(tag.match(/\by2="(-?[\d.]+)"/)?.[1]);
+      assert.ok(
+        Math.abs(x1 - x2) < 0.05 || Math.abs(y1 - y2) < 0.05,
+        `Expected orthogonal <line>, got (${x1},${y1})->(${x2},${y2})`
+      );
+    }
+  };
+  assertOrthogonal(opampSvg);
+  assertOrthogonal(rlcDiodeSvg);
+  assertOrthogonal(transistorSvg);
+  assertOrthogonal(logOpampSvg);
+
+  const cktAliased = validateDiagramSpec({
+    type: 'circuit',
+    elements: [
+      { kind: 'bjt' },
+      { kind: 'PNP' },
+      { kind: 'mosfet', channel: 'p' },
+      { kind: 'nfet' },
+    ],
+  });
+  assert.equal(cktAliased.success, true);
+  if (cktAliased.success && cktAliased.data.type === 'circuit') {
+    assert.deepEqual(
+      cktAliased.data.elements.map((el) => el.kind),
+      ['npn', 'pnp', 'pmos', 'nmos']
+    );
+  }
 
   // 6. Zod normalization + invalid rejection
   const aliased = validateDiagramSpec({

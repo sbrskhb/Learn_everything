@@ -212,6 +212,10 @@ export const CircuitElementKindEnum = z.enum([
   'wire',
   'node',
   'opamp',
+  'npn',
+  'pnp',
+  'nmos',
+  'pmos',
 ]);
 
 export const CircuitElementSchema = z.object({
@@ -227,6 +231,10 @@ export const CircuitElementSchema = z.object({
   polarity: z.enum(['+-', '-+', 'none']).optional(),
   tone: ToneEnum.optional(),
   length: z.number().positive().optional(),
+  pin: z.string().optional(),
+  flip: z.boolean().optional(),
+  route: z.enum(['auto', 'hv', 'vh']).optional(),
+  depletion: z.boolean().optional(),
 });
 
 export const CircuitSpecSchema = z.object({
@@ -319,6 +327,28 @@ const CIRCUIT_KIND_ALIAS_MAP: Record<string, CircuitElementKind> = {
   opamp: 'opamp',
   op_amp: 'opamp',
   'op-amp': 'opamp',
+  npn: 'npn',
+  bjt: 'npn',
+  bjt_npn: 'npn',
+  npn_bjt: 'npn',
+  transistor: 'npn',
+  pnp: 'pnp',
+  bjt_pnp: 'pnp',
+  pnp_bjt: 'pnp',
+  nmos: 'nmos',
+  mos: 'nmos',
+  mosfet: 'nmos',
+  nmosfet: 'nmos',
+  mosfet_n: 'nmos',
+  n_mos: 'nmos',
+  'n-mos': 'nmos',
+  nfet: 'nmos',
+  pmos: 'pmos',
+  pmosfet: 'pmos',
+  mosfet_p: 'pmos',
+  p_mos: 'pmos',
+  'p-mos': 'pmos',
+  pfet: 'pmos',
 };
 
 function normalizeCoordPair(val: unknown): unknown {
@@ -461,10 +491,19 @@ export function normalizeRawDiagramSpecInput(raw: unknown, fallbackType?: string
       src.elements = src.elements.map((el: any) => {
         if (!el || typeof el !== 'object') return el;
         const rawKind = String(el.kind || el.type || '').trim().toLowerCase();
-        const mappedKind = CIRCUIT_KIND_ALIAS_MAP[rawKind] || el.kind || el.type;
+        let mappedKind = CIRCUIT_KIND_ALIAS_MAP[rawKind] || el.kind || el.type;
+        const sub = String(el.subtype ?? el.variant ?? el.channel ?? el.polarityType ?? '')
+          .trim()
+          .toLowerCase();
+        if (mappedKind === 'npn' && (rawKind === 'bjt' || rawKind === 'transistor') && (sub === 'pnp' || sub === 'p')) {
+          mappedKind = 'pnp';
+        } else if (mappedKind === 'nmos' && (rawKind === 'mos' || rawKind === 'mosfet') && sub.startsWith('p')) {
+          mappedKind = 'pmos';
+        }
         return {
           ...el,
           kind: mappedKind,
+          pin: typeof el.pin === 'string' ? el.pin.trim().toLowerCase() : el.pin,
           fromAnchor: el.fromAnchor ?? el.from,
           toAnchor: el.toAnchor ?? el.to,
           tone: normalizeToneValue(el.tone),

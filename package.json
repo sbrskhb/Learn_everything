@@ -9,7 +9,11 @@
     "start": "node server.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "bg:start": "node scripts/service-manager.mjs start",
+    "bg:stop": "node scripts/service-manager.mjs stop",
+    "bg:restart": "node scripts/service-manager.mjs restart",
+    "bg:status": "node scripts/service-manager.mjs status"
   },
   "dependencies": {
     "@google/genai": "^3.1.0",

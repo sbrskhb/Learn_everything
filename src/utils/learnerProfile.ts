@@ -3,6 +3,7 @@ import type {
   LearnerBaselinePreset,
   LearnerLevel,
   LearningDepthPreset,
+  TargetLanguageCode,
 } from '../types';
 
 export interface BaselineOptionItem {
@@ -49,23 +50,23 @@ export const ENGLISH_BASELINE_PRESET_OPTIONS: BaselineOptionItem[] = [
   {
     value: 'zero_base',
     title: '零基础 / 基础薄弱',
-    tag: '从基础句型与核心词义讲起',
-    audience: '词汇量在中学/高考阶段，面对复合长难句、非谓语与虚拟语气容易卡壳。',
-    behavior: '放缓语境复杂度，逐句拆解主干谓语与从句引导词，配合直观词根词缀助记。',
+    tag: '从文字、基础句型与核心词义讲起',
+    audience: '尚未系统学习该语言，或处于基础起步阶段，面对长难句与语法变形容易卡壳。',
+    behavior: '首次出现的文字/术语、词尾变形与基础句法均从直观例句与结构骨架讲起，绝不跳过桥梁。',
   },
   {
     value: 'partial_base',
-    title: '四六级 / 常规阅读基础',
-    tag: '唤醒高频搭配与长难句主干',
-    audience: '具备四六级基础词汇与基本语法，但遇外刊熟词僻义、倒装省略或长从句仍需梳理。',
-    behavior: '跳过简单基础语法啰嗦，重点点拨熟词僻义、地道短语搭配与复杂句法结构。',
+    title: '具备常规基础 / 阅读进阶',
+    tag: '唤醒高频搭配、语法接续与句干',
+    audience: '具备常规读写与入门语法基础（如四六级或中级基础），遇到复杂长难句、熟词僻义或习惯表达仍需梳理。',
+    behavior: '跳过纯字母或入门语法啰嗦，重点点拨高频搭配、熟词僻义、关键语法接续与长难句主干。',
   },
   {
     value: 'solid_base',
-    title: '高阶阅读基础 / 语感扎实',
-    tag: '直入原刊修辞与深层逻辑',
-    audience: '已掌握较丰富学术词汇与复杂句法，希望直接进入高信息密度原刊语境。',
-    behavior: '省去基础语法扫盲，直接聚焦近义词微妙语体差异、作者修辞态度与篇章论证。',
+    title: '高阶基础 / 语感扎实',
+    tag: '直入原版修辞与深层语域',
+    audience: '已掌握较丰富的词汇与语法体系，希望直接进入原版文献、深度对话或考级冲刺训练。',
+    behavior: '省去基础语法扫盲，直接聚焦近义表达语体差异、习惯用法、作者态度与篇章论证。',
   },
 ];
 
@@ -96,34 +97,102 @@ export const DEPTH_PRESET_OPTIONS: DepthOptionItem[] = [
 export const ENGLISH_DEPTH_PRESET_OPTIONS: DepthOptionItem[] = [
   {
     value: 'understand_basics',
-    title: '读懂大意与掌握核心词义',
-    tag: '重语境复现与高频搭配',
-    target: '重在记住每日目标词的核心含义与常见搭配，能顺畅读懂中等长度语境文章。',
-    behavior: '文章句式清晰自然，练习聚焦词汇语境填空、词义匹配与主旨细节理解。',
+    title: '读懂大意与日常实用运用',
+    tag: '重语境复现与核心交际表达',
+    target: '重在记住目标词汇的核心含义与常用搭配，能顺畅读懂常见短文或开展日常对话运用。',
+    behavior: '句式自然清晰，练习聚焦语境填空、词义匹配、常用表达与主旨理解。',
   },
   {
     value: 'master_textbook',
-    title: '吃透外刊精读与应试进阶',
-    tag: '六级 / 考研 / 托福标准深度',
-    target: '严格对标六级/考研/托福阅读标准，掌握一词多义、近义词辨析与长难句精析。',
-    behavior: '哪怕起点薄弱也先拆解句法骨架，再完整训练长难句剖析、同义替换与阅读推断。',
+    title: '吃透精读教材与标准应试',
+    tag: '教材 / 四六级 / 考研 / 托福 / JLPT 标准',
+    target: '对标系统教材或主流语言考试标准，掌握一词多义、近义辨析、核心语法体系与长句拆解。',
+    behavior: '哪怕起点薄弱也先搭好语法词汇桥梁，再完整训练长难句剖析、同义替换与综合阅读/运用。',
   },
   {
     value: 'deep_rigorous',
-    title: '原刊深度鉴赏与学术写作迁移',
-    tag: 'Economist / 学术期刊级深度',
-    target: '深入 The New Yorker / Economist 级复杂长难句、修辞隐喻、语域辨析与高阶写作改写。',
-    behavior: '全面剖析词源逻辑、修辞张力与批判性推理，练习覆盖深层态度推断与高阶句式仿写。',
+    title: '原版深度鉴赏与高阶迁移',
+    tag: '原刊 / 学术文献与地道表达迁移',
+    target: '深入原版评论与学术期刊级复杂句法、修辞隐喻、语域辨析，并能完成地道迁移输出。',
+    behavior: '全面剖析细微语义张力、文化语境与表达风格，练习覆盖深层推断与高阶仿写。',
   },
 ];
 
-export function getBaselinePresetOptions(category?: CourseCategory): BaselineOptionItem[] {
-  return category === 'english' ? ENGLISH_BASELINE_PRESET_OPTIONS : BASELINE_PRESET_OPTIONS;
+export const NON_ENGLISH_LANG_BASELINE_PRESET_OPTIONS: BaselineOptionItem[] = [
+  {
+    value: 'zero_base',
+    title: '零基础 / 入门起跑',
+    tag: '从文字、发音与基础句型讲起',
+    audience: '尚未系统学过该语言，需要从基础文字（如假名/字母）、基础词序与入门语法铺垫。',
+    behavior: '首次出现的文字、词尾变形与语法助词给足直观对照与最简例句，绝不跳过入门桥梁。',
+  },
+  {
+    value: 'partial_base',
+    title: '具备基础 / 日常进阶',
+    tag: '快速唤醒核心词形与常见句型',
+    audience: '掌握基础读写与入门语法，但面对长难复句、敬体/简体内涵或复合接续仍需梳理。',
+    behavior: '跳过纯字母/假名扫盲，聚焦高频语法接续、词形活用与地道语境搭配。',
+  },
+  {
+    value: 'solid_base',
+    title: '中高阶基础 / 语感扎实',
+    tag: '直奔原汁文献与高阶辨析',
+    audience: '具备较扎实的读写与语法体系，希望直接进入原版文章、深度对话或考级冲刺训练。',
+    behavior: '省去基础语法讲解，聚焦近义表达语体差异、习惯用法与复杂篇章结构。',
+  },
+];
+
+export const NON_ENGLISH_LANG_DEPTH_PRESET_OPTIONS: DepthOptionItem[] = [
+  {
+    value: 'understand_basics',
+    title: '理解大意与日常实用运用',
+    tag: '重核心词汇、常用对话与基础阅读',
+    target: '重在读懂常见主题短文、掌握高频对话与核心词汇含义，建立稳定语感。',
+    behavior: '句式自然清晰，练习聚焦语境理解、常用词替换与日常场景应用。',
+  },
+  {
+    value: 'master_textbook',
+    title: '系统精学与标准考试达标',
+    tag: '教材 / 考级标准深度',
+    target: '对标系统教材或标准考级（如 JLPT 等），吃透词汇辨析、核心语法体系与长句拆解。',
+    behavior: '哪怕起点较低也先搭好语言桥梁，再完整训练语法运用、精细辨析与阅读理解。',
+  },
+  {
+    value: 'deep_rigorous',
+    title: '深度鉴赏与地道表达迁移',
+    tag: '高阶原版精读与复杂表达',
+    target: '深入高阶文学/评论文章、修辞语感、敬语或专业语域辨析，并能完成地道迁移表达。',
+    behavior: '全面剖析细微语义差、文化语境与表达风格，练习覆盖深层推断与高阶仿写。',
+  },
+];
+
+export function getBaselinePresetOptions(
+  category?: CourseCategory,
+  _targetLanguage?: TargetLanguageCode
+): BaselineOptionItem[] {
+  if (category !== 'english') return BASELINE_PRESET_OPTIONS;
+  return ENGLISH_BASELINE_PRESET_OPTIONS;
 }
 
-export function getDepthPresetOptions(category?: CourseCategory): DepthOptionItem[] {
-  return category === 'english' ? ENGLISH_DEPTH_PRESET_OPTIONS : DEPTH_PRESET_OPTIONS;
+export function getDepthPresetOptions(
+  category?: CourseCategory,
+  _targetLanguage?: TargetLanguageCode
+): DepthOptionItem[] {
+  if (category !== 'english') return DEPTH_PRESET_OPTIONS;
+  return ENGLISH_DEPTH_PRESET_OPTIONS;
 }
+
+export const NON_ENGLISH_LANG_BASELINE_LABELS: Record<Exclude<LearnerBaselinePreset, 'custom'>, string> = {
+  zero_base: '语言零基础（需从文字/发音与最简基础句型起步）',
+  partial_base: '具备语言入门基础（已会基本读写 · 需强化语法接续与语境词汇）',
+  solid_base: '语言基础扎实（可直入原版文章、地道语体与复杂句法辨析）',
+};
+
+export const NON_ENGLISH_LANG_DEPTH_LABELS: Record<Exclude<LearningDepthPreset, 'custom'>, string> = {
+  understand_basics: '日常理解与实用运用（重语境词汇与常见交际表达）',
+  master_textbook: '系统精学与考级达标（完整覆盖教材语法体系与阅读词汇辨析）',
+  deep_rigorous: '高阶原版精读与地道表达迁移（细微语感、修辞语域与高阶输出）',
+};
 
 export const BASELINE_LABELS: Record<Exclude<LearnerBaselinePreset, 'custom'>, string> = {
   zero_base: '零基础（未修先修课 · 需补全术语与数学工具直觉）',
@@ -132,9 +201,9 @@ export const BASELINE_LABELS: Record<Exclude<LearnerBaselinePreset, 'custom'>, s
 };
 
 export const ENGLISH_BASELINE_LABELS: Record<Exclude<LearnerBaselinePreset, 'custom'>, string> = {
-  zero_base: '英语基础薄弱（中学/高考词汇量 · 需逐句拆解主干与基础语法铺垫）',
-  partial_base: '四六级常规阅读基础（掌握基本语法 · 需点拨外刊熟词僻义与复杂从句）',
-  solid_base: '高阶英语阅读基础（词汇与句法扎实 · 可直入原刊修辞与深层逻辑）',
+  zero_base: '语言零基础 / 基础薄弱（需从文字/基础句型与核心词义拆解起步）',
+  partial_base: '具备语言常规基础（会基础读写与语法 · 需点拨高频搭配、语法接续与长难句）',
+  solid_base: '高阶语言基础扎实（词汇句法扎实 · 可直入原版文献与深层语域辨析）',
 };
 
 export const DEPTH_LABELS: Record<Exclude<LearningDepthPreset, 'custom'>, string> = {
@@ -144,9 +213,9 @@ export const DEPTH_LABELS: Record<Exclude<LearningDepthPreset, 'custom'>, string
 };
 
 export const ENGLISH_DEPTH_LABELS: Record<Exclude<LearningDepthPreset, 'custom'>, string> = {
-  understand_basics: '读懂大意与掌握核心词义（重语境复现、高频搭配与基础理解）',
-  master_textbook: '吃透外刊精读与应试进阶（对标六级/考研/托福长难句拆解与近义词辨析）',
-  deep_rigorous: '原刊深度鉴赏与学术写作迁移（Economist 级修辞逻辑、语域辨析与高阶仿写）',
+  understand_basics: '读懂大意与日常实用运用（重语境复现、高频搭配与基础理解）',
+  master_textbook: '吃透精读教材与标准应试（对标教材/考纲长难句拆解、语法与近义辨析）',
+  deep_rigorous: '原版深度鉴赏与高阶迁移（复杂修辞逻辑、语域辨析与高阶迁移输出）',
 };
 
 export function mapLegacyLevelToDualAxis(level?: LearnerLevel): {
@@ -174,6 +243,7 @@ export function deriveLegacyLearnerLevel(
 
 export function resolveLearnerProfile(input?: {
   category?: CourseCategory;
+  targetLanguage?: TargetLanguageCode;
   learnerLevel?: LearnerLevel;
   learnerBaseline?: LearnerBaselinePreset;
   customLearnerBaseline?: string;
@@ -190,15 +260,15 @@ export function resolveLearnerProfile(input?: {
   combinedLabel: string;
   strategySummary: string;
 } {
-  const isEnglish = input?.category === 'english';
+  const isLanguage = input?.category === 'english';
   const fallback = mapLegacyLevelToDualAxis(input?.learnerLevel);
   const baseline: LearnerBaselinePreset = input?.learnerBaseline || fallback.baseline;
   const depth: LearningDepthPreset = input?.learningDepth || fallback.depth;
   const customBaseline = (input?.customLearnerBaseline || '').trim();
   const customDepth = (input?.customLearningDepth || '').trim();
 
-  const baselineMap = isEnglish ? ENGLISH_BASELINE_LABELS : BASELINE_LABELS;
-  const depthMap = isEnglish ? ENGLISH_DEPTH_LABELS : DEPTH_LABELS;
+  const baselineMap = isLanguage ? ENGLISH_BASELINE_LABELS : BASELINE_LABELS;
+  const depthMap = isLanguage ? ENGLISH_DEPTH_LABELS : DEPTH_LABELS;
 
   const baselineText =
     baseline === 'custom'
@@ -221,25 +291,25 @@ export function resolveLearnerProfile(input?: {
   const combinedLabel = `我的当前水平：${baselineText} ｜ 我的学习目标深度：${depthText}`;
 
   let strategySummary: string;
-  if (isEnglish) {
+  if (isLanguage) {
     if (
       baseline === 'zero_base' &&
       (depth === 'master_textbook' || depth === 'deep_rigorous')
     ) {
       strategySummary =
-        '英语跨阶强攀升策略：前段先逐句拆解句子主干、从句引导词与基础词根，帮零基础扫清语法障碍；中后段不降低外刊文章立意与考纲深度，完整讲透熟词僻义、同义辨析与高阶阅读题。';
+        '语言跨阶强攀升策略：前段先从文字/基础句型、句子主干与核心词义搭好入门阶梯；中后段不降低教材/考级或原版阅读深度，完整讲透语法接续、熟词僻义、近义辨析与高阶迁移。';
     } else if (baseline === 'zero_base' && depth === 'custom') {
       strategySummary =
-        '英语基础起跑 + 自定义目标：先补齐基础句法骨架与核心词义直觉，随后严格围绕你设定的自定义英语目标完成精读拆解与训练。';
+        '语言零基础起跑 + 自定义目标：先补齐基础句法骨架与核心词义直觉，随后严格围绕你设定的自定义语言目标完成精读拆解与训练。';
     } else if (baseline === 'solid_base' && depth === 'understand_basics') {
       strategySummary =
-        '高起点轻快阅读策略：省略基础语法拆解，直接通过地道外刊语境高效串联当日目标词与核心搭配。';
+        '高起点轻快运用策略：省略基础语法拆解，直接通过地道阅读与对话语境高效串联目标词汇与高频搭配。';
     } else if (baseline === 'custom' || depth === 'custom') {
       strategySummary =
-        '自定义英语双轴策略：句法拆解与词汇助记严格贴合你输入的当前英语水平，文章语域复杂度与练习深度严格对齐你设定的学习目标。';
+        '自定义语言双轴策略：句法拆解与词汇助记严格贴合你输入的当前水平，语言难度、表达语域与练习深度严格对齐你设定的学习目标。';
     } else {
       strategySummary =
-        '英语均衡进阶策略：前段按当前英语水平点拨高频搭配与句法结构，后段精读文章深度与阅读练习严格对齐目标考纲或外刊标准。';
+        '语言均衡进阶策略：前段按当前语言水平点拨高频搭配、语法接续与句法结构，后段内容深度与练习严格对齐目标教材、考试标准或实际运用目标。';
     }
   } else {
     if (

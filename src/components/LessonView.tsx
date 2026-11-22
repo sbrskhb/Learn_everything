@@ -12,6 +12,7 @@ import {
   Copy,
   Download,
   Edit3,
+  ExternalLink,
   Eye,
   EyeOff,
   FileText,
@@ -53,6 +54,7 @@ import {
 } from '../utils/markdownMath';
 import { enhanceDiagramSvg, normalizeSvgLatexCommands } from '../utils/svgMath';
 import {
+  ensureStableSectionId,
   getEvaluatedSectionMinutes,
   getSlotExerciseSubmission,
   getTodayDateString,
@@ -61,6 +63,15 @@ import {
   normalizeWordKey,
   resolveSlotPdfSegments,
 } from '../utils/learningLogic';
+import {
+  buildEnglishInflectionForms,
+  computeSectionAssociatedVocabStats,
+  extractPendingGlossWordsForSection,
+  isPlaceholderVocabMeaning,
+  isWeakBaselineForVocabSimplification,
+  resolveEnglishQuoteAnchors,
+  syncCourseVocabCoverage,
+} from '../utils/vocabCoverage';
 import {
   detectPastedCoursewareInputKind,
   detectUnresolvedImageRefs,
@@ -274,10 +285,181 @@ export const LessonView: React.FC<LessonViewProps> = ({
   const [isSavingEdit, setIsSavingEdit] = useState(false);
 
   // English reading interactive states (100% offline-capable)
-  const [showTranslation, setShowTranslation] = useState(true);
+  const [visibleParagraphTranslations, setVisibleParagraphTranslations] = useState<
+    Record<number, boolean>
+  >({});
   const [hideVocabMeaning, setHideVocabMeaning] = useState(false);
   const [vocabFilter, setVocabFilter] = useState<'all' | 'unmastered'>('all');
-  const [activeWordCard, setActiveWordCard] = useState<VocabItem | null>(null);
+  const [showVocabLookupList, setShowVocabLookupList] = useState(true);
+  const [activeWordPopover, setActiveWordPopover] = useState<{
+    item: VocabItem;
+    role: 'new' | 'review' | 'extra_gloss' | 'incidental' | 'marked' | 'plain';
+    sourceSectionIndex?: number;
+    matchedText: string;
+    rect: {
+      left: number;
+      top: number;
+      right: number;
+      bottom: number;
+      width: number;
+      height: number;
+    };
+  } | null>(null);
+  const [markedBank, setMarkedBank] = useState<{
+    id: string;
+    name: string;
+    words: VocabItem[];
+  } | null>(null);
+  const [markedBankOptions, setMarkedBankOptions] = useState<
+    Array<{ id: string; name: string; wordCount: number }>
+  >([]);
+  const markedToggleQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const pendingMarkedToggleRef = useRef(0);
+
+  const fetchMarkedVocabBank = async () => {
+    try {
+      const res = await fetch('/api/marked-vocab-bank');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (pendingMarkedToggleRef.current === 0) {
+        setMarkedBank(data.bank || null);
+      }
+      if (Array.isArray(data.allBanks)) {
+        setMarkedBankOptions(data.allBanks);
+      }
+    } catch {
+      // ignore offline error
+    }
+  };
+
+  useEffect(() => {
+    if (course.category === 'english') {
+      void fetchMarkedVocabBank();
+    }
+  }, [course.id, course.category, slot.dayIndex]);
+
+  const markedWordMap = useMemo(() => {
+    const map = new Map<string, VocabItem>();
+    for (const w of markedBank?.words || []) {
+      const k = normalizeWordKey(w.word);
+      if (k && !map.has(k)) map.set(k, w);
+    }
+    return map;
+  }, [markedBank]);
+
+  const handleToggleMarkedWord = (item: VocabItem, contextSnippet?: string) => {
+    const cleanWord = String(item.word || '').trim();
+    const k = normalizeWordKey(cleanWord);
+    if (!k) return;
+    const isCurrentlyMarked = markedWordMap.has(k);
+
+    // Optimistic update for instant color feedback
+    setMarkedBank((prev) => {
+      const base = prev || { id: '', name: '阅读标记生词本', words: [] };
+      const nextWords = isCurrentlyMarked
+        ? base.words.filter((w) => normalizeWordKey(w.word) !== k)
+        : [
+            {
+              ...item,
+              word: cleanWord,
+              meaning:
+                item.meaning && !isPlaceholderVocabMeaning(item.meaning)
+                  ? item.meaning
+                  : '待结合语境学习',
+            },
+            ...base.words,
+          ];
+      return { ...base, words: nextWords };
+    });
+
+    pendingMarkedToggleRef.current += 1;
+    markedToggleQueueRef.current = markedToggleQueueRef.current.then(async () => {
+      try {
+        const res = await fetch('/api/marked-vocab-bank/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            word: cleanWord,
+            meaning:
+              item.meaning && !isPlaceholderVocabMeaning(item.meaning) ? item.meaning : '',
+            phonetic: item.phonetic || '',
+            contextSnippet: contextSnippet || '',
+            bankId: markedBank?.id || undefined,
+            mode: isCurrentlyMarked ? 'remove' : 'add',
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (pendingMarkedToggleRef.current <= 1 && data.bank) {
+            setMarkedBank(data.bank);
+          }
+          if (data.bank) {
+            setMarkedBankOptions((prev) => {
+              const exists = prev.some((b) => b.id === data.bank.id);
+              if (exists) {
+                return prev.map((b) =>
+                  b.id === data.bank.id
+                    ? { ...b, name: data.bank.name, wordCount: data.bank.words?.length || 0 }
+                    : b
+                );
+              }
+              return [
+                {
+                  id: data.bank.id,
+                  name: data.bank.name,
+                  wordCount: data.bank.words?.length || 0,
+                },
+                ...prev,
+              ];
+            });
+          }
+        }
+      } catch {
+        // Keep optimistic state offline
+      } finally {
+        pendingMarkedToggleRef.current = Math.max(0, pendingMarkedToggleRef.current - 1);
+      }
+    });
+  };
+
+  const handleSelectMarkedBank = async (bankId: string) => {
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ markedVocabBankId: bankId }),
+      });
+      if (res.ok) {
+        await fetchMarkedVocabBank();
+      }
+    } catch {
+      // ignore offline error
+    }
+  };
+  const [step2SimplifySynonyms, setStep2SimplifySynonyms] = useState<boolean>(() =>
+    isWeakBaselineForVocabSimplification(course)
+  );
+  const [isRunningStep2Gloss, setIsRunningStep2Gloss] = useState(false);
+  const [showStep2PasteBox, setShowStep2PasteBox] = useState(false);
+  const [step2PasteText, setStep2PasteText] = useState('');
+  const [step2CopiedKey, setStep2CopiedKey] = useState<string | null>(null);
+  const [step2Notice, setStep2Notice] = useState<{ ok: boolean; message: string } | null>(null);
+
+  useEffect(() => {
+    setVisibleParagraphTranslations({});
+    setStep2SimplifySynonyms(isWeakBaselineForVocabSimplification(course));
+    setIsRunningStep2Gloss(false);
+    setShowStep2PasteBox(false);
+    setStep2PasteText('');
+    setStep2CopiedKey(null);
+    setStep2Notice(null);
+  }, [
+    course.id,
+    slot.dayIndex,
+    course.learnerBaseline,
+    course.customLearnerBaseline,
+    course.learnerLevel,
+  ]);
 
   // Heuristic thinking question states ("先思考，后讲解" 渐进提示与完整解释)
   const [revealedHeuristicHints, setRevealedHeuristicHints] = useState<Record<string, boolean>>({});
@@ -288,6 +470,9 @@ export const LessonView: React.FC<LessonViewProps> = ({
   const [userAnswers, setUserAnswers] = useState<Record<string, string>>(
     savedSubmission?.userAnswers || {}
   );
+  const [understoodFillIds, setUnderstoodFillIds] = useState<string[]>(
+    savedSubmission?.selfUnderstoodIds || []
+  );
   const [isSubmitted, setIsSubmitted] = useState<boolean>(Boolean(savedSubmission));
   const [revealedExerciseHints, setRevealedExerciseHints] = useState<Record<string, boolean>>({});
   const [revealedSingleExercises, setRevealedSingleExercises] = useState<Record<string, boolean>>(
@@ -295,6 +480,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
   );
   const [variantAnswers, setVariantAnswers] = useState<Record<string, string>>({});
   const [variantSubmitted, setVariantSubmitted] = useState<Record<string, boolean>>({});
+  const [variantUnderstood, setVariantUnderstood] = useState<Record<string, boolean>>({});
 
   // Reverse explanation self-check states (persisted locally offline)
   const savedReverseNotes =
@@ -423,7 +609,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
     setAgentSyncMsg(null);
     setAgentSyncErr(null);
     setWorkbenchTab(course.generationMode === 'agent' ? 'agent' : 'chat');
-    setActiveWordCard(null);
+    setActiveWordPopover(null);
     setRevealedHeuristicHints({});
     setRevealedHeuristics({});
     setRevealedExerciseHints({});
@@ -442,9 +628,11 @@ export const LessonView: React.FC<LessonViewProps> = ({
     setCopiedMdKey(null);
     const sub = getSlotExerciseSubmission(course, slot);
     setUserAnswers(sub?.userAnswers || {});
+    setUnderstoodFillIds(sub?.selfUnderstoodIds || []);
     setIsSubmitted(Boolean(sub));
     setVariantAnswers({});
     setVariantSubmitted({});
+    setVariantUnderstood({});
     setStageRepairPreview(null);
     setCopiedStageKey(null);
     setReverseDrafts(
@@ -1013,6 +1201,481 @@ export const LessonView: React.FC<LessonViewProps> = ({
     };
   }, [activeSymbolPopover]);
 
+  useEffect(() => {
+    setActiveWordPopover(null);
+  }, [slot.dayIndex, slot.date, activeLesson?.title]);
+
+  useEffect(() => {
+    if (!activeWordPopover) return;
+    const handleKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') {
+        setActiveWordPopover(null);
+      }
+    };
+    const handleDocClick = (ev: MouseEvent) => {
+      const target = ev.target as HTMLElement | null;
+      if (!target) return;
+      if (
+        target.closest('[data-testid="vocab-word-popover"]') ||
+        target.closest('[data-vocab-word-trigger="true"]')
+      ) {
+        return;
+      }
+      setActiveWordPopover(null);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('mousedown', handleDocClick);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('mousedown', handleDocClick);
+    };
+  }, [activeWordPopover]);
+
+  const englishCourseVocabCoverage = useMemo(() => {
+    if (!activeLesson?.englishPayload || !course.englishConfig) return undefined;
+    return (
+      course.englishConfig.vocabCoverage ||
+      syncCourseVocabCoverage({
+        ...course,
+        englishConfig: {
+          ...course.englishConfig,
+          effectiveWords: [...(course.englishConfig.effectiveWords || [])],
+        },
+        dailyPlan: course.dailyPlan.map((s) => ({ ...s })),
+      })
+    );
+  }, [activeLesson?.englishPayload, course]);
+
+  const liveAssociatedStats = useMemo(() => {
+    if (course.category !== 'english' || !activeLesson?.englishPayload) return null;
+    return computeSectionAssociatedVocabStats(course, slot, activeLesson);
+  }, [course, slot, activeLesson]);
+
+  const pendingGlossWords = useMemo(() => {
+    if (course.category !== 'english' || !activeLesson?.englishPayload) return [];
+    return extractPendingGlossWordsForSection(
+      course,
+      slot,
+      activeLesson,
+      markedBank?.words || []
+    );
+  }, [course, slot, activeLesson, markedBank]);
+
+  const handleRunStep2Api = async () => {
+    setIsRunningStep2Gloss(true);
+    setStep2Notice(null);
+    try {
+      const res = await fetch(
+        `/api/courses/${encodeURIComponent(course.id)}/days/${slot.dayIndex}/word-glosses`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'generate_api',
+            allowSynonymReplacement: step2SimplifySynonyms,
+          }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || 'Step 2 API 生成失败');
+      if (data?.course) onCourseUpdated(data.course);
+      void fetchMarkedVocabBank();
+      const before = data?.beforeStats?.associatedWordCount;
+      const after = data?.afterStats?.associatedWordCount;
+      const remaining = Array.isArray(data?.pendingWordGlosses) ? data.pendingWordGlosses.length : 0;
+      const deltaNote =
+        typeof before === 'number' && typeof after === 'number' && before !== after
+          ? `关联生词 ${before} → ${after} 词`
+          : typeof after === 'number'
+            ? `关联生词 ${after} 词`
+            : '已完成补充';
+      setStep2Notice({
+        ok: true,
+        message: `Step 2 完成（${deltaNote}${remaining > 0 ? `，仍剩 ${remaining} 词待补` : '，正文待补词已全部标注'}）。`,
+      });
+    } catch (err: any) {
+      setStep2Notice({ ok: false, message: err?.message || 'Step 2 API 执行失败' });
+    } finally {
+      setIsRunningStep2Gloss(false);
+    }
+  };
+
+  const handleCopyStep2Prompt = async (asMdFile = false) => {
+    setStep2Notice(null);
+    try {
+      const res = await fetch(
+        `/api/courses/${encodeURIComponent(course.id)}/days/${slot.dayIndex}/chat-prompt?simplifySynonyms=${
+          step2SimplifySynonyms ? '1' : '0'
+        }`
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || '获取 Step 2 提示词失败');
+      const isAgent = course.generationMode === 'agent';
+      const promptText = isAgent
+        ? String(data.agentStage2Prompt || data.stage2Prompt || '')
+        : String(data.stage2Prompt || '');
+      if (!promptText.trim()) {
+        throw new Error('当前文章没有待补充释义的单词或无需执行 Step 2。');
+      }
+      const secId = ensureStableSectionId(slot.dayIndex, slot.id);
+      if (asMdFile) {
+        await copyPromptMarkdownFileToClipboard(
+          course.id,
+          `${secId}-${isAgent ? 'agent-step2' : 'step2'}-prompt.md`,
+          promptText
+        );
+        setStep2CopiedKey('md');
+        setStep2Notice({ ok: true, message: '已将 Step 2 提示词保存为 .md 文件并复制到剪贴板。' });
+      } else {
+        await copyPromptText(promptText);
+        setStep2CopiedKey('text');
+        setStep2Notice({
+          ok: true,
+          message: isAgent
+            ? '已复制 Agent Step 2 指令，Agent 修改本地 JSON 后请点击「扫描同步」。'
+            : '已复制 Step 2 提示词，请直接点击「粘贴并应用 Step 2」导入 AI 回复。',
+        });
+      }
+      window.setTimeout(() => setStep2CopiedKey((prev) => (prev ? null : prev)), 2500);
+    } catch (err: any) {
+      setStep2Notice({ ok: false, message: err?.message || '复制 Step 2 提示词失败' });
+    }
+  };
+
+  const applyStep2ImportText = async (rawTextInput: string) => {
+    const trimmed = rawTextInput.trim();
+    if (!trimmed) {
+      setStep2Notice({ ok: false, message: '请先粘贴 AI 返回的 Step 2 词义或同义改写 JSON。' });
+      return;
+    }
+    setIsRunningStep2Gloss(true);
+    setStep2Notice(null);
+    try {
+      const res = await fetch(
+        `/api/courses/${encodeURIComponent(course.id)}/days/${slot.dayIndex}/word-glosses`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'import',
+            rawContent: trimmed,
+            allowSynonymReplacement: step2SimplifySynonyms,
+          }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || '导入 Step 2 结果失败');
+      if (data?.course) onCourseUpdated(data.course);
+      void fetchMarkedVocabBank();
+      setStep2PasteText('');
+      setShowStep2PasteBox(false);
+      const before = data?.beforeStats?.associatedWordCount;
+      const after = data?.afterStats?.associatedWordCount;
+      const rejectedCount = Array.isArray(data?.rejectedParagraphEdits)
+        ? data.rejectedParagraphEdits.length
+        : 0;
+      const remaining = Array.isArray(data?.pendingWordGlosses) ? data.pendingWordGlosses.length : 0;
+      setStep2Notice({
+        ok: true,
+        message: `已应用 ${data?.addedGlossCount || 0} 条词义；关联生词 ${
+          typeof before === 'number' && typeof after === 'number' && before !== after
+            ? `${before} → ${after} 词`
+            : `${after ?? 0} 词`
+        }${remaining > 0 ? `，仍剩 ${remaining} 词` : ''}${
+          rejectedCount > 0 ? `（另有 ${rejectedCount} 段改写因涉及受保护目标词已回退）` : ''
+        }。`,
+      });
+    } catch (err: any) {
+      setStep2Notice({ ok: false, message: err?.message || '导入 Step 2 补词结果失败' });
+    } finally {
+      setIsRunningStep2Gloss(false);
+    }
+  };
+
+  const handlePasteAndApplyStep2FromClipboard = async () => {
+    setStep2Notice(null);
+    try {
+      if (!navigator.clipboard?.readText) {
+        throw new Error('no-clipboard-api');
+      }
+      const clipText = (await navigator.clipboard.readText()).trim();
+      if (!clipText) {
+        setShowStep2PasteBox(true);
+        setStep2Notice({
+          ok: false,
+          message: '剪贴板为空，请先复制 AI 回复，或在下方文本框手动粘贴后点击确认应用。',
+        });
+        return;
+      }
+      await applyStep2ImportText(clipText);
+    } catch {
+      setShowStep2PasteBox(true);
+      setStep2Notice({
+        ok: false,
+        message: '当前设备或浏览器不支持直接读取剪贴板，请在下方文本框手动粘贴后点击确认应用。',
+      });
+    }
+  };
+
+  const handleImportStep2Paste = async () => {
+    await applyStep2ImportText(step2PasteText);
+  };
+
+  const handleSyncStep2AgentOrRecount = async (mode: 'sync' | 'recount') => {
+    setIsRunningStep2Gloss(true);
+    setStep2Notice(null);
+    try {
+      const res = await fetch(
+        mode === 'sync'
+          ? `/api/courses/${encodeURIComponent(course.id)}/agent-sync`
+          : `/api/courses/${encodeURIComponent(course.id)}/days/${slot.dayIndex}/word-glosses`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(
+            mode === 'sync'
+              ? { forceOverwrite: false }
+              : { action: 'recount', allowSynonymReplacement: step2SimplifySynonyms }
+          ),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || '同步/统计失败');
+      if (data?.course) onCourseUpdated(data.course);
+      const countMsg =
+        typeof data?.afterStats?.associatedWordCount === 'number'
+          ? `关联生词 ${data.afterStats.associatedWordCount} 词（待补 ${data.pendingWordGlosses?.length ?? 0} 词）。`
+          : '已同步本地课件并更新关联生词统计。';
+      setStep2Notice({ ok: true, message: countMsg });
+    } catch (err: any) {
+      setStep2Notice({ ok: false, message: err?.message || '同步失败' });
+    } finally {
+      setIsRunningStep2Gloss(false);
+    }
+  };
+
+  const clickableWordEntries = useMemo(() => {
+    if (!activeLesson?.englishPayload) {
+      return [] as Array<{
+        item: VocabItem;
+        role: 'new' | 'review' | 'extra_gloss' | 'incidental' | 'marked';
+        sourceSectionIndex?: number;
+      }>;
+    }
+
+    const effectiveWords = course.englishConfig?.effectiveWords || [];
+    const effectiveById = new Map<string, VocabItem>();
+    const effectiveByKey = new Map<string, VocabItem>();
+    for (const w of effectiveWords) {
+      if (w.id) effectiveById.set(w.id, w);
+      const k = normalizeWordKey(w.word);
+      if (k && !effectiveByKey.has(k)) effectiveByKey.set(k, w);
+    }
+
+    const extraGlossById = new Map<string, VocabItem>();
+    const extraGlossByKey = new Map<string, VocabItem>();
+    for (const g of activeLesson.englishPayload.extraWordGlosses || []) {
+      if (isPlaceholderVocabMeaning(g.meaning)) continue;
+      if (g.id) extraGlossById.set(g.id, g);
+      const gk = normalizeWordKey(g.word);
+      if (gk && !extraGlossByKey.has(gk)) extraGlossByKey.set(gk, g);
+    }
+
+    const enrichWithExtraGloss = (raw: VocabItem): VocabItem => {
+      if (!isPlaceholderVocabMeaning(raw.meaning)) return raw;
+      const gk = normalizeWordKey(raw.word);
+      const g = (raw.id ? extraGlossById.get(raw.id) : undefined) || (gk ? extraGlossByKey.get(gk) : undefined);
+      if (!g) return raw;
+      return {
+        ...raw,
+        meaning: g.meaning,
+        phonetic: g.phonetic || raw.phonetic,
+        usageNote: g.usageNote || raw.usageNote,
+      };
+    };
+
+    const currentNewKeySet = new Set<string>();
+    const currentNewItems: VocabItem[] = [];
+    for (const id of slot.targetWordIds || []) {
+      const w = effectiveById.get(id);
+      if (w) {
+        const k = normalizeWordKey(w.word);
+        if (k) currentNewKeySet.add(k);
+        currentNewItems.push(w);
+      }
+    }
+    for (const w of slot.assignedWords || []) {
+      const k = normalizeWordKey(w.word);
+      if (k) currentNewKeySet.add(k);
+      currentNewItems.push(w);
+    }
+
+    // Collect words learned in earlier sections (most recent section index preserved)
+    const priorWordSectionMap = new Map<
+      string,
+      { sectionIndex: number; item: VocabItem }
+    >();
+    const priorEndIdx = currentSlotIdx >= 0 ? currentSlotIdx : sortedSlots.length;
+    for (let i = 0; i < priorEndIdx; i++) {
+      const prev = sortedSlots[i];
+      const recordPrev = (rawItem: VocabItem | undefined) => {
+        if (!rawItem || !rawItem.word) return;
+        const k = normalizeWordKey(rawItem.word);
+        if (!k || currentNewKeySet.has(k)) return;
+        const canonical =
+          (rawItem.id && effectiveById.get(rawItem.id)) || effectiveByKey.get(k);
+        const merged: VocabItem = canonical
+          ? {
+              ...canonical,
+              ...rawItem,
+              id: rawItem.id || canonical.id,
+              meaning:
+                rawItem.meaning && rawItem.meaning !== '待结合语境学习'
+                  ? rawItem.meaning
+                  : canonical.meaning || rawItem.meaning,
+            }
+          : rawItem;
+        priorWordSectionMap.set(k, {
+          sectionIndex: prev.dayIndex,
+          item: merged,
+        });
+      };
+
+      for (const id of prev.targetWordIds || []) {
+        recordPrev(effectiveById.get(id));
+      }
+      for (const w of prev.assignedWords || []) {
+        recordPrev((w.id && effectiveById.get(w.id)) || effectiveByKey.get(normalizeWordKey(w.word)) || w);
+      }
+      for (const w of prev.lesson?.englishPayload?.targetWords || []) {
+        if (w.isReview) continue;
+        recordPrev(w);
+      }
+    }
+
+    const byKey = new Map<
+      string,
+      {
+        item: VocabItem;
+        role: 'new' | 'review' | 'extra_gloss' | 'incidental' | 'marked';
+        sourceSectionIndex?: number;
+      }
+    >();
+
+    // 1. Explicit targetWords on the active lesson (richest contextual metadata)
+    for (const w of activeLesson.englishPayload.targetWords || []) {
+      const k = normalizeWordKey(w.word);
+      if (!k) continue;
+      const priorInfo = priorWordSectionMap.get(k);
+      const isRev = Boolean(w.isReview || (priorInfo && !currentNewKeySet.has(k)));
+      const enriched = enrichWithExtraGloss(w);
+      byKey.set(k, {
+        item: isRev ? { ...enriched, isReview: true } : enriched,
+        role: isRev ? 'review' : 'new',
+        sourceSectionIndex: priorInfo?.sectionIndex,
+      });
+    }
+
+    // 2. Planned target words for this section missing from payload.targetWords
+    for (const w of currentNewItems) {
+      const k = normalizeWordKey(w.word);
+      if (!k || byKey.has(k)) continue;
+      byKey.set(k, {
+        item: enrichWithExtraGloss(w),
+        role: 'new',
+      });
+    }
+
+    // 3. Prior sections' words appearing in the article for cross-article click lookup
+    for (const [k, info] of priorWordSectionMap.entries()) {
+      if (byKey.has(k)) continue;
+      byKey.set(k, {
+        item: enrichWithExtraGloss({ ...info.item, isReview: true }),
+        role: 'review',
+        sourceSectionIndex: info.sectionIndex,
+      });
+    }
+
+    // 4. Incidental course vocab bank matches in prose coverage (promote words with Step 2 glosses to 'extra_gloss')
+    const secId = ensureStableSectionId(slot.dayIndex, slot.id);
+    const secCov = englishCourseVocabCoverage?.bySection?.[secId];
+    for (const m of secCov?.matches || []) {
+      const canonical =
+        (m.wordId && effectiveById.get(m.wordId)) ||
+        effectiveByKey.get(normalizeWordKey(m.word));
+      if (!canonical) continue;
+      const k = normalizeWordKey(canonical.word);
+      if (!k || byKey.has(k)) continue;
+      const g =
+        (canonical.id ? extraGlossById.get(canonical.id) : undefined) ||
+        extraGlossByKey.get(k);
+      const baseRole =
+        m.role === 'review' ? 'review' : m.role === 'new' ? 'new' : g ? 'extra_gloss' : 'incidental';
+      byKey.set(k, {
+        item: g
+          ? {
+              ...canonical,
+              ...g,
+              id: canonical.id || g.id,
+              meaning: g.meaning,
+              phonetic: g.phonetic || canonical.phonetic,
+              usageNote: g.usageNote || canonical.usageNote,
+            }
+          : canonical,
+        role: baseRole,
+      });
+    }
+
+    // 5. Also expose Step 2 extraWordGlosses directly in case cached secCov has not run yet
+    for (const g of activeLesson.englishPayload.extraWordGlosses || []) {
+      if (isPlaceholderVocabMeaning(g.meaning)) continue;
+      const k = normalizeWordKey(g.word);
+      if (!k || byKey.has(k)) continue;
+      byKey.set(k, {
+        item: g,
+        role: 'extra_gloss',
+      });
+    }
+
+    // 6. Highlight user-marked words in a distinct rose color (and enrich meanings if available)
+    for (const [k, existing] of byKey.entries()) {
+      const markedItem = markedWordMap.get(k);
+      if (!markedItem) continue;
+      byKey.set(k, {
+        ...existing,
+        item: enrichWithExtraGloss({
+          ...existing.item,
+          meaning:
+            existing.item.meaning && !isPlaceholderVocabMeaning(existing.item.meaning)
+              ? existing.item.meaning
+              : markedItem.meaning,
+          phonetic: existing.item.phonetic || markedItem.phonetic,
+        }),
+        role: 'marked',
+      });
+    }
+    for (const [k, mw] of markedWordMap.entries()) {
+      if (byKey.has(k)) continue;
+      byKey.set(k, {
+        item: enrichWithExtraGloss(mw),
+        role: 'marked',
+      });
+    }
+
+    return Array.from(byKey.values());
+  }, [
+    activeLesson?.englishPayload,
+    course.englishConfig?.effectiveWords,
+    slot.id,
+    slot.dayIndex,
+    slot.targetWordIds,
+    slot.assignedWords,
+    sortedSlots,
+    currentSlotIdx,
+    englishCourseVocabCoverage,
+    markedWordMap,
+  ]);
+
   /**
    * Build interleaved closed-loop flow so heuristic questions ("先思考，后讲解"),
    * teaching diagrams ("图文同步"), and immediate exercises ("知识点闭环即时练习")
@@ -1033,7 +1696,10 @@ export const LessonView: React.FC<LessonViewProps> = ({
     }
 
     const resolved = resolveLessonAssetReferences(activeLesson, combinedAssets);
-    const rawMd = resolved.markdownBody || '';
+    const rawMd = resolveEnglishQuoteAnchors(
+      resolved.markdownBody || '',
+      activeLesson.englishPayload?.paragraphs
+    );
     const diagrams = activeLesson.diagrams || [];
     const heuristics = activeLesson.heuristicQuestions || [];
     const exercises = activeLesson.exercises || [];
@@ -1373,8 +2039,8 @@ export const LessonView: React.FC<LessonViewProps> = ({
 
   const gradeReport = useMemo(() => {
     if (!activeLesson?.exercises || !isSubmitted) return null;
-    return gradeExerciseSet(activeLesson.exercises, userAnswers);
-  }, [activeLesson?.exercises, isSubmitted, userAnswers]);
+    return gradeExerciseSet(activeLesson.exercises, userAnswers, understoodFillIds);
+  }, [activeLesson?.exercises, isSubmitted, userAnswers, understoodFillIds]);
 
   const handlePersistModePreference = async (newMode: CourseGenerationMode) => {
     try {
@@ -2229,35 +2895,51 @@ export const LessonView: React.FC<LessonViewProps> = ({
     }
   };
 
-  const handleToggleWordMastery = async (word: string) => {
-    try {
-      const res = await fetch(`/api/courses/${course.id}/vocab-mastery`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ word }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        onCourseUpdated({
-          ...course,
-          masteredWords: data.masteredWords,
+  const masteryQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const pendingMasteryCountRef = useRef(0);
+
+  const handleToggleWordMastery = (word: string) => {
+    const norm = normalizeWordKey(word);
+    if (!norm) return;
+    const prevMastered = course.masteredWords || [];
+    const exists = prevMastered.includes(norm);
+    const optimisticNext = exists
+      ? prevMastered.filter((w) => w !== norm)
+      : [...prevMastered, norm];
+
+    // Update UI immediately so rapid clicks have zero visual lag
+    onCourseUpdated({ ...course, masteredWords: optimisticNext });
+    pendingMasteryCountRef.current += 1;
+
+    masteryQueueRef.current = masteryQueueRef.current.then(async () => {
+      try {
+        const res = await fetch(`/api/courses/${course.id}/vocab-mastery`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ word }),
         });
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data?.masteredWords) && pendingMasteryCountRef.current <= 1) {
+            onCourseUpdated({
+              ...course,
+              masteredWords: data.masteredWords,
+            });
+          }
+        }
+      } catch {
+        // Keep optimistic update offline
+      } finally {
+        pendingMasteryCountRef.current = Math.max(0, pendingMasteryCountRef.current - 1);
       }
-    } catch {
-      const norm = normalizeWordKey(word);
-      const exists = course.masteredWords.includes(norm);
-      const next = exists
-        ? course.masteredWords.filter((w) => w !== norm)
-        : [...course.masteredWords, norm];
-      onCourseUpdated({ ...course, masteredWords: next });
-    }
+    });
   };
 
   const handleSubmitExercises = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!activeLesson?.exercises) return;
 
-    const result = gradeExerciseSet(activeLesson.exercises, userAnswers);
+    const result = gradeExerciseSet(activeLesson.exercises, userAnswers, understoodFillIds);
     setIsSubmitted(true);
 
     try {
@@ -2268,6 +2950,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
           sectionId: slot.id,
           date: slot.date,
           userAnswers,
+          selfUnderstoodIds: understoodFillIds,
           score: result.score,
           total: result.total,
         }),
@@ -2281,8 +2964,44 @@ export const LessonView: React.FC<LessonViewProps> = ({
     }
   };
 
+  const handleToggleFillUnderstood = async (questionId: string) => {
+    const alreadyUnderstood = understoodFillIds.includes(questionId);
+    const nextIds = alreadyUnderstood
+      ? understoodFillIds.filter((id) => id !== questionId)
+      : [...understoodFillIds, questionId];
+    setUnderstoodFillIds(nextIds);
+    if (!alreadyUnderstood) {
+      setRevealedSingleExercises((prev) => ({ ...prev, [questionId]: true }));
+    }
+
+    if (!isSubmitted || !activeLesson?.exercises) return;
+    const updated = gradeExerciseSet(activeLesson.exercises, userAnswers, nextIds);
+    try {
+      const res = await fetch(`/api/courses/${course.id}/exercises`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sectionId: slot.id,
+          date: slot.date,
+          userAnswers,
+          selfUnderstoodIds: nextIds,
+          score: updated.score,
+          total: updated.total,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        onCourseUpdated(data.course);
+      }
+    } catch {
+      // Offline state already updated
+    }
+  };
+
   const handleResetExercises = () => {
     setUserAnswers({});
+    setUnderstoodFillIds([]);
+    setRevealedSingleExercises({});
     setIsSubmitted(false);
   };
 
@@ -2354,9 +3073,16 @@ export const LessonView: React.FC<LessonViewProps> = ({
         : null;
     const currentVariantVal = variantAnswers[q.id] || '';
     const isVariantChecked = Boolean(variantSubmitted[q.id]);
+    const isVariantUnderstood = Boolean(variantUnderstood[q.id]);
+    const isVariantChoice =
+      Boolean(variantObj) &&
+      Array.isArray(variantObj?.options) &&
+      variantObj.options.length > 0;
     const variantReport =
       variantQuestion && isVariantChecked
-        ? gradeSingleExercise(variantQuestion, currentVariantVal)
+        ? gradeSingleExercise(variantQuestion, currentVariantVal, {
+            selfUnderstood: isVariantUnderstood,
+          })
         : null;
 
     return (
@@ -2468,24 +3194,48 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     }
                     className="px-2.5 py-1 rounded border border-sky-700/80 bg-sky-950/40 hover:bg-sky-900/50 text-sky-200 font-medium transition-colors"
                   >
-                    {isVariantChecked ? '重新核对变式答案' : '检验变式答案'}
+                    {isVariantChoice
+                      ? isVariantChecked
+                        ? '重新核对变式答案'
+                        : '检验变式答案'
+                      : isVariantChecked
+                        ? '已展开变式答案'
+                        : '查看变式答案'}
                   </button>
                 </div>
 
                 {isVariantChecked && (
-                  <div className="p-2.5 rounded border border-neutral-800 bg-black/80 space-y-1.5 text-xs">
-                    <div
-                      className={
-                        variantReport?.isCorrect ? 'text-emerald-300' : 'text-amber-300'
-                      }
-                    >
-                      参考答案：
-                      <span
-                        className="font-mono font-medium ml-1"
-                        dangerouslySetInnerHTML={{
-                          __html: renderInlineMathWithLatex(variantObj.answer, lessonVisuals),
-                        }}
-                      />
+                  <div className="p-2.5 rounded border border-neutral-800 bg-black/80 space-y-2 text-xs">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div
+                        className={
+                          variantReport?.isCorrect ? 'text-emerald-300' : 'text-amber-300'
+                        }
+                      >
+                        参考答案：
+                        <span
+                          className="font-mono font-medium ml-1"
+                          dangerouslySetInnerHTML={{
+                            __html: renderInlineMathWithLatex(variantObj.answer, lessonVisuals),
+                          }}
+                        />
+                      </div>
+                      {!isVariantChoice && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setVariantUnderstood((prev) => ({ ...prev, [q.id]: !prev[q.id] }))
+                          }
+                          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded border text-[11px] font-medium transition-colors ${
+                            isVariantUnderstood
+                              ? 'border-emerald-500/70 bg-emerald-950/60 text-emerald-200'
+                              : 'border-white/80 bg-white text-black hover:bg-neutral-200'
+                          }`}
+                        >
+                          <Check className="w-3 h-3" />
+                          <span>{isVariantUnderstood ? '✓ 已理解（已通过）' : '我理解了'}</span>
+                        </button>
+                      )}
                     </div>
                     {variantObj.explanation && (
                       <div
@@ -2508,47 +3258,225 @@ export const LessonView: React.FC<LessonViewProps> = ({
     );
   };
 
+  const [optimisticVerifications, setOptimisticVerifications] = useState<
+    Record<string, 'confirmed' | 'rejected' | 'reset'>
+  >({});
+  const verifyQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const pendingVerifyCountRef = useRef(0);
+
+  useEffect(() => {
+    setOptimisticVerifications({});
+  }, [course.id, slot.dayIndex]);
+
+  const handleVerifyVocabMatch = (
+    sectionId: string,
+    wordId: string,
+    status: 'confirmed' | 'rejected' | 'reset'
+  ) => {
+    const key = `${sectionId}::${wordId}`;
+    // Immediately hide/update row on click without waiting for server persistence
+    setOptimisticVerifications((prev) => ({ ...prev, [key]: status }));
+    pendingVerifyCountRef.current += 1;
+
+    verifyQueueRef.current = verifyQueueRef.current
+      .then(async () => {
+        try {
+          const res = await fetch(`/api/courses/${course.id}/vocab-coverage/verify`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sectionId, wordId, status, reviewer: 'manual' }),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data.course && pendingVerifyCountRef.current <= 1) {
+              onCourseUpdated(data.course);
+            }
+          }
+        } catch {
+          // ignore offline error; optimistic state remains active
+        } finally {
+          pendingVerifyCountRef.current = Math.max(0, pendingVerifyCountRef.current - 1);
+          if (pendingVerifyCountRef.current === 0) {
+            setOptimisticVerifications({});
+          }
+        }
+      });
+  };
+
+  const renderSnippetWithHighlightedWord = (
+    snippet: string,
+    matchedForms: string[],
+    canonicalWord: string
+  ) => {
+    const forms = Array.from(
+      new Set([...(matchedForms || []), canonicalWord].map((s) => String(s || '').trim()).filter(Boolean))
+    ).sort((a, b) => b.length - a.length);
+    if (forms.length === 0 || !snippet) return snippet;
+    const escaped = forms.map((f) => f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const regex = new RegExp(`(?<![A-Za-z0-9'-])(${escaped.join('|')})(?![A-Za-z0-9'-])`, 'gi');
+    const nodes: React.ReactNode[] = [];
+    let lastIdx = 0;
+    let m: RegExpExecArray | null;
+    while ((m = regex.exec(snippet)) !== null) {
+      if (m.index > lastIdx) nodes.push(snippet.slice(lastIdx, m.index));
+      nodes.push(
+        <mark
+          key={`${m.index}-${m[0]}`}
+          className="not-italic bg-amber-400/25 text-amber-200 font-semibold px-1 rounded"
+        >
+          {m[0]}
+        </mark>
+      );
+      lastIdx = m.index + m[0].length;
+    }
+    if (lastIdx < snippet.length) nodes.push(snippet.slice(lastIdx));
+    return nodes.length > 0 ? nodes : snippet;
+  };
+
   const renderHighlightedEnglishParagraph = (
     text: string,
-    targetWords: VocabItem[]
+    wordEntries: Array<{
+      item: VocabItem;
+      role: 'new' | 'review' | 'extra_gloss' | 'incidental' | 'marked';
+      sourceSectionIndex?: number;
+    }>
   ) => {
-    if (!targetWords || targetWords.length === 0) return text;
-    const wordMap = new Map<string, VocabItem>();
-    for (const item of targetWords) {
-      wordMap.set(normalizeWordKey(item.word), item);
+    const renderPlainSegment = (segment: string, keyPrefix: string): React.ReactNode => {
+      if (!segment) return null;
+      const plainWordRegex = /[A-Za-z]+(?:['’-][A-Za-z]+)*/g;
+      const nodes: React.ReactNode[] = [];
+      let segLast = 0;
+      let pm: RegExpExecArray | null;
+      while ((pm = plainWordRegex.exec(segment)) !== null) {
+        if (pm.index > segLast) {
+          nodes.push(segment.slice(segLast, pm.index));
+        }
+        const rawWord = pm[0];
+        nodes.push(
+          <button
+            key={`${keyPrefix}-${pm.index}`}
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              const r = e.currentTarget.getBoundingClientRect();
+              const k = normalizeWordKey(rawWord);
+              const markedHit = k ? markedWordMap.get(k) : undefined;
+              setActiveWordPopover({
+                item: markedHit || {
+                  word: rawWord,
+                  meaning: '',
+                },
+                role: markedHit ? 'marked' : 'plain',
+                matchedText: rawWord,
+                rect: {
+                  left: r.left,
+                  top: r.top,
+                  right: r.right,
+                  bottom: r.bottom,
+                  width: r.width,
+                  height: r.height,
+                },
+              });
+            }}
+            className="hover:bg-white/10 rounded-sm transition-colors cursor-pointer"
+            title={`点击查看或标记生词：${rawWord}`}
+          >
+            {rawWord}
+          </button>
+        );
+        segLast = pm.index + rawWord.length;
+      }
+      if (segLast < segment.length) {
+        nodes.push(segment.slice(segLast));
+      }
+      return nodes.length > 0 ? nodes : segment;
+    };
+
+    if (!wordEntries || wordEntries.length === 0) {
+      return renderPlainSegment(text, 'plain-only');
+    }
+    const formMap = new Map<
+      string,
+      {
+        item: VocabItem;
+        role: 'new' | 'review' | 'extra_gloss' | 'incidental' | 'marked';
+        sourceSectionIndex?: number;
+      }
+    >();
+    const rawPatterns: string[] = [];
+
+    for (const entry of wordEntries) {
+      const { item } = entry;
+      const clean = String(item.word || '').trim().replace(/\s+/g, ' ');
+      if (!clean) continue;
+      if (/\s/.test(clean) || !/[A-Za-z]/.test(clean)) {
+        const key = clean.toLowerCase();
+        if (!formMap.has(key)) formMap.set(key, entry);
+        rawPatterns.push(clean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+'));
+      } else {
+        const forms = buildEnglishInflectionForms(clean, item.meaning);
+        for (const f of forms) {
+          if (!formMap.has(f)) formMap.set(f, entry);
+          rawPatterns.push(f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+        }
+      }
     }
 
-    const escapedWords = targetWords
-      .map((w) => w.word.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-      .filter(Boolean);
+    if (rawPatterns.length === 0) return text;
 
-    if (escapedWords.length === 0) return text;
-
-    const regex = new RegExp(`\\b(${escapedWords.join('|')})(?:s|es|ed|ing|d)?\\b`, 'gi');
+    const sortedPatterns = Array.from(new Set(rawPatterns)).sort((a, b) => b.length - a.length);
+    const regex = new RegExp(`(?<![A-Za-z0-9'-])(${sortedPatterns.join('|')})(?![A-Za-z0-9'-])`, 'gi');
     const parts: React.ReactNode[] = [];
     let lastIndex = 0;
     let match: RegExpExecArray | null;
 
     while ((match = regex.exec(text)) !== null) {
       const matchedStr = match[0];
-      const baseCandidate = match[1].toLowerCase();
+      const matchedKey = matchedStr.toLowerCase().replace(/\s+/g, ' ');
       const start = match.index;
       if (start > lastIndex) {
-        parts.push(text.slice(lastIndex, start));
+        parts.push(renderPlainSegment(text.slice(lastIndex, start), `gap-${start}`));
       }
-      const vocabObj =
-        wordMap.get(baseCandidate) ||
-        targetWords.find((w) =>
-          matchedStr.toLowerCase().startsWith(w.word.toLowerCase().slice(0, 5))
-        );
+      const entry =
+        formMap.get(matchedKey) ||
+        wordEntries.find((e) => normalizeWordKey(e.item.word) === matchedKey);
+      const roleClass =
+        entry?.role === 'marked'
+          ? 'text-rose-200 underline decoration-rose-400/85 decoration-[1.5px] underline-offset-4 bg-rose-500/10 hover:bg-rose-500/20 rounded-sm px-0.5 transition-colors cursor-pointer'
+          : entry?.role === 'review'
+            ? 'text-amber-100 underline decoration-dashed decoration-amber-400/75 hover:decoration-amber-300 underline-offset-4 px-0.5 transition-colors cursor-pointer'
+            : entry?.role === 'extra_gloss'
+              ? 'text-teal-200/95 underline decoration-dotted decoration-teal-400/80 hover:bg-teal-500/15 hover:text-teal-100 decoration-[1.5px] underline-offset-[5px] px-0.5 transition-colors cursor-pointer'
+              : entry?.role === 'incidental'
+                ? 'text-neutral-200 underline decoration-dotted decoration-neutral-500 hover:decoration-neutral-300 underline-offset-4 px-0.5 transition-colors cursor-pointer'
+                : 'text-white font-medium underline decoration-sky-400/75 hover:decoration-sky-300 decoration-[1.5px] underline-offset-4 px-0.5 transition-colors cursor-pointer';
 
       parts.push(
         <button
           key={`${start}-${matchedStr}`}
           type="button"
-          onClick={() => vocabObj && setActiveWordCard(vocabObj)}
-          className="text-white font-medium underline decoration-neutral-500 hover:decoration-white underline-offset-4 px-0.5 transition-colors"
-          title={vocabObj ? `${vocabObj.word}: ${vocabObj.meaning}` : matchedStr}
+          data-vocab-word-trigger="true"
+          onClick={(e) => {
+            if (!entry) return;
+            e.stopPropagation();
+            const r = e.currentTarget.getBoundingClientRect();
+            setActiveWordPopover({
+              item: entry.item,
+              role: entry.role,
+              sourceSectionIndex: entry.sourceSectionIndex,
+              matchedText: matchedStr,
+              rect: {
+                left: r.left,
+                top: r.top,
+                right: r.right,
+                bottom: r.bottom,
+                width: r.width,
+                height: r.height,
+              },
+            });
+          }}
+          className={roleClass}
+          title={entry ? `点击查看释义：${entry.item.word}` : matchedStr}
         >
           {matchedStr}
         </button>
@@ -2557,7 +3485,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
     }
 
     if (lastIndex < text.length) {
-      parts.push(text.slice(lastIndex));
+      parts.push(renderPlainSegment(text.slice(lastIndex), `tail-${lastIndex}`));
     }
     return parts;
   };
@@ -2726,7 +3654,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     course,
                     course.outlineConfirmed
                       ? 'lessons'
-                      : hasPdfSource
+                      : hasPdfSource || (course.englishConfig?.effectiveWords?.length || 0) > 0
                         ? 'split_vocab'
                         : 'outline'
                   )
@@ -4340,7 +5268,7 @@ export const LessonView: React.FC<LessonViewProps> = ({
                         course,
                         course.outlineConfirmed
                           ? 'lessons'
-                          : hasPdfSource
+                          : hasPdfSource || (course.englishConfig?.effectiveWords?.length || 0) > 0
                             ? 'split_vocab'
                             : 'outline'
                       )
@@ -4905,247 +5833,363 @@ export const LessonView: React.FC<LessonViewProps> = ({
               )}
             </header>
 
-            {/* English Course Dedicated Module */}
-            {activeLesson.englishPayload && (
-              <section className="space-y-10">
+            {/* 1. Reading-First English Article Section (文章正文优先 + 原文来源/AI 原创标注 + 点词弹窗释义) */}
+            {activeLesson.englishPayload && (() => {
+              const payload = activeLesson.englishPayload;
+              const safeSourceUrl =
+                payload.sourceUrl && /^https?:\/\/\S+$/i.test(payload.sourceUrl.trim())
+                  ? payload.sourceUrl.trim()
+                  : '';
+              const isAdaptedArticle = payload.contentOrigin === 'adapted_article';
+              const isAiOriginal =
+                payload.contentOrigin === 'ai_original' ||
+                (!payload.contentOrigin && payload.articleMode === 'llm_original' && !safeSourceUrl);
+              const originLabel = isAiOriginal
+                ? 'AI 原创文章'
+                : isAdaptedArticle
+                  ? '基于近期原文改写'
+                  : '真实英文原文';
+              const originBadgeClass = isAiOriginal
+                ? 'border-amber-700/70 bg-amber-950/35 text-amber-200'
+                : isAdaptedArticle
+                  ? 'border-sky-700/70 bg-sky-950/35 text-sky-200'
+                  : 'border-emerald-700/70 bg-emerald-950/35 text-emerald-200';
+              const hasReviewWordsInText = clickableWordEntries.some((e) => e.role === 'review');
+              const hasExtraGlossedWordsInText = clickableWordEntries.some(
+                (e) => e.role === 'extra_gloss'
+              );
+              const hasMarkedWordsInText = clickableWordEntries.some((e) => e.role === 'marked');
+
+              return (
+              <section className="space-y-5">
                 <div className="space-y-4">
-                  <div className="flex flex-wrap items-center justify-between gap-4 border-b border-neutral-900 pb-3">
-                    <div>
-                      <h2 className="text-base font-semibold text-white">
-                        一、本节目标词汇与例句（共 {activeLesson.englishPayload.targetWords.length} 词）
-                      </h2>
-                      {course.englishConfig && (
-                        <p className="text-xs text-neutral-500 mt-0.5 font-mono">
-                          词库范围：{course.englishConfig.targetBankName} −{' '}
-                          {course.englishConfig.excludedBankName}
-                        </p>
-                      )}
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setHideVocabMeaning((v) => !v)}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-800 hover:border-neutral-600 rounded text-neutral-300 transition-colors whitespace-nowrap"
-                      >
-                        {hideVocabMeaning ? (
-                          <>
-                            <Eye className="w-3.5 h-3.5" />
-                            <span>显示释义</span>
-                          </>
-                        ) : (
-                          <>
-                            <EyeOff className="w-3.5 h-3.5" />
-                            <span>遮盖释义自测</span>
-                          </>
-                        )}
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setVocabFilter((f) => (f === 'all' ? 'unmastered' : 'all'))
-                        }
-                        className="px-2.5 py-1 text-xs border border-neutral-800 hover:border-neutral-600 rounded text-neutral-300 transition-colors whitespace-nowrap"
-                      >
-                        {vocabFilter === 'all' ? '仅看未掌握' : '显示全部词汇'}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="divide-y divide-neutral-900 border border-neutral-900 rounded">
-                    {activeLesson.englishPayload.targetWords
-                      .filter((item) =>
-                        vocabFilter === 'all'
-                          ? true
-                          : !course.masteredWords.includes(normalizeWordKey(item.word))
-                      )
-                      .map((item) => {
-                        const isMastered = course.masteredWords.includes(
-                          normalizeWordKey(item.word)
-                        );
-                        return (
-                          <div
-                            key={item.word}
-                            className="p-4 flex flex-col md:flex-row md:items-start justify-between gap-4 bg-black hover:bg-neutral-950/60 transition-colors"
-                          >
-                            <div className="space-y-1.5 flex-1">
-                              <div className="flex items-baseline gap-3">
-                                <span className="text-base font-semibold text-white font-mono">
-                                  {item.word}
-                                </span>
-                                {item.phonetic && (
-                                  <span className="text-xs font-mono text-neutral-500">
-                                    {item.phonetic}
-                                  </span>
-                                )}
-                                <span
-                                  className={`text-sm ${
-                                    hideVocabMeaning
-                                      ? 'bg-neutral-900 text-transparent select-none rounded px-2 cursor-pointer hover:text-neutral-200 [&_*]:!text-transparent'
-                                      : 'text-neutral-200'
-                                  } [&>p]:m-0`}
-                                  onClick={() => hideVocabMeaning && setHideVocabMeaning(false)}
-                                  dangerouslySetInnerHTML={{
-                                    __html: renderInlineMathWithLatex(
-                                      stripAiCitationArtifacts(item.meaning),
-                                      lessonVisuals
-                                    ),
-                                  }}
-                                />
-                              </div>
-                              {item.example && (
-                                <div className="text-xs text-neutral-400 space-y-0.5 pt-1">
-                                  <p
-                                    className="font-serif-reading text-neutral-300 text-sm [&>p]:m-0"
-                                    dangerouslySetInnerHTML={{
-                                      __html: renderInlineMathWithLatex(
-                                        stripAiCitationArtifacts(item.example),
-                                        lessonVisuals
-                                      ),
-                                    }}
-                                  />
-                                  {!hideVocabMeaning && item.exampleTranslation && (
-                                    <p
-                                      className="text-neutral-500 [&>p]:m-0"
-                                      dangerouslySetInnerHTML={{
-                                        __html: renderInlineMathWithLatex(
-                                          stripAiCitationArtifacts(item.exampleTranslation),
-                                          lessonVisuals
-                                        ),
-                                      }}
-                                    />
-                                  )}
-                                </div>
-                              )}
-                            </div>
-
-                            <button
-                              type="button"
-                              onClick={() => handleToggleWordMastery(item.word)}
-                              className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded border transition-colors whitespace-nowrap shrink-0 ${
-                                isMastered
-                                  ? 'border-neutral-700 bg-neutral-900 text-white'
-                                  : 'border-neutral-800 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
-                              }`}
-                            >
-                              <Check className="w-3 h-3" />
-                              <span>{isMastered ? '已掌握' : '标记已掌握'}</span>
-                            </button>
-                          </div>
-                        );
-                      })}
-                  </div>
-                </div>
-
-                <div className="space-y-4">
-                  <div className="flex flex-wrap items-center justify-between gap-4 border-b border-neutral-900 pb-3">
-                    <div>
-                      <h2 className="text-base font-semibold text-white">
-                        二、文章阅读：
+                  <div className="flex flex-wrap items-start justify-between gap-4 border-b border-neutral-900 pb-3">
+                    <div className="space-y-1.5 min-w-0 flex-1">
+                      <h2 className="text-base md:text-lg font-semibold text-white">
+                        一、完整英文文章阅读：
                         <span
                           className="[&>p]:m-0"
                           dangerouslySetInnerHTML={{
                             __html: renderInlineMathWithLatex(
-                              stripAiCitationArtifacts(activeLesson.englishPayload.articleTitle),
+                              stripAiCitationArtifacts(payload.articleTitle),
                               lessonVisuals
                             ),
                           }}
                         />
                       </h2>
-                      {activeLesson.englishPayload.sourceReference && (
-                        <p className="text-xs text-neutral-500 mt-0.5">
+
+                      <div className="flex flex-wrap items-center gap-2 text-xs text-neutral-400">
+                        <span
+                          className={`px-2 py-0.5 rounded border text-[11px] font-medium ${originBadgeClass}`}
+                        >
+                          {originLabel}
+                        </span>
+
+                        {payload.sourceReference && (
                           <span
-                            className="[&>p]:m-0"
+                            className="text-neutral-300 [&>p]:m-0"
                             dangerouslySetInnerHTML={{
                               __html: renderInlineMathWithLatex(
-                                stripAiCitationArtifacts(activeLesson.englishPayload.sourceReference),
+                                stripAiCitationArtifacts(payload.sourceReference),
                                 lessonVisuals
                               ),
                             }}
-                          />{' '}
-                          · 点击文中下划线词汇可查看释义
-                        </p>
-                      )}
-                    </div>
+                          />
+                        )}
 
-                    <button
-                      type="button"
-                      onClick={() => setShowTranslation((v) => !v)}
-                      className="px-3 py-1 text-xs border border-neutral-800 hover:border-neutral-600 rounded text-neutral-300 transition-colors whitespace-nowrap"
-                    >
-                      {showTranslation ? '隐藏中文译文（纯英阅读）' : '显示逐段中文译文'}
-                    </button>
+                        {payload.publishDate && (
+                          <span className="font-mono text-neutral-400">
+                            · {payload.publishDate}
+                          </span>
+                        )}
+
+                        {safeSourceUrl && (
+                          <a
+                            href={safeSourceUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 text-sky-300 hover:text-sky-200 underline underline-offset-4"
+                          >
+                            <span>{isAdaptedArticle ? '查看参考原文' : '查看原文链接'}</span>
+                            <ExternalLink className="w-3 h-3" />
+                          </a>
+                        )}
+
+                        {isAiOriginal && (
+                          <span className="text-amber-200/80">
+                            · {payload.originNote
+                              ? stripAiCitationArtifacts(payload.originNote)
+                              : '基于近期可靠信息编写的 AI 原创英文文章'}
+                          </span>
+                        )}
+                        {!isAiOriginal && payload.originNote && (
+                          <span className={isAdaptedArticle ? 'text-sky-200/80' : 'text-neutral-500'}>
+                            · {stripAiCitationArtifacts(payload.originNote)}
+                          </span>
+                        )}
+                      </div>
+
+                      <p className="text-[11px] text-neutral-500">
+                        点击文中任意单词可弹窗查看或标记生词（实线下划线：本节生词
+                        {hasReviewWordsInText ? ' · 琥珀虚线：前节复现词' : ''}
+                        {hasExtraGlossedWordsInText ? ' · 青绿点线：Step 2 补充释义' : ''}
+                        {hasMarkedWordsInText ? ' · 玫红实线：已标记生词' : ''}）
+                      </p>
+                    </div>
                   </div>
 
-                  {activeWordCard && (
-                    <div className="border border-neutral-700 bg-neutral-950 rounded p-3 flex items-center justify-between gap-4">
-                      <div className="text-xs space-y-0.5">
-                        <div className="flex items-center gap-2">
-                          <strong className="text-sm font-mono text-white">
-                            {activeWordCard.word}
-                          </strong>
-                          <span className="font-mono text-neutral-400">
-                            {activeWordCard.phonetic}
-                          </span>
-                          <span
-                            className="text-neutral-200 [&>p]:m-0"
-                            dangerouslySetInnerHTML={{
-                              __html: renderInlineMathWithLatex(
-                                stripAiCitationArtifacts(activeWordCard.meaning),
-                                lessonVisuals
-                              ),
-                            }}
-                          />
+                  {liveAssociatedStats && pendingGlossWords.length > 0 && (
+                      <div
+                        data-testid="english-step2-toolbar"
+                        className="rounded-lg border border-neutral-800/90 bg-neutral-950/75 px-3.5 py-2.5 space-y-2 text-xs"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-neutral-300">
+                            <span className="font-medium text-teal-300">Step 2 生词标注与关联统计</span>
+                            <span>
+                              正文 {liveAssociatedStats.proseWordCount} 词 · 规划新词{' '}
+                              {liveAssociatedStats.plannedNewCount}
+                            </span>
+                            <span>
+                              关联生词{' '}
+                              <strong className="text-white">
+                                {liveAssociatedStats.associatedWordCount}
+                              </strong>{' '}
+                              词（占正文 {liveAssociatedStats.associatedDensityPercent}%）
+                            </span>
+                            <span className="text-teal-300">
+                              已补释义 {liveAssociatedStats.glossedExtraCount}
+                            </span>
+                            <span
+                              className={
+                                pendingGlossWords.length > 0
+                                  ? 'text-amber-300 font-medium'
+                                  : 'text-emerald-400'
+                              }
+                            >
+                              {pendingGlossWords.length > 0
+                                ? `待补释义 ${pendingGlossWords.length} 词`
+                                : '待补释义 0 词'}
+                            </span>
+                          </div>
+
+                          <label
+                            className="inline-flex items-center gap-1.5 text-[11px] text-neutral-300 cursor-pointer select-none"
+                            title="开启后，Step 2 会在保留本节规划目标词的前提下，对密集关联生词进行简单同义替换并重新统计关联生词量"
+                          >
+                            <input
+                              type="checkbox"
+                              checked={step2SimplifySynonyms}
+                              onChange={(e) => setStep2SimplifySynonyms(e.target.checked)}
+                              className="rounded border-neutral-700 bg-black text-teal-400 focus:ring-0"
+                            />
+                            <span>基础薄弱同义简化</span>
+                          </label>
                         </div>
-                        {activeWordCard.example && (
+
+                        {(payload.step2VocabStats?.associatedWordCountBefore !== undefined ||
+                          (payload.synonymReplacements?.length || 0) > 0) && (
+                          <div className="flex flex-wrap items-center gap-2 text-[11px] text-neutral-400">
+                            {payload.step2VocabStats?.associatedWordCountBefore !== undefined &&
+                              payload.step2VocabStats.associatedWordCountBefore !==
+                                liveAssociatedStats.associatedWordCount && (
+                                <span className="px-2 py-0.5 rounded bg-teal-950/60 border border-teal-800/70 text-teal-200">
+                                  关联生词变化：{payload.step2VocabStats.associatedWordCountBefore} →{' '}
+                                  {liveAssociatedStats.associatedWordCount} 词
+                                  {(payload.synonymReplacements?.length || 0) > 0
+                                    ? `（已同义简化 ${payload.synonymReplacements!.length} 词）`
+                                    : ''}
+                                </span>
+                              )}
+                            {(payload.synonymReplacements?.length || 0) > 0 && (
+                              <details className="text-neutral-400">
+                                <summary className="cursor-pointer hover:text-neutral-200">
+                                  查看同义替换明细（{payload.synonymReplacements!.length} 处）
+                                </summary>
+                                <div className="mt-1 flex flex-wrap gap-1.5">
+                                  {payload.synonymReplacements!.map((rep, rIdx) => (
+                                    <span
+                                      key={`${rep.paragraphIndex}-${rep.originalWord}-${rIdx}`}
+                                      className="px-2 py-0.5 rounded border border-neutral-800 bg-black text-neutral-300"
+                                    >
+                                      P{rep.paragraphIndex + 1}: {rep.originalWord} →{' '}
+                                      <span className="text-teal-300">{rep.replacedWith}</span>
+                                    </span>
+                                  ))}
+                                </div>
+                              </details>
+                            )}
+                          </div>
+                        )}
+
+                        <div className="flex flex-wrap items-center gap-2">
+                          {(pendingGlossWords.length > 0 ||
+                            (step2SimplifySynonyms &&
+                              liveAssociatedStats.associatedWordCount > 0)) && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={handleRunStep2Api}
+                                disabled={isRunningStep2Gloss}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-teal-500 text-black hover:bg-teal-400 font-medium rounded transition-colors disabled:opacity-50"
+                              >
+                                <RefreshCw
+                                  className={`w-3.5 h-3.5 ${isRunningStep2Gloss ? 'animate-spin' : ''}`}
+                                />
+                                <span>
+                                  {isRunningStep2Gloss
+                                    ? 'Step 2 处理中...'
+                                    : step2SimplifySynonyms
+                                      ? `API 执行 Step 2（补词+简化）`
+                                      : `API 补充 ${pendingGlossWords.length} 词释义`}
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleCopyStep2Prompt(false)}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 border border-neutral-700 hover:border-teal-500 text-neutral-200 rounded transition-colors"
+                              >
+                                {step2CopiedKey === 'text' ? (
+                                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                ) : (
+                                  <Copy className="w-3.5 h-3.5" />
+                                )}
+                                <span>
+                                  {step2CopiedKey === 'text'
+                                    ? '已复制 Step 2 提示词'
+                                    : '复制 Step 2 提示词'}
+                                </span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleCopyStep2Prompt(true)}
+                                className="inline-flex items-center gap-1 px-2 py-1 border border-neutral-800 hover:border-neutral-600 text-neutral-300 rounded transition-colors"
+                              >
+                                <FileText className="w-3.5 h-3.5" />
+                                <span>{step2CopiedKey === 'md' ? '已复制 .md' : 'Step 2 .md'}</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={handlePasteAndApplyStep2FromClipboard}
+                                disabled={isRunningStep2Gloss}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 border border-teal-600/80 bg-teal-950/40 hover:border-teal-400 text-teal-200 rounded transition-colors disabled:opacity-50"
+                              >
+                                <Upload className="w-3.5 h-3.5" />
+                                <span>{isRunningStep2Gloss ? '正在应用...' : '粘贴并应用 Step 2'}</span>
+                              </button>
+                            </>
+                          )}
+                          {course.generationMode === 'agent' && (
+                            <button
+                              type="button"
+                              onClick={() => handleSyncStep2AgentOrRecount('sync')}
+                              disabled={isRunningStep2Gloss}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 border border-emerald-700/80 hover:border-emerald-400 bg-emerald-950/30 text-emerald-200 rounded transition-colors disabled:opacity-50"
+                            >
+                              <FolderSync className="w-3.5 h-3.5" />
+                              <span>扫描同步</span>
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleSyncStep2AgentOrRecount('recount')}
+                            disabled={isRunningStep2Gloss}
+                            className="inline-flex items-center gap-1 px-2 py-1 border border-neutral-800 hover:border-neutral-600 text-neutral-400 hover:text-neutral-200 rounded transition-colors disabled:opacity-50"
+                            title="重新扫描当前正文并再次统计关联生词量"
+                          >
+                            <RefreshCw className="w-3 h-3" />
+                            <span>重算关联生词量</span>
+                          </button>
+                        </div>
+
+                        {showStep2PasteBox && (
+                          <div className="space-y-2 pt-1 border-t border-neutral-900">
+                            <textarea
+                              value={step2PasteText}
+                              onChange={(e) => setStep2PasteText(e.target.value)}
+                              placeholder="粘贴 AI 返回的 Step 2 JSON（extraWordGlosses / paragraphUpdates / synonymReplacements）或紧凑格式（wordId | word | /音标/ | 词性. 简明释义）..."
+                              className="w-full h-28 rounded border border-neutral-800 bg-black p-2 text-xs text-neutral-200 focus:border-teal-600 focus:outline-none"
+                            />
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={handleImportStep2Paste}
+                                disabled={isRunningStep2Gloss}
+                                className="px-3 py-1 bg-teal-400 text-black hover:bg-teal-300 font-medium rounded transition-colors disabled:opacity-50"
+                              >
+                                {isRunningStep2Gloss ? '正在应用并重算...' : '确认应用并重算关联生词'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setShowStep2PasteBox(false)}
+                                className="px-2.5 py-1 border border-neutral-800 hover:border-neutral-600 text-neutral-400 hover:text-neutral-200 rounded transition-colors"
+                              >
+                                收起
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {step2Notice && (
                           <p
-                            className="text-neutral-400 [&>p]:m-0"
-                            dangerouslySetInnerHTML={{
-                              __html: renderInlineMathWithLatex(
-                                stripAiCitationArtifacts(activeWordCard.example),
-                                lessonVisuals
-                              ),
-                            }}
-                          />
+                            className={`text-[11px] ${
+                              step2Notice.ok ? 'text-emerald-300' : 'text-red-300'
+                            }`}
+                          >
+                            {step2Notice.message}
+                          </p>
                         )}
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => setActiveWordCard(null)}
-                        className="text-xs text-neutral-400 hover:text-white whitespace-nowrap"
-                      >
-                        关闭
-                      </button>
-                    </div>
-                  )}
+                    )}
 
                   <div className="space-y-6">
-                    {activeLesson.englishPayload.paragraphs.map((para, idx) => (
-                      <div key={idx} className="space-y-2">
-                        <p className="font-serif-reading text-base md:text-[17px] leading-8 text-neutral-100">
-                          {renderHighlightedEnglishParagraph(
-                            stripAiCitationArtifacts(para.english),
-                            activeLesson.englishPayload!.targetWords
+                    {payload.paragraphs.map((para, idx) => {
+                      const hasChinese = Boolean(para.chinese && para.chinese.trim());
+                      const isParaVisible = Boolean(visibleParagraphTranslations[idx]);
+                      return (
+                        <div key={idx} className="space-y-2">
+                          <p className="font-serif-reading text-base md:text-[17px] leading-8 text-neutral-100">
+                            {renderHighlightedEnglishParagraph(
+                              stripAiCitationArtifacts(para.english),
+                              clickableWordEntries
+                            )}
+                          </p>
+                          {hasChinese && (
+                            <div className="pt-0.5 space-y-1.5">
+                              <button
+                                type="button"
+                                data-testid={`toggle-para-translation-${idx}`}
+                                onClick={() =>
+                                  setVisibleParagraphTranslations((prev) => ({
+                                    ...prev,
+                                    [idx]: !prev[idx],
+                                  }))
+                                }
+                                className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] border border-neutral-800 hover:border-neutral-600 rounded text-neutral-400 hover:text-neutral-200 transition-colors"
+                              >
+                                {isParaVisible ? '隐藏中文译文' : '显示中文译文'}
+                              </button>
+                              {isParaVisible && (
+                                <p
+                                  className="text-sm leading-relaxed text-neutral-400 [&>p]:m-0"
+                                  dangerouslySetInnerHTML={{
+                                    __html: renderInlineMathWithLatex(
+                                      stripAiCitationArtifacts(para.chinese),
+                                      lessonVisuals
+                                    ),
+                                  }}
+                                />
+                              )}
+                            </div>
                           )}
-                        </p>
-                        {showTranslation && (
-                          <p
-                            className="text-sm leading-relaxed text-neutral-400 pt-1 [&>p]:m-0"
-                            dangerouslySetInnerHTML={{
-                              __html: renderInlineMathWithLatex(
-                                stripAiCitationArtifacts(para.chinese),
-                                lessonVisuals
-                              ),
-                            }}
-                          />
-                        )}
-                      </div>
-                    ))}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               </section>
-            )}
+              );
+            })()}
 
             {/* Closed-Loop Interleaved Self-Study Flow:
                 先思考后讲解 (Inline Heuristics) + 图文同步 (Inline Diagrams) + 知识点即时练习 (Inline Exercises) */}
@@ -5350,7 +6394,8 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     if (!q) return null;
                     const qIdx = block.exIdx;
                     const currentVal = userAnswers[q.id] || '';
-                    const singleReport = gradeExerciseSet([q], userAnswers).details[q.id];
+                    const isUnderstood = understoodFillIds.includes(q.id);
+                    const singleReport = gradeExerciseSet([q], userAnswers, understoodFillIds).details[q.id];
                     const showAnswer =
                       isSubmitted || Boolean(revealedSingleExercises[q.id]);
                     const showHint = Boolean(revealedExerciseHints[q.id]);
@@ -5414,7 +6459,13 @@ export const LessonView: React.FC<LessonViewProps> = ({
                               }
                               className="inline-flex items-center gap-1 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 rounded text-neutral-200 transition-colors"
                             >
-                              {showAnswer ? '收起本题解析' : '核对本题答案与解析'}
+                              {q.type === 'choice'
+                                ? showAnswer
+                                  ? '收起本题解析'
+                                  : '核对本题答案与解析'
+                                : showAnswer
+                                  ? '收起答案'
+                                  : '查看答案'}
                             </button>
                           </div>
                         </div>
@@ -5532,21 +6583,36 @@ export const LessonView: React.FC<LessonViewProps> = ({
                             })}
                           </div>
                         ) : (
-                          <div className="space-y-1.5 max-w-md">
-                            <input
-                              type="text"
-                              value={currentVal}
-                              disabled={isSubmitted}
-                              onChange={(e) =>
-                                setUserAnswers((prev) => ({
-                                  ...prev,
-                                  [q.id]: e.target.value,
-                                }))
-                              }
-                              placeholder="请输入你的答案..."
-                              aria-label={`第 ${qIdx + 1} 题填空答案`}
-                              className="w-full max-w-md bg-black border border-neutral-800 rounded px-3 py-2 text-sm font-mono text-white placeholder:text-neutral-600 focus:outline-none focus:border-neutral-500 disabled:opacity-70"
-                            />
+                          <div className="space-y-1.5">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <input
+                                type="text"
+                                value={currentVal}
+                                disabled={isSubmitted}
+                                onChange={(e) =>
+                                  setUserAnswers((prev) => ({
+                                    ...prev,
+                                    [q.id]: e.target.value,
+                                  }))
+                                }
+                                placeholder="可选：记录答案，或直接点击「查看答案」..."
+                                aria-label={`第 ${qIdx + 1} 题填空答案`}
+                                className="flex-1 min-w-[220px] max-w-md bg-black border border-neutral-800 rounded px-3 py-2 text-sm font-mono text-white placeholder:text-neutral-600 focus:outline-none focus:border-neutral-500 disabled:opacity-70"
+                              />
+                              <button
+                                type="button"
+                                data-testid={`exercise-view-answer-${q.id}`}
+                                onClick={() =>
+                                  setRevealedSingleExercises((prev) => ({
+                                    ...prev,
+                                    [q.id]: !prev[q.id],
+                                  }))
+                                }
+                                className="px-3 py-2 text-xs font-medium border border-neutral-700 hover:border-white bg-neutral-900 text-white rounded transition-colors whitespace-nowrap"
+                              >
+                                {showAnswer ? '收起答案' : '查看答案'}
+                              </button>
+                            </div>
                             {renderInputMathPreviewBox(
                               currentVal,
                               lessonVisuals,
@@ -5556,8 +6622,8 @@ export const LessonView: React.FC<LessonViewProps> = ({
                         )}
 
                         {showAnswer && singleReport && (
-                          <div className="pt-3 border-t border-neutral-900 text-xs space-y-2">
-                            <div className="flex items-center justify-between gap-2 font-mono">
+                          <div className="pt-3 border-t border-neutral-900 text-xs space-y-2.5">
+                            <div className="flex flex-wrap items-center justify-between gap-2 font-mono">
                               <span className="text-neutral-300">
                                 标准答案：
                                 <strong
@@ -5570,15 +6636,38 @@ export const LessonView: React.FC<LessonViewProps> = ({
                                   }}
                                 />
                               </span>
-                              {currentVal.trim() !== '' && (
-                                <span
-                                  className={
-                                    singleReport.isCorrect ? 'text-emerald-400' : 'text-red-400'
-                                  }
-                                >
-                                  {singleReport.isCorrect ? '✓ 回答正确' : '✗ 回答错误'}
-                                </span>
-                              )}
+                              <div className="flex flex-wrap items-center gap-2">
+                                {isUnderstood ? (
+                                  <span className="text-emerald-400">✓ 已理解（自动算对）</span>
+                                ) : currentVal.trim() !== '' ? (
+                                  <span
+                                    className={
+                                      singleReport.isCorrect ? 'text-emerald-400' : 'text-red-400'
+                                    }
+                                  >
+                                    {singleReport.isCorrect ? '✓ 回答正确' : '✗ 回答错误'}
+                                  </span>
+                                ) : isSubmitted ? (
+                                  <span className="text-amber-300">
+                                    未判定（可点击「我理解了」算对）
+                                  </span>
+                                ) : null}
+                                {q.type !== 'choice' && (
+                                  <button
+                                    type="button"
+                                    data-testid={`exercise-understood-${q.id}`}
+                                    onClick={() => handleToggleFillUnderstood(q.id)}
+                                    className={`inline-flex items-center gap-1.5 px-3 py-1 rounded border font-sans text-xs font-medium transition-colors ${
+                                      isUnderstood
+                                        ? 'border-emerald-500/70 bg-emerald-950/60 text-emerald-200 hover:bg-emerald-900/50'
+                                        : 'border-white/80 bg-white text-black hover:bg-neutral-200'
+                                    }`}
+                                  >
+                                    <Check className="w-3.5 h-3.5" />
+                                    <span>{isUnderstood ? '已理解 · 点击取消' : '我理解了'}</span>
+                                  </button>
+                                )}
+                              </div>
                             </div>
                             {singleReport.explanation && (
                               <div
@@ -5625,18 +6714,297 @@ export const LessonView: React.FC<LessonViewProps> = ({
                 </section>
               )}
 
+            {/* 3. Post-Article & Post-Explanation Auxiliary Vocabulary Lookup & Coverage Bar */}
+            {activeLesson.englishPayload && (() => {
+              const secId = ensureStableSectionId(slot.dayIndex, slot.id);
+              const secCov = englishCourseVocabCoverage?.bySection?.[secId];
+              const uncertainMatches =
+                secCov?.matches.filter((m) => {
+                  const key = `${secId}::${m.wordId}`;
+                  const opt = optimisticVerifications[key];
+                  if (opt === 'confirmed' || opt === 'rejected') return false;
+                  return m.semanticStatus === 'needs_review';
+                }) || [];
+              const targetWords = activeLesson.englishPayload.targetWords || [];
+              if (targetWords.length === 0 && uncertainMatches.length === 0) {
+                return null;
+              }
+
+              return (
+                <section className="border-t border-neutral-800 pt-6 space-y-4">
+                  {secCov && uncertainMatches.length > 0 && (
+                    <div className="border border-neutral-800 rounded p-3.5 bg-neutral-950/60 space-y-2 text-xs">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="font-semibold text-neutral-200">
+                          本节正文词汇实际覆盖检测（与「标记已掌握」相互独立）
+                        </span>
+                        <span className="font-mono text-neutral-300">
+                          {secCov.plannedNewWordIds.length > 0
+                            ? `本节新词覆盖 ${secCov.coveredNewWordIds.length}/${secCov.plannedNewWordIds.length}`
+                            : `正文匹配目标词 ${secCov.matches.length} 个`}
+                          {` · 正文 ${secCov.proseWordCount} 词 · 目标词密度 ${Math.round(secCov.actualDensity * 1000) / 10}%`}
+                          {uncertainMatches.length > 0
+                            ? ` · 待确认 ${uncertainMatches.length}`
+                            : ''}
+                        </span>
+                      </div>
+
+                      <div className="pt-2 border-t border-neutral-900 space-y-1.5">
+                        <div className="text-[11px] text-amber-300">
+                          以下词条存在同形异义或词形歧义，请结合上下文确认是否计入正文有效覆盖：
+                        </div>
+                        {uncertainMatches.map((m) => {
+                          const k = `${secId}::${m.wordId}`;
+                          return (
+                            <div
+                              key={k}
+                              className="flex flex-wrap items-center justify-between gap-2 bg-black border border-neutral-800 rounded px-2.5 py-2"
+                            >
+                              <div className="text-[11px] text-neutral-300 min-w-0 flex-1 space-y-0.5">
+                                <div>
+                                  <strong className="text-white">{m.word}</strong>
+                                  <span className="text-neutral-500 ml-1.5">
+                                    ({m.matchedForms.join(', ')})
+                                  </span>
+                                </div>
+                                {m.snippets[0] && (
+                                  <span className="block text-neutral-400 italic whitespace-normal break-words leading-relaxed">
+                                    “{renderSnippetWithHighlightedWord(m.snippets[0], m.matchedForms, m.word)}”
+                                  </span>
+                                )}
+                              </div>
+                              <div className="flex items-center gap-1.5 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleVerifyVocabMatch(secId, m.wordId, 'confirmed')
+                                  }
+                                  className="px-2 py-0.5 text-[11px] border border-emerald-700/70 bg-emerald-950/40 text-emerald-200 rounded hover:border-emerald-400 active:scale-95 transition-transform"
+                                >
+                                  确认匹配
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleVerifyVocabMatch(secId, m.wordId, 'rejected')
+                                  }
+                                  className="px-2 py-0.5 text-[11px] border border-red-800/70 bg-red-950/40 text-red-200 rounded hover:border-red-400 active:scale-95 transition-transform"
+                                >
+                                  标记不符
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {targetWords.length > 0 && (
+                    <div className="space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                          <h2 className="text-base font-semibold text-white">
+                            三、本节重点词汇速查（共 {targetWords.length} 词）
+                          </h2>
+                          {course.englishConfig && course.englishConfig.effectiveWords.length > 0 && (
+                            <p className="text-xs text-neutral-500 mt-0.5 font-mono">
+                              词库范围：{course.englishConfig.targetBankName} −{' '}
+                              {course.englishConfig.excludedBankName}
+                            </p>
+                          )}
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setShowVocabLookupList((v) => !v)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs border border-neutral-800 hover:border-neutral-600 rounded text-neutral-300 transition-colors whitespace-nowrap"
+                          >
+                            {showVocabLookupList ? (
+                              <>
+                                <ChevronUp className="w-3.5 h-3.5" />
+                                <span>收起词汇表</span>
+                              </>
+                            ) : (
+                              <>
+                                <ChevronDown className="w-3.5 h-3.5" />
+                                <span>展开词汇表</span>
+                              </>
+                            )}
+                          </button>
+
+                          {showVocabLookupList && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => setHideVocabMeaning((v) => !v)}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs border border-neutral-800 hover:border-neutral-600 rounded text-neutral-300 transition-colors whitespace-nowrap"
+                              >
+                                {hideVocabMeaning ? (
+                                  <>
+                                    <Eye className="w-3.5 h-3.5" />
+                                    <span>显示释义</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <EyeOff className="w-3.5 h-3.5" />
+                                    <span>遮盖释义自测</span>
+                                  </>
+                                )}
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setVocabFilter((f) => (f === 'all' ? 'unmastered' : 'all'))
+                                }
+                                className="px-2.5 py-1 text-xs border border-neutral-800 hover:border-neutral-600 rounded text-neutral-300 transition-colors whitespace-nowrap"
+                              >
+                                {vocabFilter === 'all' ? '仅看未掌握' : '显示全部词汇'}
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+
+                      {showVocabLookupList && (
+                        <div className="divide-y divide-neutral-900 border border-neutral-900 rounded">
+                          {targetWords
+                            .filter((item) =>
+                              vocabFilter === 'all'
+                                ? true
+                                : !course.masteredWords.includes(normalizeWordKey(item.word))
+                            )
+                            .map((item) => {
+                              const isMastered = course.masteredWords.includes(
+                                normalizeWordKey(item.word)
+                              );
+                              return (
+                                <div
+                                  key={item.word}
+                                  className="p-3.5 flex flex-col md:flex-row md:items-start justify-between gap-3 bg-black hover:bg-neutral-950/60 transition-colors"
+                                >
+                                  <div className="space-y-1.5 flex-1">
+                                    <div className="flex flex-wrap items-baseline gap-2.5">
+                                      <span className="text-sm font-semibold text-white font-mono">
+                                        {item.word}
+                                      </span>
+                                      {item.isReview && (
+                                        <span className="px-1.5 py-0.5 text-[10px] rounded border border-amber-700/60 bg-amber-950/35 text-amber-200">
+                                          前节复现
+                                        </span>
+                                      )}
+                                      {item.phonetic && (
+                                        <span className="text-xs font-mono text-neutral-500">
+                                          {item.phonetic}
+                                        </span>
+                                      )}
+                                      <span
+                                        className={`text-sm ${
+                                          hideVocabMeaning
+                                            ? 'bg-neutral-900 text-transparent select-none rounded px-2 cursor-pointer hover:text-neutral-200 [&_*]:!text-transparent'
+                                            : 'text-neutral-200'
+                                        } [&>p]:m-0`}
+                                        onClick={() => hideVocabMeaning && setHideVocabMeaning(false)}
+                                        dangerouslySetInnerHTML={{
+                                          __html: renderInlineMathWithLatex(
+                                            stripAiCitationArtifacts(item.meaning),
+                                            lessonVisuals
+                                          ),
+                                        }}
+                                      />
+                                    </div>
+                                    {!hideVocabMeaning &&
+                                      Array.isArray(item.collocations) &&
+                                      item.collocations.length > 0 && (
+                                        <div className="flex flex-wrap gap-1.5 pt-0.5">
+                                          {item.collocations.map((col, cIdx) => (
+                                            <span
+                                              key={cIdx}
+                                              className="px-2 py-0.5 text-[11px] font-mono rounded border border-neutral-800 bg-neutral-950 text-sky-200"
+                                            >
+                                              {col}
+                                            </span>
+                                          ))}
+                                        </div>
+                                      )}
+                                    {!hideVocabMeaning && item.usageNote && (
+                                      <p
+                                        className="text-xs text-neutral-400 leading-relaxed [&>p]:m-0"
+                                        dangerouslySetInnerHTML={{
+                                          __html: renderInlineMathWithLatex(
+                                            stripAiCitationArtifacts(item.usageNote),
+                                            lessonVisuals
+                                          ),
+                                        }}
+                                      />
+                                    )}
+                                    {item.example && (
+                                      <div className="text-xs text-neutral-400 space-y-0.5 pt-0.5">
+                                        <p
+                                          className="font-serif-reading text-neutral-300 text-sm [&>p]:m-0"
+                                          dangerouslySetInnerHTML={{
+                                            __html: renderInlineMathWithLatex(
+                                              stripAiCitationArtifacts(item.example),
+                                              lessonVisuals
+                                            ),
+                                          }}
+                                        />
+                                        {!hideVocabMeaning && item.exampleTranslation && (
+                                          <p
+                                            className="text-neutral-500 [&>p]:m-0"
+                                            dangerouslySetInnerHTML={{
+                                              __html: renderInlineMathWithLatex(
+                                                stripAiCitationArtifacts(item.exampleTranslation),
+                                                lessonVisuals
+                                              ),
+                                            }}
+                                          />
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+
+                                  <button
+                                    type="button"
+                                    onClick={() => handleToggleWordMastery(item.word)}
+                                    className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded border transition-colors whitespace-nowrap shrink-0 ${
+                                      isMastered
+                                        ? 'border-neutral-700 bg-neutral-900 text-white'
+                                        : 'border-neutral-800 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200'
+                                    }`}
+                                  >
+                                    <Check className="w-3 h-3" />
+                                    <span>{isMastered ? '已掌握' : '标记已掌握'}</span>
+                                  </button>
+                                </div>
+                              );
+                            })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </section>
+              );
+            })()}
+
             {/* End-of-Chapter Comprehensive Exercises & Full-Lesson Offline Grading */}
             {activeLesson.exercises && activeLesson.exercises.length > 0 && (
               <section data-symbol-scope="post-body" className="border-t border-neutral-800 pt-8 space-y-6">
                 <div className="flex flex-wrap items-center justify-between gap-4">
                   <div>
                     <h2 className="text-base font-semibold text-white">
-                      {interleavedLessonFlow.comprehensiveExerciseIndices.length > 0
-                        ? '章节末综合与迁移练习（含全节自主检验判分）'
-                        : '本节练习总评与离线判分'}
+                      {activeLesson.englishPayload
+                        ? `四、阅读理解与词汇练习（共 ${activeLesson.exercises.length} 题）`
+                        : interleavedLessonFlow.comprehensiveExerciseIndices.length > 0
+                          ? '章节末综合与迁移练习（含全节自主检验判分）'
+                          : '本节练习总评与离线判分'}
                     </h2>
                     <p className="text-xs text-neutral-500 mt-0.5">
-                      覆盖概念辨析、直接应用、错误分析与知识迁移；支持单题随时展开提示与解析，或点击下方按钮汇总本节全部 {activeLesson.exercises.length} 道练习得分（100% 离线可用）。
+                      {activeLesson.englishPayload
+                        ? '涵盖阅读主旨/细节/推断/作者观点与新语境词汇运用；支持单题随时展开答案解析，或汇总全节得分（100% 离线可用）。'
+                        : `覆盖概念辨析、直接应用、错误分析与知识迁移；支持单题随时展开提示与解析，或点击下方按钮汇总本节全部 ${activeLesson.exercises.length} 道练习得分（100% 离线可用）。`}
                     </p>
                   </div>
 
@@ -5662,7 +7030,8 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     const q = activeLesson.exercises[qIdx];
                     if (!q) return null;
                     const currentVal = userAnswers[q.id] || '';
-                    const singleReport = gradeExerciseSet([q], userAnswers).details[q.id];
+                    const isUnderstood = understoodFillIds.includes(q.id);
+                    const singleReport = gradeExerciseSet([q], userAnswers, understoodFillIds).details[q.id];
                     const showAnswer =
                       isSubmitted || Boolean(revealedSingleExercises[q.id]);
                     const showHint = Boolean(revealedExerciseHints[q.id]);
@@ -5731,7 +7100,13 @@ export const LessonView: React.FC<LessonViewProps> = ({
                               }
                               className="inline-flex items-center gap-1 px-2.5 py-1 text-xs border border-neutral-700 hover:border-neutral-500 rounded text-neutral-200 transition-colors"
                             >
-                              {showAnswer ? '收起本题解析' : '核对本题答案与解析'}
+                              {q.type === 'choice'
+                                ? showAnswer
+                                  ? '收起本题解析'
+                                  : '核对本题答案与解析'
+                                : showAnswer
+                                  ? '收起答案'
+                                  : '查看答案'}
                             </button>
                           </div>
                         </div>
@@ -5849,21 +7224,36 @@ export const LessonView: React.FC<LessonViewProps> = ({
                             })}
                           </div>
                         ) : (
-                          <div className="pl-5 space-y-1.5 max-w-md">
-                            <input
-                              type="text"
-                              value={currentVal}
-                              disabled={isSubmitted}
-                              onChange={(e) =>
-                                setUserAnswers((prev) => ({
-                                  ...prev,
-                                  [q.id]: e.target.value,
-                                }))
-                              }
-                              placeholder="请输入你的答案..."
-                              aria-label={`第 ${qIdx + 1} 题填空答案`}
-                              className="w-full max-w-md bg-black border border-neutral-800 rounded px-3 py-2 text-sm font-mono text-white placeholder:text-neutral-600 focus:outline-none focus:border-neutral-500 disabled:opacity-70"
-                            />
+                          <div className="pl-5 space-y-1.5">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <input
+                                type="text"
+                                value={currentVal}
+                                disabled={isSubmitted}
+                                onChange={(e) =>
+                                  setUserAnswers((prev) => ({
+                                    ...prev,
+                                    [q.id]: e.target.value,
+                                  }))
+                                }
+                                placeholder="可选：记录答案，或直接点击「查看答案」..."
+                                aria-label={`第 ${qIdx + 1} 题填空答案`}
+                                className="flex-1 min-w-[220px] max-w-md bg-black border border-neutral-800 rounded px-3 py-2 text-sm font-mono text-white placeholder:text-neutral-600 focus:outline-none focus:border-neutral-500 disabled:opacity-70"
+                              />
+                              <button
+                                type="button"
+                                data-testid={`exercise-view-answer-${q.id}`}
+                                onClick={() =>
+                                  setRevealedSingleExercises((prev) => ({
+                                    ...prev,
+                                    [q.id]: !prev[q.id],
+                                  }))
+                                }
+                                className="px-3 py-2 text-xs font-medium border border-neutral-700 hover:border-white bg-neutral-900 text-white rounded transition-colors whitespace-nowrap"
+                              >
+                                {showAnswer ? '收起答案' : '查看答案'}
+                              </button>
+                            </div>
                             {renderInputMathPreviewBox(
                               currentVal,
                               lessonVisuals,
@@ -5873,8 +7263,8 @@ export const LessonView: React.FC<LessonViewProps> = ({
                         )}
 
                         {showAnswer && singleReport && (
-                          <div className="pl-5 pt-3 border-t border-neutral-900 text-xs space-y-2">
-                            <div className="flex items-center justify-between gap-2 font-mono">
+                          <div className="pl-5 pt-3 border-t border-neutral-900 text-xs space-y-2.5">
+                            <div className="flex flex-wrap items-center justify-between gap-2 font-mono">
                               <span className="text-neutral-300">
                                 标准答案：
                                 <strong
@@ -5887,15 +7277,38 @@ export const LessonView: React.FC<LessonViewProps> = ({
                                   }}
                                 />
                               </span>
-                              {currentVal.trim() !== '' && (
-                                <span
-                                  className={
-                                    singleReport.isCorrect ? 'text-emerald-400' : 'text-red-400'
-                                  }
-                                >
-                                  {singleReport.isCorrect ? '✓ 回答正确' : '✗ 回答错误'}
-                                </span>
-                              )}
+                              <div className="flex flex-wrap items-center gap-2">
+                                {isUnderstood ? (
+                                  <span className="text-emerald-400">✓ 已理解（自动算对）</span>
+                                ) : currentVal.trim() !== '' ? (
+                                  <span
+                                    className={
+                                      singleReport.isCorrect ? 'text-emerald-400' : 'text-red-400'
+                                    }
+                                  >
+                                    {singleReport.isCorrect ? '✓ 回答正确' : '✗ 回答错误'}
+                                  </span>
+                                ) : isSubmitted ? (
+                                  <span className="text-amber-300">
+                                    未判定（可点击「我理解了」算对）
+                                  </span>
+                                ) : null}
+                                {q.type !== 'choice' && (
+                                  <button
+                                    type="button"
+                                    data-testid={`exercise-understood-${q.id}`}
+                                    onClick={() => handleToggleFillUnderstood(q.id)}
+                                    className={`inline-flex items-center gap-1.5 px-3 py-1 rounded border font-sans text-xs font-medium transition-colors ${
+                                      isUnderstood
+                                        ? 'border-emerald-500/70 bg-emerald-950/60 text-emerald-200 hover:bg-emerald-900/50'
+                                        : 'border-white/80 bg-white text-black hover:bg-neutral-200'
+                                    }`}
+                                  >
+                                    <Check className="w-3.5 h-3.5" />
+                                    <span>{isUnderstood ? '已理解 · 点击取消' : '我理解了'}</span>
+                                  </button>
+                                )}
+                              </div>
                             </div>
                             {singleReport.explanation && (
                               <div
@@ -6528,6 +7941,216 @@ export const LessonView: React.FC<LessonViewProps> = ({
                     />
                   </div>
                 )}
+              </div>
+            );
+          })(),
+          document.body
+        )}
+
+      {/* 交互式英文生词弹窗：点击阅读文章正文中的生词或前节复现词就近弹出 */}
+      {typeof document !== 'undefined' &&
+        activeWordPopover &&
+        createPortal(
+          (() => {
+            const { item, role, sourceSectionIndex, matchedText, rect } = activeWordPopover;
+            const popoverWidth = 360;
+            const vw = typeof window !== 'undefined' ? window.innerWidth : 1280;
+            const vh = typeof window !== 'undefined' ? window.innerHeight : 800;
+            const clampedLeft = Math.max(
+              12,
+              Math.min(vw - popoverWidth - 12, rect.left + rect.width / 2 - popoverWidth / 2)
+            );
+            const showBelow = rect.bottom + 240 < vh;
+            const topPos = showBelow ? rect.bottom + 10 : Math.max(12, rect.top - 220);
+            const isMastered = course.masteredWords.includes(normalizeWordKey(item.word));
+            const isMarked = markedWordMap.has(normalizeWordKey(item.word));
+            const roleBadgeLabel =
+              isMarked || role === 'marked'
+                ? '已标记生词'
+                : role === 'review'
+                  ? sourceSectionIndex
+                    ? `第 ${sourceSectionIndex} 节复现词`
+                    : '前节复现词'
+                  : role === 'extra_gloss'
+                    ? '补充简明释义'
+                    : role === 'incidental'
+                      ? '关联词（待补释义）'
+                      : role === 'plain'
+                        ? '正文单词'
+                        : '本节生词';
+            const roleBadgeClass =
+              isMarked || role === 'marked'
+                ? 'border-rose-700/70 bg-rose-950/60 text-rose-200'
+                : role === 'review'
+                  ? 'border-amber-700/70 bg-amber-950/50 text-amber-200'
+                  : role === 'extra_gloss'
+                    ? 'border-teal-700/70 bg-teal-950/70 text-teal-200'
+                    : role === 'incidental' || role === 'plain'
+                      ? 'border-neutral-700 bg-neutral-900 text-neutral-300'
+                      : 'border-sky-600/60 bg-sky-950/50 text-sky-200';
+
+            return (
+              <div
+                data-testid="vocab-word-popover"
+                role="dialog"
+                aria-label={`单词 ${item.word} 释义`}
+                style={{
+                  left: `${Math.round(clampedLeft)}px`,
+                  top: `${Math.round(topPos)}px`,
+                  width: `${popoverWidth}px`,
+                }}
+                className="fixed z-50 border border-neutral-700 bg-[#080b10]/98 backdrop-blur-md rounded-lg shadow-2xl p-3.5 space-y-2.5"
+              >
+                <div className="flex items-start justify-between gap-2 border-b border-neutral-800/80 pb-2">
+                  <div className="space-y-1 min-w-0">
+                    <div className="flex flex-wrap items-baseline gap-2">
+                      <span className="text-base font-bold font-mono text-white">
+                        {item.word}
+                      </span>
+                      {matchedText.toLowerCase() !== item.word.toLowerCase() && (
+                        <span className="text-[11px] font-mono text-neutral-400">
+                          (文中：{matchedText})
+                        </span>
+                      )}
+                      {item.phonetic && (
+                        <span className="text-xs font-mono text-neutral-400">
+                          {item.phonetic}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span
+                        className={`px-1.5 py-0.5 rounded border text-[10px] font-medium ${roleBadgeClass}`}
+                      >
+                        {roleBadgeLabel}
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    aria-label="关闭词汇释义"
+                    onClick={() => setActiveWordPopover(null)}
+                    className="p-1 text-neutral-400 hover:text-white rounded hover:bg-neutral-800 transition-colors shrink-0"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                <div
+                  className="text-sm text-neutral-100 leading-relaxed [&>p]:m-0"
+                  dangerouslySetInnerHTML={{
+                    __html: renderInlineMathWithLatex(
+                      stripAiCitationArtifacts(
+                        item.meaning && !isPlaceholderVocabMeaning(item.meaning)
+                          ? item.meaning
+                          : isMarked
+                            ? '已标记生词，可在课件上方 Step 2 工具栏复制提示词由 AI 同步当前语境释义'
+                            : role === 'plain'
+                              ? '未收录到本节词表，可点击下方「标记生词」加入生词本并在上方 Step 2 同步释义'
+                              : '暂无释义'
+                      ),
+                      lessonVisuals
+                    ),
+                  }}
+                />
+
+                {Array.isArray(item.collocations) && item.collocations.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {item.collocations.map((col, idx) => (
+                      <span
+                        key={idx}
+                        className="px-2 py-0.5 text-[11px] font-mono rounded border border-neutral-800 bg-neutral-950 text-sky-200"
+                      >
+                        {col}
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                {item.usageNote && (
+                  <div
+                    className="text-xs text-neutral-300 leading-relaxed bg-neutral-950/70 border border-neutral-900 rounded p-2 [&>p]:m-0"
+                    dangerouslySetInnerHTML={{
+                      __html: renderInlineMathWithLatex(
+                        stripAiCitationArtifacts(item.usageNote),
+                        lessonVisuals
+                      ),
+                    }}
+                  />
+                )}
+
+                {item.example && (
+                  <div className="text-xs space-y-0.5 border-t border-neutral-900 pt-2">
+                    <p
+                      className="font-serif-reading text-neutral-200 [&>p]:m-0"
+                      dangerouslySetInnerHTML={{
+                        __html: renderInlineMathWithLatex(
+                          stripAiCitationArtifacts(item.example),
+                          lessonVisuals
+                        ),
+                      }}
+                    />
+                    {item.exampleTranslation && (
+                      <p
+                        className="text-neutral-400 [&>p]:m-0"
+                        dangerouslySetInnerHTML={{
+                          __html: renderInlineMathWithLatex(
+                            stripAiCitationArtifacts(item.exampleTranslation),
+                            lessonVisuals
+                          ),
+                        }}
+                      />
+                    )}
+                  </div>
+                )}
+
+                <div className="pt-1 border-t border-neutral-900 flex flex-wrap items-center justify-between gap-2">
+                  {markedBankOptions.length > 0 ? (
+                    <select
+                      aria-label="生词保存词库"
+                      value={markedBank?.id || ''}
+                      onChange={(e) => handleSelectMarkedBank(e.target.value)}
+                      className="max-w-[130px] bg-neutral-950 border border-neutral-800 rounded px-1.5 py-0.5 text-[11px] text-neutral-300 focus:outline-none focus:border-rose-500"
+                      title="选择标记生词保存的目标词库"
+                    >
+                      <option value="">默认生词本</option>
+                      {markedBankOptions.map((b) => (
+                        <option key={b.id} value={b.id}>
+                          {b.name}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <span className="text-[10px] text-neutral-500 truncate max-w-[130px]">
+                      词库：{markedBank?.name || '阅读标记生词本'}
+                    </span>
+                  )}
+                  <div className="flex items-center gap-1.5 ml-auto">
+                    <button
+                      type="button"
+                      onClick={() => handleToggleMarkedWord(item)}
+                      className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded border transition-colors ${
+                        isMarked
+                          ? 'border-rose-600/80 bg-rose-950/50 text-rose-200'
+                          : 'border-neutral-700 hover:border-rose-500 text-neutral-200 hover:text-rose-100'
+                      }`}
+                    >
+                      <span>{isMarked ? '已标记生词' : '标记生词'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleToggleWordMastery(item.word)}
+                      className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs rounded border transition-colors ${
+                        isMastered
+                          ? 'border-emerald-700/70 bg-emerald-950/40 text-emerald-200'
+                          : 'border-neutral-700 hover:border-white text-neutral-200 hover:text-white'
+                      }`}
+                    >
+                      <Check className="w-3 h-3" />
+                      <span>{isMastered ? '已掌握' : '标记已掌握'}</span>
+                    </button>
+                  </div>
+                </div>
               </div>
             );
           })(),

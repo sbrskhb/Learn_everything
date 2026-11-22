@@ -16,6 +16,11 @@ This file defines the system prompt used for Step 2 of the unified Course Genera
    - 每个小节必须明确 `prerequisites`（先修依赖）与 `connectionNote`（承前启后衔接说明）。
    - 大纲阶段专注知识结构划分，**无需在此输出 `difficulty` 评分或强行按天数排期**。
 3. **规范严谨**：所有标题、知识点和范围描述使用规范学科专业术语，严禁照抄乱码或残缺字符。
+4. **语言学习课程大纲补充原则（仅当课程为语言学习时适用）**：
+   - **四类输入整合**：① 仅词库时，分析词库语义并规划 N 个主题及其下属文章（N 由用户指定或依内容规模自主决定）；② 仅教材时，依据教材结构与切分区域规划；③ 词库 + 教材时，**整合为同一套课程**，由教材决定主要知识顺序，词库作为额外覆盖目标，必要时增加补充单元；④ 均不提供时，依学习目标、目的与水平自主规划。
+   - **主题广度与兴趣权重**：保持主题广泛多样；用户表达的兴趣偏好仅作选材权重提高对应领域占比，不得使大纲失去必要主题广度。
+   - **语义分配与稳定 ID**：存在目标词库时，按词汇与主题的语义关联通过 `targetWordIds`（引用词库稳定 ID）分配各节首次引入的新词，允许调整初始主题划分以免生硬凑词；可通过 `reviewWordIds` 引用此前已引入的复习词；并用 `topicGroup` 标明所属主题。
+   - **目的与多语种适配**：备考课程优先确保词库、教材与考试目标完整覆盖；兴趣课程优先内容连贯、知识递进与实际语言运用；日语等非英语课程可有机包含词汇、语法、阅读、对话等模块，直接沿用已有学习者水平约束。
 
 ### 二、严格输出 JSON 格式
 仅输出合法 JSON 对象（优先使用 `sections` 数组）：
@@ -34,12 +39,15 @@ This file defines the system prompt used for Step 2 of the unified Course Genera
       "id": "sec-01",
       "regionId": "region-01",
       "regionIds": ["region-01"],
+      "topicGroup": "所属主题名称（语言课程适用，其他课程可省略）",
       "title": "第 1 节：逻辑完整的知识点块主题",
       "objective": "本节具体可检验的自学目标",
       "prerequisites": ["本节先修知识"],
       "teachingScope": "对应区域 region-01 / 原教材章节、物理及印刷页码范围与具体推导/练习边界",
       "connectionNote": "说明本节如何承接前序知识点并为后续小节铺垫",
-      "keyTopics": ["核心概念与方法"]
+      "keyTopics": ["核心概念与方法"],
+      "targetWordIds": ["w-001"],
+      "reviewWordIds": []
     }
   ]
 }

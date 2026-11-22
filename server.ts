@@ -15,6 +15,8 @@ import type {
   DailyPlanSlot,
   EnglishArticleMode,
   KnowledgeCatalogNode,
+  LanguageInputMode,
+  LanguageLearningPurpose,
   LearnerBaselinePreset,
   LearnerLevel,
   LearningDepthPreset,
@@ -23,23 +25,55 @@ import type {
   PromptModuleToggles,
   StudyStats,
   SubjectProfile,
+  TargetLanguageCode,
   UploadedMaterial,
+  VocabBank,
   VocabItem,
+  VocabThemePlan,
+  VocabWordThemeMapping,
 } from './src/types';
 import {
   addDaysToDateString,
   allocateEnglishWordsRandomly,
   allocateSectionsToDays,
+  assignStableVocabIds,
   bindAndEnsureAllPdfRegionsCovered,
   buildCourseDailySchedule,
   computeVocabCoverageStats,
+  deduplicateVocabList,
   ensureStableSectionId,
   extractReferencedRegionIds,
+  formatVocabularyExport,
   getEvaluatedSectionMinutes,
   getTodayDateString,
+  normalizeWordKey,
+  parseVocabularyInput,
   resolveSlotPdfSegments,
   sanitizeCourseFolderName,
 } from './src/utils/learningLogic';
+import {
+  applyStep2EnglishEnhancementToLesson,
+  computeEnglishReadingPlanStats,
+  computeSectionAssociatedVocabStats,
+  extractPendingGlossWordsForSection,
+  isPlaceholderVocabMeaning,
+  isWeakBaselineForVocabSimplification,
+  parseImportedStep2EnglishOutput,
+  reassignVocabWordsToCourse,
+  resolveLanguageInputMode,
+  setVocabManualVerification,
+  syncCourseVocabCoverage,
+} from './src/utils/vocabCoverage';
+import {
+  allocateVocabByThemes,
+  buildCompactVocabText,
+  getNextMappingBatch,
+  getVocabThemeMappingProgress,
+  matchWordsToThemesLocally,
+  normalizeVocabThemes,
+  parseImportedVocabThemes,
+  parseImportedWordThemeMappings,
+} from './src/utils/vocabThemePlanner';
 import {
   deriveLegacyLearnerLevel,
   mapLegacyLevelToDualAxis,
@@ -76,9 +110,13 @@ import {
   buildCourseLessonStage1Prompt,
   buildCourseLessonUserPrompt,
   buildEnglishLessonUserPrompt,
+  buildEnglishStage2WordGlossPrompt,
   buildLessonStage2DiagramsPrompt,
   buildPdfSplitPrompts,
   buildSyllabusUserPrompt,
+  buildVocabSemanticReviewPrompt,
+  buildVocabThemePlanningPrompt,
+  buildVocabWordMappingPrompt,
   composeCoursewareSystemPrompt,
   getDefaultPromptsFromSkill,
   getPromptPresetsFromSkill,
@@ -105,6 +143,88 @@ const TMP_UPLOADS_DIR = path.join(DATA_DIR, 'tmp_uploads');
 const COURSES_ROOT = path.resolve(process.cwd(), 'courses');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
+const VOCAB_BANKS_FILE = path.join(DATA_DIR, 'vocab-banks.json');
+
+function loadVocabBanks(): VocabBank[] {
+  try {
+    if (fs.existsSync(VOCAB_BANKS_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(VOCAB_BANKS_FILE, 'utf-8'));
+      const list = Array.isArray(raw) ? raw : Array.isArray(raw?.banks) ? raw.banks : [];
+      return list
+        .filter((b: any) => b && typeof b.id === 'string' && typeof b.name === 'string')
+        .map((b: any) => ({
+          id: b.id,
+          name: String(b.name).trim(),
+          language:
+            b.language === 'japanese' || b.language === 'other' ? b.language : 'english',
+          customLanguageName:
+            typeof b.customLanguageName === 'string' ? b.customLanguageName.trim() : undefined,
+          description: typeof b.description === 'string' ? b.description.trim() : undefined,
+          words: assignStableVocabIds(Array.isArray(b.words) ? b.words : []),
+          createdAt: typeof b.createdAt === 'string' ? b.createdAt : new Date().toISOString(),
+          updatedAt: typeof b.updatedAt === 'string' ? b.updatedAt : new Date().toISOString(),
+        }));
+    }
+  } catch (err) {
+    console.error('Failed to read vocab-banks.json:', err);
+  }
+  return [];
+}
+
+function saveVocabBanks(banks: VocabBank[]): void {
+  fs.writeFileSync(
+    VOCAB_BANKS_FILE,
+    JSON.stringify({ banks }, null, 2),
+    'utf-8'
+  );
+}
+
+function getMarkedVocabBankWords(settings: StoredSettings): VocabItem[] {
+  if (!settings.markedVocabBankId) return [];
+  const banks = loadVocabBanks();
+  const target = banks.find((b) => b.id === settings.markedVocabBankId);
+  return target?.words || [];
+}
+
+function backfillMarkedVocabBankMeanings(settings: StoredSettings, glosses: VocabItem[]): number {
+  if (!settings.markedVocabBankId || !Array.isArray(glosses) || glosses.length === 0) return 0;
+  const banks = loadVocabBanks();
+  const idx = banks.findIndex((b) => b.id === settings.markedVocabBankId);
+  if (idx === -1) return 0;
+
+  const glossByKey = new Map<string, VocabItem>();
+  for (const g of glosses) {
+    const k = normalizeWordKey(g.word);
+    if (k && !isPlaceholderVocabMeaning(g.meaning)) {
+      glossByKey.set(k, g);
+    }
+  }
+  if (glossByKey.size === 0) return 0;
+
+  let updatedCount = 0;
+  const nextWords = banks[idx].words.map((w) => {
+    const k = normalizeWordKey(w.word);
+    const match = k ? glossByKey.get(k) : undefined;
+    if (!match) return w;
+    if (!isPlaceholderVocabMeaning(w.meaning)) return w;
+    updatedCount++;
+    return {
+      ...w,
+      meaning: match.meaning,
+      ...(w.phonetic ? {} : match.phonetic ? { phonetic: match.phonetic } : {}),
+    };
+  });
+
+  if (updatedCount > 0) {
+    banks[idx] = {
+      ...banks[idx],
+      words: nextWords,
+      updatedAt: new Date().toISOString(),
+    };
+    saveVocabBanks(banks);
+  }
+  return updatedCount;
+}
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -161,6 +281,7 @@ function ensurePythonVenv(): string | null {
       cwd: process.cwd(),
       stdio: 'ignore',
       timeout: 5000,
+      windowsHide: true,
     });
     if (check.status !== 0) continue;
 
@@ -169,6 +290,7 @@ function ensurePythonVenv(): string | null {
       cwd: process.cwd(),
       stdio: 'ignore',
       timeout: 20000,
+      windowsHide: true,
     });
     if (createFull.status === 0 && fs.existsSync(venvPython)) {
       console.log(`[python-backend] Created Python virtual environment at ${venvDir}`);
@@ -183,6 +305,7 @@ function ensurePythonVenv(): string | null {
       cwd: process.cwd(),
       stdio: 'ignore',
       timeout: 15000,
+      windowsHide: true,
     });
     if (createMinimal.status === 0 && fs.existsSync(venvPython)) {
       console.log(`[python-backend] Created minimal Python virtual environment at ${venvDir}`);
@@ -232,6 +355,7 @@ async function ensurePythonBackend(): Promise<boolean> {
         cwd: process.cwd(),
         env: envObj,
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       });
 
       let spawnFailed = false;
@@ -251,12 +375,28 @@ async function ensurePythonBackend(): Promise<boolean> {
         if (await isPythonBackendHealthy()) {
           managedPythonProcess = child;
           const cleanup = () => {
-            if (managedPythonProcess && !managedPythonProcess.killed) {
+            if (!managedPythonProcess || managedPythonProcess.killed) return;
+            const pyPid = managedPythonProcess.pid;
+            if (process.platform === 'win32' && pyPid) {
+              try {
+                spawnSync('taskkill', ['/F', '/T', '/PID', String(pyPid)], {
+                  windowsHide: true,
+                  stdio: 'ignore',
+                });
+                return;
+              } catch {
+                // fallback below
+              }
+            }
+            try {
               managedPythonProcess.kill();
+            } catch {
+              // ignore
             }
           };
           process.once('SIGINT', cleanup);
           process.once('SIGTERM', cleanup);
+          process.once('exit', cleanup);
           return true;
         }
       }
@@ -316,6 +456,7 @@ interface StoredSettings {
   showLessonTools: boolean;
   showAdvancedWorkflowDetails: boolean;
   showContentCategoryBadges: boolean;
+  markedVocabBankId: string;
   remoteAccessEnabled: boolean;
   serverPort: number;
   allowAllHosts: boolean;
@@ -333,9 +474,20 @@ function loadSettings(): StoredSettings {
   try {
     if (fs.existsSync(SETTINGS_FILE)) {
       const raw = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
-      const isUpgradedPrompt =
+        const isUpgradedPrompt =
         typeof raw.courseSystemPrompt === 'string' &&
         raw.courseSystemPrompt.includes('{{heuristic:hq-1}}');
+      const isLegacyDefaultSyllabus =
+        typeof raw.syllabusSystemPrompt === 'string' &&
+        raw.syllabusSystemPrompt.startsWith('你是一位资深的课程大纲规划专家与教材体系教研专家') &&
+        !raw.syllabusSystemPrompt.includes('targetWordIds');
+      const isLegacyDefaultEnglish =
+        typeof raw.englishSystemPrompt === 'string' &&
+        (raw.englishSystemPrompt.startsWith('你是一位精通认知语言学、外刊深度精读与词汇习得规律的资深英语教学专家') ||
+          raw.englishSystemPrompt.startsWith('你是一位精通认知语言学、外语精读教学与词汇习得规律的资深语言教学专家') ||
+          raw.englishSystemPrompt.startsWith('你是一位专注于外刊精读与语言习得的资深教学专家') ||
+          raw.englishSystemPrompt.includes('以“启发思考 → 语境理解/句法拆解 → 词汇/表达辨析 → 即时巩固”为闭环')) &&
+        !raw.englishSystemPrompt.includes('adapted_article');
       const legacyLevel: LearnerLevel = raw.defaultLearnerLevel || 'intermediate';
       const fallbackDual = mapLegacyLevelToDualAxis(legacyLevel);
       return {
@@ -351,6 +503,8 @@ function loadSettings(): StoredSettings {
         showLessonTools: Boolean(raw.showLessonTools),
         showAdvancedWorkflowDetails: Boolean(raw.showAdvancedWorkflowDetails),
         showContentCategoryBadges: Boolean(raw.showContentCategoryBadges),
+        markedVocabBankId:
+          typeof raw.markedVocabBankId === 'string' ? raw.markedVocabBankId.trim() : '',
         remoteAccessEnabled:
           typeof raw.remoteAccessEnabled === 'boolean' ? raw.remoteAccessEnabled : true,
         serverPort:
@@ -367,15 +521,17 @@ function loadSettings(): StoredSettings {
           ...DEFAULT_PROMPT_MODULE_TOGGLES,
           ...(raw.promptModules || {}),
         },
-        syllabusSystemPrompt: isUpgradedPrompt
-          ? raw.syllabusSystemPrompt || skillDefaults.syllabusSystemPrompt
-          : skillDefaults.syllabusSystemPrompt,
+        syllabusSystemPrompt:
+          isUpgradedPrompt && !isLegacyDefaultSyllabus
+            ? raw.syllabusSystemPrompt || skillDefaults.syllabusSystemPrompt
+            : skillDefaults.syllabusSystemPrompt,
         courseSystemPrompt: isUpgradedPrompt
           ? raw.courseSystemPrompt || skillDefaults.courseSystemPrompt
           : skillDefaults.courseSystemPrompt,
-        englishSystemPrompt: isUpgradedPrompt
-          ? raw.englishSystemPrompt || skillDefaults.englishSystemPrompt
-          : skillDefaults.englishSystemPrompt,
+        englishSystemPrompt:
+          isUpgradedPrompt && !isLegacyDefaultEnglish
+            ? raw.englishSystemPrompt || skillDefaults.englishSystemPrompt
+            : skillDefaults.englishSystemPrompt,
         customTeachingSupplement: raw.customTeachingSupplement || '',
       };
     }
@@ -395,6 +551,7 @@ function loadSettings(): StoredSettings {
     showLessonTools: false,
     showAdvancedWorkflowDetails: false,
     showContentCategoryBadges: false,
+    markedVocabBankId: '',
     remoteAccessEnabled: true,
     serverPort: 3000,
     allowAllHosts: true,
@@ -413,12 +570,6 @@ function saveSettings(settings: StoredSettings): void {
 }
 
 function getEffectiveTeachingSystemPrompt(course: Course, settings: StoredSettings): string {
-  if (course.category === 'english') {
-    return settings.englishSystemPrompt;
-  }
-  const resolvedProfile =
-    course.subjectProfile ||
-    inferSubjectProfile(course.category, course.name, course.extraRequirements);
   const resolvedLevel = course.learnerLevel || settings.defaultLearnerLevel || 'intermediate';
   const fallbackDual = mapLegacyLevelToDualAxis(resolvedLevel);
   const resolvedBaseline =
@@ -430,6 +581,41 @@ function getEffectiveTeachingSystemPrompt(course: Course, settings: StoredSettin
   const resolvedCustomDepth =
     course.customLearningDepth ?? settings.defaultCustomLearningDepth ?? '';
   const defaultPrompts = getDefaultPromptsFromSkill();
+
+  if (course.category === 'english') {
+    const customEng =
+      settings.englishSystemPrompt &&
+      settings.englishSystemPrompt.trim() &&
+      settings.englishSystemPrompt.trim() !== defaultPrompts.englishSystemPrompt.trim() &&
+      !settings.englishSystemPrompt.includes('```text')
+        ? settings.englishSystemPrompt.trim()
+        : '';
+    if (customEng) {
+      return [
+        customEng,
+        settings.customTeachingSupplement ? `【补充要求】\n${settings.customTeachingSupplement}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+    }
+    return composeCoursewareSystemPrompt({
+      subjectProfile: 'english_language',
+      targetLanguage: course.englishConfig?.targetLanguage || 'english',
+      customLanguageName: course.englishConfig?.customLanguageName,
+      learningPurpose: course.englishConfig?.learningPurpose || 'interest',
+      learnerLevel: resolvedLevel,
+      learnerBaseline: resolvedBaseline,
+      customLearnerBaseline: resolvedCustomBaseline,
+      learningDepth: resolvedDepth,
+      customLearningDepth: resolvedCustomDepth,
+      customSupplement: [settings.customTeachingSupplement, course.extraRequirements]
+        .filter(Boolean)
+        .join('\n'),
+    });
+  }
+  const resolvedProfile =
+    course.subjectProfile ||
+    inferSubjectProfile(course.category, course.name, course.extraRequirements);
 
   if (
     settings.courseSystemPrompt &&
@@ -685,23 +871,48 @@ async function persistCourseToFolder(
     materialFilePaths.push(relSourceFile);
   }
 
-  // Save English vocabulary banks in `sources/` if applicable
+  // Ensure language course vocab IDs & two-layer coverage are synced before persisting
+  if (course.category === 'english' && course.englishConfig) {
+    syncCourseVocabCoverage(course);
+  }
+
+  // Save English/language vocabulary banks in `sources/` if applicable
   if (course.category === 'english' && course.englishConfig) {
     const vocabSourcePath = path.join(sourcesDir, 'vocabulary-effective.json');
     fs.writeFileSync(
       vocabSourcePath,
       JSON.stringify(
         {
+          targetLanguage: course.englishConfig.targetLanguage || 'english',
+          customLanguageName: course.englishConfig.customLanguageName,
+          learningPurpose: course.englishConfig.learningPurpose || 'interest',
+          inputMode: course.englishConfig.inputMode,
           targetBankName: course.englishConfig.targetBankName,
           excludedBankName: course.englishConfig.excludedBankName,
-          dailyWordCount: course.englishConfig.dailyWordCount || 20,
+          dailyWordCount:
+            course.englishConfig.newWordsPerArticle || course.englishConfig.dailyWordCount || 15,
+          targetWordDensity: course.englishConfig.targetWordDensity,
           effectiveWords: course.englishConfig.effectiveWords,
+          vocabCoverage: course.englishConfig.vocabCoverage,
         },
         null,
         2
       ),
       'utf-8'
     );
+    const compactVocabPath = path.join(sourcesDir, 'vocabulary-compact.txt');
+    fs.writeFileSync(
+      compactVocabPath,
+      buildCompactVocabText(course.englishConfig.effectiveWords || []),
+      'utf-8'
+    );
+    if (course.englishConfig.vocabThemePlan) {
+      fs.writeFileSync(
+        path.join(segmentsDir, 'vocab-theme-plan.json'),
+        JSON.stringify(course.englishConfig.vocabThemePlan, null, 2),
+        'utf-8'
+      );
+    }
   }
 
   // 2. Save `segments/split-plan.json` if present & ensure 100% region coverage
@@ -742,6 +953,10 @@ async function persistCourseToFolder(
       estimatedMinutes: getEvaluatedSectionMinutes(d),
       regionId: regionIds[0] || d.regionId,
       regionIds: regionIds.length > 0 ? regionIds : undefined,
+      topicGroup: d.topicGroup,
+      themeId: d.themeId,
+      targetWordIds: d.targetWordIds,
+      reviewWordIds: d.reviewWordIds,
       title: d.title,
       objective: d.objective,
       prerequisites: d.prerequisites || [],
@@ -952,6 +1167,7 @@ function syncCourseFolderFromDisk(
   importedDays: number[];
   syllabusUpdated: boolean;
   splitPlanUpdated: boolean;
+  vocabThemePlanUpdated: boolean;
 } {
   const { absCourseDir, relCourseDir } = getCourseDirectory(course);
   if (!fs.existsSync(absCourseDir)) {
@@ -960,12 +1176,14 @@ function syncCourseFolderFromDisk(
       importedDays: [],
       syllabusUpdated: false,
       splitPlanUpdated: false,
+      vocabThemePlanUpdated: false,
     };
   }
 
   let updated = false;
   let syllabusUpdated = false;
   let splitPlanUpdated = false;
+  let vocabThemePlanUpdated = false;
   const importedDays: number[] = [];
 
   // 1. Scan assets/ directory for images
@@ -1019,7 +1237,7 @@ function syncCourseFolderFromDisk(
       const makeSig = (arr: DailyPlanSlot[]) =>
         arr.map(
           (s) =>
-            `${s.id}|${s.title}|${s.estimatedMinutes || ''}|${s.scheduledDay || ''}|${(s.regionIds || (s.regionId ? [s.regionId] : [])).join(',')}`
+            `${s.id}|${s.title}|${s.topicGroup || ''}|${(s.targetWordIds || []).join(',')}|${(s.reviewWordIds || []).join(',')}|${s.estimatedMinutes || ''}|${s.scheduledDay || ''}|${(s.regionIds || (s.regionId ? [s.regionId] : [])).join(',')}`
         );
       if (
         parsedOutline.dailyPlan.length > 0 &&
@@ -1070,6 +1288,84 @@ function syncCourseFolderFromDisk(
       splitPlanUpdated = true;
     } catch {
       // ignore
+    }
+  }
+
+  // 3b. Check segments/vocab-theme-plan.json for Agent-updated language theme planning & word mappings
+  const vocabThemePlanFile = path.join(segmentsDir, 'vocab-theme-plan.json');
+  if (course.category === 'english' && course.englishConfig && fs.existsSync(vocabThemePlanFile)) {
+    try {
+      const rawDiskPlan = JSON.parse(fs.readFileSync(vocabThemePlanFile, 'utf-8'));
+      const diskThemes = Array.isArray(rawDiskPlan?.themes)
+        ? normalizeVocabThemes(rawDiskPlan.themes)
+        : course.englishConfig.vocabThemePlan?.themes || [];
+      if (diskThemes.length > 0) {
+        const validThemeSet = new Set(diskThemes.map((t) => t.id));
+        const normalizedWordThemes: Record<string, VocabWordThemeMapping> = {};
+        if (rawDiskPlan?.wordThemes && typeof rawDiskPlan.wordThemes === 'object') {
+          const parsedMap = parseImportedWordThemeMappings(
+            JSON.stringify(rawDiskPlan.wordThemes),
+            course.englishConfig.effectiveWords || [],
+            diskThemes,
+            'ai'
+          );
+          for (const [wid, entry] of Object.entries(parsedMap.mappings)) {
+            const rawOrig = rawDiskPlan.wordThemes[wid];
+            const src =
+              rawOrig && typeof rawOrig === 'object' && !Array.isArray(rawOrig)
+                ? rawOrig.source === 'manual' || rawOrig.source === 'local'
+                  ? rawOrig.source
+                  : 'ai'
+                : 'ai';
+            const cleanTids = entry.themeIds.filter((tid) => validThemeSet.has(tid));
+            if (cleanTids.length > 0) {
+              normalizedWordThemes[wid] = {
+                themeIds: cleanTids,
+                source: src,
+                ...(rawOrig && typeof rawOrig.confidence === 'number'
+                  ? { confidence: rawOrig.confidence }
+                  : {}),
+                updatedAt:
+                  (rawOrig && typeof rawOrig.updatedAt === 'string' && rawOrig.updatedAt) ||
+                  entry.updatedAt,
+              };
+            }
+          }
+        }
+        const prevPlan = course.englishConfig.vocabThemePlan;
+        const makePlanSig = (p?: VocabThemePlan) => {
+          if (!p) return '';
+          const themeSig = (p.themes || []).map((t) => `${t.id}:${t.name}:${t.weight}`).join('|');
+          const mapKeys = Object.keys(p.wordThemes || {}).sort();
+          const mapSample = mapKeys
+            .slice(0, 20)
+            .concat(mapKeys.slice(-20))
+            .map((k) => `${k}=${p.wordThemes[k]?.themeIds.join(',')}:${p.wordThemes[k]?.source}`)
+            .join(';');
+          return `${themeSig}#${mapKeys.length}#${mapSample}#${p.lastThemesUpdatedAt || ''}#${p.lastMappingUpdatedAt || ''}`;
+        };
+        const candidatePlan: VocabThemePlan = {
+          themes: diskThemes,
+          wordThemes: normalizedWordThemes,
+          interleaveThemes:
+            typeof rawDiskPlan.interleaveThemes === 'boolean'
+              ? rawDiskPlan.interleaveThemes
+              : prevPlan?.interleaveThemes ?? true,
+          lastThemesUpdatedAt: rawDiskPlan.lastThemesUpdatedAt || new Date().toISOString(),
+          lastMappingUpdatedAt:
+            rawDiskPlan.lastMappingUpdatedAt ||
+            (Object.keys(normalizedWordThemes).length > 0 ? new Date().toISOString() : undefined),
+          lastAllocatedAt: rawDiskPlan.lastAllocatedAt || prevPlan?.lastAllocatedAt,
+          allocationSummary: rawDiskPlan.allocationSummary || prevPlan?.allocationSummary,
+        };
+        if (makePlanSig(prevPlan) !== makePlanSig(candidatePlan)) {
+          course.englishConfig.vocabThemePlan = candidatePlan;
+          vocabThemePlanUpdated = true;
+          updated = true;
+        }
+      }
+    } catch {
+      // ignore invalid disk vocab-theme-plan.json
     }
   }
 
@@ -1175,7 +1471,11 @@ function syncCourseFolderFromDisk(
     );
   }
 
-  return { updated, importedDays, syllabusUpdated, splitPlanUpdated };
+  if (course.category === 'english' && course.englishConfig) {
+    syncCourseVocabCoverage(course);
+  }
+
+  return { updated, importedDays, syllabusUpdated, splitPlanUpdated, vocabThemePlanUpdated };
 }
 
 interface DatabaseSchema {
@@ -1240,6 +1540,9 @@ function loadDb(): DatabaseSchema {
             date: d.date || addDaysToDateString(courseConfig.startDate || getTodayDateString(), idx),
             regionId: d.regionId,
             regionIds: Array.isArray(d.regionIds) ? d.regionIds : undefined,
+            topicGroup: typeof d.topicGroup === 'string' ? d.topicGroup : undefined,
+            targetWordIds: Array.isArray(d.targetWordIds) ? d.targetWordIds : undefined,
+            reviewWordIds: Array.isArray(d.reviewWordIds) ? d.reviewWordIds : undefined,
             title: d.title || `第 ${idx + 1} 讲`,
             objective: d.objective || '',
             prerequisites: d.prerequisites || [],
@@ -1344,6 +1647,9 @@ function loadDb(): DatabaseSchema {
       if (s.lesson) {
         s.lesson = sanitizeLessonCitations(s.lesson);
       }
+    }
+    if (c.category === 'english' && c.englishConfig) {
+      syncCourseVocabCoverage(c);
     }
   }
 
@@ -1861,7 +2167,7 @@ function extractJsonFromText<T>(rawText: string): T | null {
  * Build clean pending outline slots BEFORE Step 2 LLM outline generation runs.
  * Strictly NEVER scrapes raw PDF lines (which could contain garbled glyphs) into outline titles or topics.
  */
-function buildPendingOutlinePlaceholders(params: {
+function buildPendingOutlinePlaceholders(_params: {
   name: string;
   category: CourseCategory;
   goal: string;
@@ -1872,57 +2178,7 @@ function buildPendingOutlinePlaceholders(params: {
   knowledgeCatalog: KnowledgeCatalogNode[];
   dailyPlan: DailyPlanSlot[];
 } {
-  const { name, category, goal, startDate, durationDays, wordBuckets = [] } = params;
-
-  if (category !== 'english') {
-    return { knowledgeCatalog: [], dailyPlan: [] };
-  }
-
-  const sectionCount = wordBuckets.length > 0 ? wordBuckets.length : durationDays;
-  const slots: DailyPlanSlot[] = [];
-  for (let i = 0; i < sectionCount; i++) {
-    const dayIndex = i + 1;
-    const sectionId = ensureStableSectionId(dayIndex);
-    const date = addDaysToDateString(startDate, i);
-    const assignedWords = wordBuckets[i] || [];
-
-    let heading = `第 ${dayIndex} 讲（待第 2 步由 LLM 生成大纲）`;
-    let objective = `围绕“${goal}”规划第 ${dayIndex} 讲：请先在第 2 步生成完整课程大纲。`;
-    let keyTopics: string[] = [];
-
-    if (assignedWords.length > 0) {
-      const sample = assignedWords
-        .slice(0, 3)
-        .map((w) => w.word)
-        .join(', ');
-      heading = `第 ${dayIndex} 讲：英语语境精读与目标词汇 (${sample} 等 ${assignedWords.length} 词)`;
-      objective = `围绕“${goal}”掌握本节随机分配的 ${assignedWords.length} 个核心词汇并完成语境阅读。`;
-      keyTopics = [`目标词汇 (${assignedWords.length} 词)`, '语境精读文章', '长难句与近义词辨析'];
-    }
-
-    slots.push({
-      id: sectionId,
-      dayIndex,
-      scheduledDay: dayIndex,
-      estimatedMinutes: undefined,
-      date,
-      title: heading,
-      objective,
-      prerequisites: dayIndex === 1 ? ['课程基础先修概念'] : [`第 ${dayIndex - 1} 讲核心内容`],
-      teachingScope: `${name} 第 ${dayIndex} 讲`,
-      connectionNote:
-        dayIndex === 1
-          ? '课程开篇第 1 讲，建立核心概念与分析基础'
-          : `承接第 ${dayIndex - 1} 讲，推进本节原理推导与应用`,
-      keyTopics,
-      assignedWords,
-    });
-  }
-
-  return {
-    knowledgeCatalog: [],
-    dailyPlan: allocateSectionsToDays(slots, durationDays, startDate),
-  };
+  return { knowledgeCatalog: [], dailyPlan: [] };
 }
 
 async function generateCourseSyllabus(params: {
@@ -1943,6 +2199,15 @@ async function generateCourseSyllabus(params: {
   pdfSplitPlan?: PdfSplitPlanItem[];
   effectiveWords?: VocabItem[];
   dailyWordCount?: number;
+  targetLanguage?: TargetLanguageCode;
+  customLanguageName?: string;
+  learningPurpose?: LanguageLearningPurpose;
+  interestPreferences?: string;
+  inputMode?: LanguageInputMode;
+  topicCount?: number | null;
+  targetWordDensity?: number;
+  expectedRepeatsPerWord?: number;
+  vocabThemePlan?: VocabThemePlan;
   existingSlots?: DailyPlanSlot[];
   pdfAttachments?: Array<{ fileName: string; base64Data: string }>;
   requireLlm?: boolean;
@@ -1967,47 +2232,37 @@ async function generateCourseSyllabus(params: {
     materials,
     pdfSplitPlan = [],
     effectiveWords = [],
-    dailyWordCount = 20,
+    dailyWordCount = 15,
+    targetLanguage,
+    customLanguageName,
+    learningPurpose,
+    interestPreferences,
+    inputMode,
+    topicCount,
+    targetWordDensity,
+    expectedRepeatsPerWord,
+    vocabThemePlan,
     existingSlots = [],
     pdfAttachments = [],
     requireLlm = false,
   } = params;
 
-  const englishSectionCount =
-    category === 'english' && effectiveWords.length > 0
-      ? Math.max(1, Math.ceil(effectiveWords.length / dailyWordCount))
-      : durationDays;
-
-  const wordBuckets =
-    category === 'english'
-      ? allocateEnglishWordsRandomly({
-          effectiveWords,
-          durationDays: englishSectionCount,
-          dailyWordCount,
-          existingSlots,
-          preserveStartedSlots: existingSlots.length > 0,
-        }).buckets
-      : [];
+  const normalizedWords = assignStableVocabIds(effectiveWords);
+  const vocabById = new Map<string, VocabItem>();
+  const vocabByKey = new Map<string, VocabItem>();
+  for (const w of normalizedWords) {
+    if (w.id) vocabById.set(w.id, w);
+    vocabByKey.set(w.word.trim().toLowerCase(), w);
+  }
 
   if (!requireLlm && (generationMode === 'agent' || generationMode === 'chat')) {
-    const pending = buildPendingOutlinePlaceholders({
+    return buildPendingOutlinePlaceholders({
       name,
       category,
       goal,
       startDate,
       durationDays,
-      wordBuckets,
     });
-    for (let i = 0; i < pending.dailyPlan.length; i++) {
-      const ex = existingSlots[i];
-      if (ex) {
-        pending.dailyPlan[i].id = ensureStableSectionId(i + 1, ex.id);
-        pending.dailyPlan[i].regionId = ex.regionId;
-        pending.dailyPlan[i].lesson = ex.lesson;
-        pending.dailyPlan[i].pdfSegment = resolveSlotPdfSegment(ex, pdfSplitPlan) || ex.pdfSegment;
-      }
-    }
-    return pending;
   }
 
   const settings = loadSettings();
@@ -2025,8 +2280,18 @@ async function generateCourseSyllabus(params: {
     extraRequirements,
     materials,
     pdfSplitPlan,
-    effectiveWords,
+    effectiveWords: normalizedWords,
     dailyWordCount,
+    targetLanguage,
+    customLanguageName,
+    learningPurpose,
+    interestPreferences,
+    inputMode,
+    topicCount,
+    targetWordDensity,
+    expectedRepeatsPerWord,
+    vocabThemePlan,
+    existingSlots,
   });
 
   const llmResult = await callLlmJson<{
@@ -2036,6 +2301,10 @@ async function generateCourseSyllabus(params: {
       dayIndex?: number;
       regionId?: string;
       regionIds?: string[];
+      topicGroup?: string;
+      themeId?: string;
+      targetWordIds?: string[];
+      reviewWordIds?: string[];
       title: string;
       objective: string;
       prerequisites?: string[];
@@ -2049,6 +2318,10 @@ async function generateCourseSyllabus(params: {
       dayIndex?: number;
       regionId?: string;
       regionIds?: string[];
+      topicGroup?: string;
+      themeId?: string;
+      targetWordIds?: string[];
+      reviewWordIds?: string[];
       title: string;
       objective: string;
       prerequisites?: string[];
@@ -2071,6 +2344,22 @@ async function generateCourseSyllabus(params: {
         : null;
 
   if (rawSections && rawSections.length > 0) {
+    const resolveIds = (rawIds?: unknown[]): string[] => {
+      if (!Array.isArray(rawIds)) return [];
+      const out: string[] = [];
+      for (const raw of rawIds) {
+        const s = String(raw || '').trim();
+        if (!s) continue;
+        if (vocabById.has(s)) {
+          out.push(s);
+        } else {
+          const byWord = vocabByKey.get(s.toLowerCase());
+          if (byWord?.id) out.push(byWord.id);
+        }
+      }
+      return Array.from(new Set(out));
+    };
+
     const rawSlots: DailyPlanSlot[] = [];
     for (let i = 0; i < rawSections.length; i++) {
       const llmSec = rawSections[i];
@@ -2080,8 +2369,26 @@ async function generateCourseSyllabus(params: {
         (requestedId && existingSlots.find((s) => s.id === requestedId)) ||
         existingSlots[i];
       const sectionId = ensureStableSectionId(sectionOrder, requestedId || existing?.id);
+
+      const resolvedTargetIds =
+        category === 'english'
+          ? Array.isArray(llmSec?.targetWordIds)
+            ? resolveIds(llmSec.targetWordIds)
+            : existing?.targetWordIds || []
+          : undefined;
+      const resolvedReviewIds =
+        category === 'english' && Array.isArray(llmSec?.reviewWordIds)
+          ? resolveIds(llmSec.reviewWordIds)
+          : existing?.reviewWordIds;
       const assignedWords =
-        category === 'english' ? wordBuckets[i] || existing?.assignedWords || [] : undefined;
+        category === 'english'
+          ? resolvedTargetIds && resolvedTargetIds.length > 0
+            ? resolvedTargetIds
+                .map((id) => vocabById.get(id))
+                .filter((w): w is VocabItem => Boolean(w))
+            : existing?.assignedWords
+          : undefined;
+
       const extractedRegions = extractReferencedRegionIds({
         regionId: llmSec?.regionId || existing?.regionId,
         regionIds: Array.isArray(llmSec?.regionIds) ? llmSec.regionIds : existing?.regionIds,
@@ -2126,6 +2433,16 @@ async function generateCourseSyllabus(params: {
             : matchedSegments.length > 0
               ? matchedSegments.map((s) => s.sectionId)
               : undefined,
+        topicGroup:
+          typeof llmSec?.topicGroup === 'string' && llmSec.topicGroup.trim()
+            ? llmSec.topicGroup.trim()
+            : existing?.topicGroup,
+        themeId:
+          typeof llmSec?.themeId === 'string' && llmSec.themeId.trim()
+            ? llmSec.themeId.trim()
+            : existing?.themeId,
+        targetWordIds: resolvedTargetIds && resolvedTargetIds.length > 0 ? resolvedTargetIds : undefined,
+        reviewWordIds: resolvedReviewIds && resolvedReviewIds.length > 0 ? resolvedReviewIds : undefined,
         title: llmSec?.title || `第 ${sectionOrder} 节：${name}`,
         objective: llmSec?.objective || `${goal}（第 ${sectionOrder} 节）`,
         prerequisites: Array.isArray(llmSec?.prerequisites) ? llmSec.prerequisites : undefined,
@@ -2173,8 +2490,152 @@ async function generateCourseSyllabus(params: {
     goal,
     startDate,
     durationDays,
-    wordBuckets,
   });
+}
+
+async function runEnglishStep2ViaApi(
+  course: Course,
+  slot: DailyPlanSlot,
+  baseLesson: DailyLessonContent,
+  options?: {
+    allowSynonymReplacement?: boolean;
+    onProgress?: (event: GenerationProgressEvent) => void;
+  }
+): Promise<{
+  lesson: DailyLessonContent;
+  beforeStats: ReturnType<typeof computeSectionAssociatedVocabStats>;
+  afterStats: ReturnType<typeof computeSectionAssociatedVocabStats>;
+  appliedReplacementsCount: number;
+}> {
+  if (!baseLesson?.englishPayload) {
+    throw new Error('当前课件缺少 englishPayload，无法执行英文 Step 2 补充词义。');
+  }
+
+  const initialBeforeStats = computeSectionAssociatedVocabStats(course, slot, baseLesson);
+  const allowSynonym =
+    options?.allowSynonymReplacement ?? isWeakBaselineForVocabSimplification(course);
+  const apiSettings = loadSettings();
+  const markedBankWords = getMarkedVocabBankWords(apiSettings);
+  let workingLesson: DailyLessonContent = baseLesson;
+  let totalAppliedReplacements = 0;
+
+  // Pass 2A: optional weak-baseline synonym simplification for dense associated words + initial glosses
+  if (allowSynonym && initialBeforeStats.associatedWordCount > 0) {
+    const pendingBefore = extractPendingGlossWordsForSection(
+      course,
+      slot,
+      workingLesson,
+      markedBankWords
+    );
+    options?.onProgress?.({
+      type: 'progress',
+      stage: 'parsing',
+      step: 3,
+      percent: 64,
+      message: `Step 2：正在为薄弱基础执行关联生词同义简化与词义补充（当前关联词 ${initialBeforeStats.associatedWordCount} 个）...`,
+    });
+    const prompt2A = buildEnglishStage2WordGlossPrompt({
+      course,
+      slot,
+      lesson: workingLesson,
+      pendingWords: pendingBefore.slice(0, 60),
+      allowSynonymReplacement: true,
+      mode: 'api',
+    });
+    const res2A = await callLlmJson<Record<string, unknown>>({
+      systemInstruction: prompt2A.systemInstruction,
+      userPrompt: prompt2A.userPrompt,
+    });
+    if (res2A) {
+      const parsed2A = parseImportedStep2EnglishOutput(JSON.stringify(res2A), pendingBefore);
+      const enhanced2A = applyStep2EnglishEnhancementToLesson({
+        course,
+        slot,
+        lesson: workingLesson,
+        parsed: parsed2A,
+        allowSynonymReplacement: true,
+      });
+      workingLesson = enhanced2A.lesson;
+      totalAppliedReplacements += enhanced2A.appliedReplacements.length;
+    }
+  }
+
+  // Pass 2B: chunked contextual glossing for remaining unannotated words (60 words per batch)
+  const remainingPending = extractPendingGlossWordsForSection(
+    course,
+    slot,
+    workingLesson,
+    markedBankWords
+  );
+  if (remainingPending.length > 0) {
+    const batchSize = 60;
+    const totalBatches = Math.ceil(remainingPending.length / batchSize);
+    for (let b = 0; b < totalBatches; b++) {
+      const chunk = remainingPending.slice(b * batchSize, (b + 1) * batchSize);
+      options?.onProgress?.({
+        type: 'progress',
+        stage: 'parsing',
+        step: 4,
+        percent: Math.min(95, 72 + Math.round(((b + 1) / totalBatches) * 20)),
+        message: `Step 2：正在补充正文待标注生词简明释义（第 ${b + 1}/${totalBatches} 批，共 ${chunk.length} 词）...`,
+      });
+      const prompt2B = buildEnglishStage2WordGlossPrompt({
+        course,
+        slot,
+        lesson: workingLesson,
+        pendingWords: chunk,
+        allowSynonymReplacement: false,
+        mode: 'api',
+      });
+      const res2B = await callLlmJson<Record<string, unknown>>({
+        systemInstruction: prompt2B.systemInstruction,
+        userPrompt: prompt2B.userPrompt,
+      });
+      if (res2B) {
+        const parsed2B = parseImportedStep2EnglishOutput(JSON.stringify(res2B), chunk);
+        const enhanced2B = applyStep2EnglishEnhancementToLesson({
+          course,
+          slot,
+          lesson: workingLesson,
+          parsed: parsed2B,
+          allowSynonymReplacement: false,
+        });
+        workingLesson = enhanced2B.lesson;
+      }
+    }
+  } else {
+    // Ensure fresh stats summary is recorded even when 0 pending words remained after 2A
+    workingLesson = applyStep2EnglishEnhancementToLesson({
+      course,
+      slot,
+      lesson: workingLesson,
+      parsed: {
+        extraWordGlosses: [],
+        paragraphUpdates: [],
+        fullParagraphs: [],
+        synonymReplacements: [],
+      },
+      allowSynonymReplacement: allowSynonym,
+    }).lesson;
+  }
+
+  const sanitized = sanitizeLessonCitations(workingLesson);
+  if (sanitized.englishPayload?.step2VocabStats) {
+    sanitized.englishPayload.step2VocabStats.associatedWordCountBefore =
+      initialBeforeStats.associatedWordCount;
+    sanitized.englishPayload.step2VocabStats.synonymReplacementEnabled = allowSynonym;
+  }
+  backfillMarkedVocabBankMeanings(
+    apiSettings,
+    sanitized.englishPayload?.extraWordGlosses || []
+  );
+  const afterStats = computeSectionAssociatedVocabStats(course, slot, sanitized);
+  return {
+    lesson: sanitized,
+    beforeStats: initialBeforeStats,
+    afterStats,
+    appliedReplacementsCount: totalAppliedReplacements,
+  };
 }
 
 async function generateDailyLesson(
@@ -2279,15 +2740,39 @@ async function generateDailyLesson(
   };
 
   if (isEnglish) {
+    if (stageOption === 'stage2') {
+      const existingLesson = slot.lesson || slot.stage1Draft;
+      if (!existingLesson?.englishPayload) {
+        throw new Error('请先生成本节 Step 1 英文阅读文章，再执行 Step 2 补充词义与关联生词统计。');
+      }
+      const step2Res = await runEnglishStep2ViaApi(course, slot, existingLesson, { onProgress });
+      return {
+        ...step2Res.lesson,
+        sectionId,
+        generationStage: 'complete',
+        sourceMode: existingLesson.sourceMode || 'api',
+      };
+    }
+
+    const effectiveWords = assignStableVocabIds(course.englishConfig?.effectiveWords || []);
+    const vocabById = new Map<string, VocabItem>();
+    for (const w of effectiveWords) {
+      if (w.id) vocabById.set(w.id, w);
+    }
     const targetWords =
-      slot.assignedWords && slot.assignedWords.length > 0
-        ? slot.assignedWords
-        : course.englishConfig?.effectiveWords.slice(0, course.englishConfig?.dailyWordCount || 15) || [];
+      Array.isArray(slot.targetWordIds) && slot.targetWordIds.length > 0
+        ? slot.targetWordIds
+            .map((id) => vocabById.get(id))
+            .filter((w): w is VocabItem => Boolean(w))
+        : Array.isArray(slot.assignedWords) && slot.assignedWords.length > 0
+          ? slot.assignedWords
+          : [];
 
     const articleMode: EnglishArticleMode =
-      course.englishConfig?.articleMode || 'llm_original';
+      course.englishConfig?.articleMode || 'media_search';
     const preferredSources =
-      course.englishConfig?.preferredSources || 'The New Yorker, The Economist';
+      course.englishConfig?.preferredSources ||
+      'The Economist, The Guardian, Nature, MIT Technology Review, BBC';
 
     const englishUserPrompt = buildEnglishLessonUserPrompt({
       course,
@@ -2300,8 +2785,9 @@ async function generateDailyLesson(
       materialContext,
     });
 
+    const effectiveLanguageSystemPrompt = getEffectiveTeachingSystemPrompt(course, settings);
     const llmLesson = await callLlmJsonStream<Omit<DailyLessonContent, 'dayIndex' | 'date' | 'generatedAt'>>({
-      systemInstruction: settings.englishSystemPrompt,
+      systemInstruction: effectiveLanguageSystemPrompt,
       userPrompt: englishUserPrompt,
       pdfAttachments: slotPdfAttachments,
       onStart: emitStartProgress,
@@ -2316,9 +2802,9 @@ async function generateDailyLesson(
         type: 'progress',
         stage: 'parsing',
         step: 4,
-        percent: 94,
+        percent: 62,
         pdfSummary,
-        message: '流式接收完毕，正在校验英语语境数据与启发式锚点...',
+        message: 'Step 1 文章生成完毕，正在校验数据结构与统计关联生词...',
       });
       const normalized = parseImportedLessonContent(
         JSON.stringify(llmLesson),
@@ -2338,9 +2824,10 @@ async function generateDailyLesson(
           }
         : undefined;
       const mergedPayload = normalized.englishPayload || fallbackPayload;
-      return {
+      const step1Lesson: DailyLessonContent = {
         ...normalized,
         sectionId,
+        generationStage: 'complete',
         englishPayload: mergedPayload
           ? {
               ...mergedPayload,
@@ -2353,9 +2840,34 @@ async function generateDailyLesson(
           : undefined,
         sourceMode: 'api',
       };
+
+      if (stageOption === 'stage1') {
+        return step1Lesson;
+      }
+
+      const pendingAfterStep1 = extractPendingGlossWordsForSection(
+        course,
+        slot,
+        step1Lesson,
+        getMarkedVocabBankWords(settings)
+      );
+      const statsAfterStep1 = computeSectionAssociatedVocabStats(course, slot, step1Lesson);
+      if (
+        pendingAfterStep1.length > 0 ||
+        (isWeakBaselineForVocabSimplification(course) && statsAfterStep1.associatedWordCount > 0)
+      ) {
+        try {
+          const step2Res = await runEnglishStep2ViaApi(course, slot, step1Lesson, { onProgress });
+          return step2Res.lesson;
+        } catch (step2Err: any) {
+          console.warn('[English Step 2 API fallback] Keeping Step 1 lesson:', step2Err?.message || step2Err);
+          return step1Lesson;
+        }
+      }
+      return step1Lesson;
     }
 
-    throw new Error('未能从 API 获取英语课件数据。若未配置 API Key，可切换为 Agent 课件模式或 Chat 课件模式导入。');
+    throw new Error('未能从 API 获取语言课件数据。若未配置 API Key，可切换为 Agent 课件模式或 Chat 课件模式导入。');
   }
 
   const effectiveSystemPrompt = getEffectiveTeachingSystemPrompt(course, settings);
@@ -2486,6 +2998,7 @@ function formatPublicSettings(settings: StoredSettings) {
     showLessonTools: settings.showLessonTools,
     showAdvancedWorkflowDetails: Boolean(settings.showAdvancedWorkflowDetails),
     showContentCategoryBadges: Boolean(settings.showContentCategoryBadges),
+    markedVocabBankId: settings.markedVocabBankId || '',
     remoteAccessEnabled:
       typeof settings.remoteAccessEnabled === 'boolean' ? settings.remoteAccessEnabled : true,
     serverPort: settings.serverPort || 3000,
@@ -2580,6 +3093,7 @@ async function startServer() {
 
     res.json({
       courses: db.courses,
+      vocabBanks: loadVocabBanks(),
       settings: formatPublicSettings(settings),
       promptPresets: getPromptPresetsFromSkill(),
       studyStats: db.studyStats,
@@ -2751,6 +3265,7 @@ async function startServer() {
       showLessonTools,
       showAdvancedWorkflowDetails,
       showContentCategoryBadges,
+      markedVocabBankId,
       remoteAccessEnabled,
       serverPort,
       allowAllHosts,
@@ -2816,6 +3331,10 @@ async function startServer() {
         typeof showContentCategoryBadges === 'boolean'
           ? showContentCategoryBadges
           : current.showContentCategoryBadges,
+      markedVocabBankId:
+        typeof markedVocabBankId === 'string'
+          ? markedVocabBankId.trim()
+          : current.markedVocabBankId,
       remoteAccessEnabled:
         typeof remoteAccessEnabled === 'boolean'
           ? remoteAccessEnabled
@@ -2910,6 +3429,268 @@ async function startServer() {
     }
   });
 
+  // 4b. Local Custom Vocabulary Bank CRUD & Export (persisted in data/vocab-banks.json)
+  app.get('/api/vocab-banks', (_req, res) => {
+    res.json({ vocabBanks: loadVocabBanks() });
+  });
+
+  app.post('/api/vocab-banks', (req, res) => {
+    try {
+      const {
+        name,
+        description = '',
+        language,
+        customLanguageName = '',
+        words = [],
+        rawText = '',
+      } = req.body || {};
+
+      const trimmedName = String(name || '').trim();
+      if (!trimmedName) {
+        res.status(400).json({ error: '请输入词库名称' });
+        return;
+      }
+
+      const parsedFromRaw =
+        typeof rawText === 'string' && rawText.trim() ? parseVocabularyInput(rawText) : [];
+      const incomingWords: VocabItem[] = [
+        ...(Array.isArray(words) ? words : []),
+        ...parsedFromRaw,
+      ];
+      const cleanedWords = assignStableVocabIds(deduplicateVocabList(incomingWords));
+      const now = new Date().toISOString();
+      const validLanguage: TargetLanguageCode | undefined =
+        language === 'english' || language === 'japanese' || language === 'other'
+          ? language
+          : undefined;
+      const newBank: VocabBank = {
+        id: `bank-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        name: trimmedName,
+        ...(validLanguage ? { language: validLanguage } : {}),
+        customLanguageName:
+          validLanguage === 'other' && String(customLanguageName || '').trim()
+            ? String(customLanguageName).trim()
+            : undefined,
+        description: String(description || '').trim() || undefined,
+        words: cleanedWords,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      const banks = loadVocabBanks();
+      banks.unshift(newBank);
+      saveVocabBanks(banks);
+      res.status(201).json({ vocabBank: newBank, vocabBanks: banks });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || '创建本地词库失败' });
+    }
+  });
+
+  app.put('/api/vocab-banks/:bankId', (req, res) => {
+    try {
+      const { bankId } = req.params;
+      const {
+        name,
+        description,
+        language,
+        customLanguageName,
+        words,
+        appendRawText,
+        appendWords,
+      } = req.body || {};
+
+      const banks = loadVocabBanks();
+      const idx = banks.findIndex((b) => b.id === bankId);
+      if (idx === -1) {
+        res.status(404).json({ error: '未找到指定词库' });
+        return;
+      }
+
+      const target = { ...banks[idx] };
+      if (typeof name === 'string' && name.trim()) {
+        target.name = name.trim();
+      }
+      if (typeof description === 'string') {
+        target.description = description.trim() || undefined;
+      }
+      if (language === 'english' || language === 'japanese' || language === 'other') {
+        target.language = language;
+        target.customLanguageName =
+          language === 'other' && typeof customLanguageName === 'string' && customLanguageName.trim()
+            ? customLanguageName.trim()
+            : undefined;
+      } else if (typeof customLanguageName === 'string') {
+        target.customLanguageName = customLanguageName.trim() || undefined;
+      }
+
+      if (Array.isArray(words)) {
+        target.words = assignStableVocabIds(deduplicateVocabList(words));
+      } else if (typeof appendRawText === 'string' || Array.isArray(appendWords)) {
+        const parsedRaw =
+          typeof appendRawText === 'string' && appendRawText.trim()
+            ? parseVocabularyInput(appendRawText)
+            : [];
+        const extra = Array.isArray(appendWords) ? appendWords : [];
+        target.words = assignStableVocabIds(
+          deduplicateVocabList([...target.words, ...extra, ...parsedRaw])
+        );
+      }
+
+      target.updatedAt = new Date().toISOString();
+      banks[idx] = target;
+      saveVocabBanks(banks);
+      res.json({ vocabBank: target, vocabBanks: banks });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || '更新本地词库失败' });
+    }
+  });
+
+  app.delete('/api/vocab-banks/:bankId', (req, res) => {
+    try {
+      const { bankId } = req.params;
+      const banks = loadVocabBanks();
+      const next = banks.filter((b) => b.id !== bankId);
+      if (next.length === banks.length) {
+        res.status(404).json({ error: '未找到指定词库' });
+        return;
+      }
+      saveVocabBanks(next);
+      res.json({ ok: true, vocabBanks: next });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || '删除本地词库失败' });
+    }
+  });
+
+  app.get('/api/vocab-banks/:bankId/export', (req, res) => {
+    const { bankId } = req.params;
+    const rawFormat = String(req.query.format || 'txt').toLowerCase();
+    const format: 'txt' | 'csv' | 'json' =
+      rawFormat === 'csv' || rawFormat === 'json' ? rawFormat : 'txt';
+    const banks = loadVocabBanks();
+    const bank = banks.find((b) => b.id === bankId);
+    if (!bank) {
+      res.status(404).json({ error: '未找到指定词库' });
+      return;
+    }
+
+    const body = formatVocabularyExport(bank.words, format);
+    const mimeMap = {
+      txt: 'text/plain; charset=utf-8',
+      csv: 'text/csv; charset=utf-8',
+      json: 'application/json; charset=utf-8',
+    };
+    const safeName = bank.name.replace(/[\\/:*?"<>|]/g, '_');
+    res.setHeader('Content-Type', mimeMap[format]);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename*=UTF-8''${encodeURIComponent(`${safeName}.${format}`)}`
+    );
+    res.send(body);
+  });
+
+  // 4c. User-Marked Vocabulary Bank endpoints (persisted in configurable VocabBank)
+  app.get('/api/marked-vocab-bank', (_req, res) => {
+    const settings = loadSettings();
+    const banks = loadVocabBanks();
+    const targetBank = settings.markedVocabBankId
+      ? banks.find((b) => b.id === settings.markedVocabBankId) || null
+      : null;
+    res.json({
+      markedVocabBankId: targetBank?.id || '',
+      bank: targetBank,
+      allBanks: banks.map((b) => ({
+        id: b.id,
+        name: b.name,
+        wordCount: b.words.length,
+        language: b.language,
+      })),
+    });
+  });
+
+  app.post('/api/marked-vocab-bank/toggle', (req, res) => {
+    try {
+      const {
+        word,
+        meaning = '',
+        phonetic = '',
+        contextSnippet = '',
+        bankId,
+        mode = 'toggle',
+      } = req.body || {};
+
+      const cleanWord = String(word || '').trim();
+      const normKey = normalizeWordKey(cleanWord);
+      if (!normKey) {
+        res.status(400).json({ error: '请提供有效单词' });
+        return;
+      }
+
+      const settings = loadSettings();
+      const banks = loadVocabBanks();
+      const requestedBankId = typeof bankId === 'string' && bankId.trim() ? bankId.trim() : settings.markedVocabBankId;
+      let targetIdx = requestedBankId ? banks.findIndex((b) => b.id === requestedBankId) : -1;
+
+      if (targetIdx === -1) {
+        if (mode === 'remove') {
+          res.json({ marked: false, markedVocabBankId: '', bank: null });
+          return;
+        }
+        const now = new Date().toISOString();
+        const defaultBank: VocabBank = {
+          id: `bank-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          name: '阅读标记生词本',
+          language: 'english',
+          description: '在英文阅读中点击标记的个人生词本（Step 2 可一并查询释义）',
+          words: [],
+          createdAt: now,
+          updatedAt: now,
+        };
+        banks.unshift(defaultBank);
+        targetIdx = 0;
+        settings.markedVocabBankId = defaultBank.id;
+        saveSettings(settings);
+      } else if (bankId && bankId.trim() && settings.markedVocabBankId !== bankId.trim()) {
+        settings.markedVocabBankId = bankId.trim();
+        saveSettings(settings);
+      }
+
+      const bank = { ...banks[targetIdx] };
+      const existingIdx = bank.words.findIndex((w) => normalizeWordKey(w.word) === normKey);
+      let marked = false;
+
+      if (existingIdx >= 0 && mode !== 'add') {
+        bank.words = bank.words.filter((w) => normalizeWordKey(w.word) !== normKey);
+        marked = false;
+      } else if (existingIdx >= 0 && mode === 'add') {
+        marked = true;
+      } else if (mode !== 'remove') {
+        const cleanMeaning = String(meaning || '').trim();
+        const newEntry: VocabItem = {
+          word: cleanWord,
+          meaning: cleanMeaning && !isPlaceholderVocabMeaning(cleanMeaning) ? cleanMeaning : '待结合语境学习',
+          ...(String(phonetic || '').trim() ? { phonetic: String(phonetic).trim() } : {}),
+          ...(String(contextSnippet || '').trim()
+            ? { usageNote: `阅读摘录：${String(contextSnippet).trim().slice(0, 120)}` }
+            : {}),
+        };
+        bank.words = assignStableVocabIds(deduplicateVocabList([newEntry, ...bank.words]));
+        marked = true;
+      }
+
+      bank.updatedAt = new Date().toISOString();
+      banks[targetIdx] = bank;
+      saveVocabBanks(banks);
+
+      res.json({
+        marked,
+        markedVocabBankId: bank.id,
+        bank,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || '更新阅读标记生词本失败' });
+    }
+  });
+
   // 5. Create a new course:
   // Unified pipeline:
   //   Step 1: Save sources & determine PDF split regions via LLM (or clean bookmark scaffold)
@@ -2980,24 +3761,96 @@ async function startServer() {
         (m) => Boolean(m?.isPdf) || (m?.fileName || '').toLowerCase().endsWith('.pdf')
       );
 
-      const dailyWordCount =
-        category === 'english'
-          ? Math.max(1, Math.min(200, Number(englishConfig?.dailyWordCount) || 20))
-          : 20;
+      let builtLanguageConfig: Course['englishConfig'] = undefined;
+      if (category === 'english') {
+        const rawCfg = englishConfig || {};
+        const explicitTargetLanguage: TargetLanguageCode | undefined =
+          rawCfg.targetLanguage === 'english' ||
+          rawCfg.targetLanguage === 'japanese' ||
+          rawCfg.targetLanguage === 'other'
+            ? rawCfg.targetLanguage
+            : undefined;
+        const customLanguageName =
+          explicitTargetLanguage === 'other' && typeof rawCfg.customLanguageName === 'string'
+            ? rawCfg.customLanguageName.trim() || undefined
+            : undefined;
+        const learningPurpose: LanguageLearningPurpose =
+          rawCfg.learningPurpose === 'exam' ? 'exam' : 'interest';
+        const interestPreferences =
+          typeof rawCfg.interestPreferences === 'string' && rawCfg.interestPreferences.trim()
+            ? rawCfg.interestPreferences.trim()
+            : undefined;
+        const rawTopicCount = Number(rawCfg.topicCount);
+        const topicCount =
+          Number.isFinite(rawTopicCount) && rawTopicCount >= 1
+            ? Math.min(50, Math.round(rawTopicCount))
+            : null;
+        const newWordsPerArticle = Math.max(
+          1,
+          Math.min(100, Math.round(Number(rawCfg.newWordsPerArticle || rawCfg.dailyWordCount) || 15))
+        );
+        const rawDensity = Number(rawCfg.targetWordDensity);
+        const targetWordDensity =
+          Number.isFinite(rawDensity) && rawDensity > 0
+            ? Math.max(0.005, Math.min(0.25, rawDensity))
+            : 0.04;
+        const rawRepeats = Number(rawCfg.expectedRepeatsPerWord);
+        const expectedRepeatsPerWord =
+          Number.isFinite(rawRepeats) && rawRepeats >= 1 ? Math.min(10, rawRepeats) : 2;
+        const normalizedEffectiveWords = assignStableVocabIds(
+          deduplicateVocabList(Array.isArray(rawCfg.effectiveWords) ? rawCfg.effectiveWords : [])
+        );
+        const inputMode = resolveLanguageInputMode(
+          normalizedEffectiveWords.length,
+          rawMaterials.length
+        );
+        const readingStats =
+          normalizedEffectiveWords.length > 0 &&
+          (!explicitTargetLanguage || explicitTargetLanguage === 'english')
+            ? computeEnglishReadingPlanStats({
+                effectiveTotal: normalizedEffectiveWords.length,
+                newWordsPerArticle,
+                targetWordDensity,
+                expectedRepeatsPerWord,
+              })
+            : null;
 
-      const englishSectionCount =
-        category === 'english' && (englishConfig?.effectiveWords || []).length > 0
-          ? Math.max(1, Math.ceil((englishConfig?.effectiveWords || []).length / dailyWordCount))
-          : days;
-
-      const wordBuckets =
-        category === 'english'
-          ? allocateEnglishWordsRandomly({
-              effectiveWords: englishConfig?.effectiveWords || [],
-              durationDays: englishSectionCount,
-              dailyWordCount,
-            }).buckets
-          : [];
+        builtLanguageConfig = {
+          targetBankName: String(rawCfg.targetBankName || (normalizedEffectiveWords.length > 0 ? '自定义目标词库' : '无外加词库')).trim(),
+          excludedBankName: String(rawCfg.excludedBankName || '无排除词库').trim(),
+          totalTargetCount: Math.max(
+            normalizedEffectiveWords.length,
+            Number(rawCfg.totalTargetCount) || normalizedEffectiveWords.length
+          ),
+          excludedCount: Math.max(0, Number(rawCfg.excludedCount) || 0),
+          effectiveWords: normalizedEffectiveWords,
+          dailyWordCount: newWordsPerArticle,
+          articleMode: rawCfg.articleMode === 'media_search' ? 'media_search' : 'llm_original',
+          preferredSources: String(rawCfg.preferredSources || 'The Economist, Nature, BBC').trim(),
+          lastAllocatedAt: new Date().toISOString(),
+          ...(explicitTargetLanguage ? { targetLanguage: explicitTargetLanguage } : {}),
+          ...(customLanguageName ? { customLanguageName } : {}),
+          learningPurpose,
+          ...(interestPreferences ? { interestPreferences } : {}),
+          inputMode,
+          ...(typeof rawCfg.targetBankId === 'string' && rawCfg.targetBankId
+            ? { targetBankId: rawCfg.targetBankId }
+            : {}),
+          ...(typeof rawCfg.excludedBankId === 'string' && rawCfg.excludedBankId
+            ? { excludedBankId: rawCfg.excludedBankId }
+            : {}),
+          topicCount,
+          newWordsPerArticle,
+          targetWordDensity,
+          expectedRepeatsPerWord,
+          ...(readingStats
+            ? {
+                estimatedArticleCount: readingStats.estimatedArticleCount,
+                estimatedArticleWordLength: readingStats.estimatedArticleWordLength,
+              }
+            : {}),
+        };
+      }
 
       // Initialize clean pending outline placeholders (Step 2 generates the real outline after Step 1 PDF split)
       const pendingSchedule = buildPendingOutlinePlaceholders({
@@ -3006,7 +3859,6 @@ async function startServer() {
         goal: trimmedGoal,
         startDate,
         durationDays: days,
-        wordBuckets,
       });
 
       const existingDirs = fs.existsSync(COURSES_ROOT) ? fs.readdirSync(COURSES_ROOT) : [];
@@ -3036,20 +3888,14 @@ async function startServer() {
         knowledgeCatalog: pendingSchedule.knowledgeCatalog,
         agentWorkspacePath: `courses/${folderName}`,
         customAssets: {},
-        englishConfig:
-          category === 'english' && englishConfig
-            ? {
-                ...englishConfig,
-                dailyWordCount,
-                lastAllocatedAt: new Date().toISOString(),
-              }
-            : undefined,
+        englishConfig: builtLanguageConfig,
         dailyPlan: pendingSchedule.dailyPlan,
         masteredWords: [],
         exerciseSubmissions: {},
         reverseCheckNotes: {},
         createdAt: new Date().toISOString(),
       };
+      syncCourseVocabCoverage(newCourse);
 
       // Persist raw files into `courses/<课程名称>/sources/` and extract clean PDF metadata/bookmarks via pdfjs-dist
       await persistCourseToFolder(newCourse, settings);
@@ -3129,13 +3975,22 @@ async function startServer() {
           durationDays: days,
           extraRequirements: trimmedExtra,
           materials: newCourse.materials,
-          effectiveWords: englishConfig?.effectiveWords || [],
-          dailyWordCount,
+          effectiveWords: builtLanguageConfig?.effectiveWords || [],
+          dailyWordCount: builtLanguageConfig?.newWordsPerArticle || builtLanguageConfig?.dailyWordCount || 15,
+          targetLanguage: builtLanguageConfig?.targetLanguage,
+          customLanguageName: builtLanguageConfig?.customLanguageName,
+          learningPurpose: builtLanguageConfig?.learningPurpose,
+          interestPreferences: builtLanguageConfig?.interestPreferences,
+          inputMode: builtLanguageConfig?.inputMode,
+          topicCount: builtLanguageConfig?.topicCount,
+          targetWordDensity: builtLanguageConfig?.targetWordDensity,
+          expectedRepeatsPerWord: builtLanguageConfig?.expectedRepeatsPerWord,
           existingSlots: newCourse.dailyPlan,
           requireLlm: false,
         });
         newCourse.knowledgeCatalog = generated.knowledgeCatalog;
         newCourse.dailyPlan = generated.dailyPlan;
+        syncCourseVocabCoverage(newCourse);
       }
 
       const { agentPrompt } = await persistCourseToFolder(newCourse, settings);
@@ -3223,6 +4078,22 @@ async function startServer() {
                   ? prev.estimatedMinutes
                   : undefined;
 
+          const vocabById = new Map<string, VocabItem>();
+          for (const w of course.englishConfig?.effectiveWords || []) {
+            if (w.id) vocabById.set(w.id, w);
+          }
+          const nextTargetWordIds = Array.isArray(item.targetWordIds)
+            ? item.targetWordIds.map(String).filter(Boolean)
+            : prev?.targetWordIds;
+          const nextReviewWordIds = Array.isArray(item.reviewWordIds)
+            ? item.reviewWordIds.map(String).filter(Boolean)
+            : prev?.reviewWordIds;
+          const nextAssignedWords = Array.isArray(item.assignedWords)
+            ? item.assignedWords
+            : Array.isArray(nextTargetWordIds) && vocabById.size > 0
+              ? nextTargetWordIds.map((id) => vocabById.get(id)).filter((w): w is VocabItem => Boolean(w))
+              : prev?.assignedWords;
+
           return {
             id: stableId,
             dayIndex,
@@ -3230,6 +4101,14 @@ async function startServer() {
             date: item.date || prev?.date || addDaysToDateString(course.startDate, idx),
             regionId: nextRegionId,
             regionIds: extractedRegions.length > 0 ? extractedRegions : undefined,
+            topicGroup:
+              item.topicGroup !== undefined
+                ? String(item.topicGroup || '').trim() || undefined
+                : prev?.topicGroup,
+            themeId:
+              item.themeId !== undefined
+                ? String(item.themeId || '').trim() || undefined
+                : prev?.themeId,
             title: nextTitle,
             objective: String(item.objective ?? prev?.objective ?? '').trim(),
             prerequisites: Array.isArray(item.prerequisites)
@@ -3238,9 +4117,9 @@ async function startServer() {
             teachingScope: nextTeachingScope,
             connectionNote: String(item.connectionNote ?? prev?.connectionNote ?? '').trim(),
             keyTopics,
-            assignedWords: Array.isArray(item.assignedWords)
-              ? item.assignedWords
-              : prev?.assignedWords,
+            targetWordIds: nextTargetWordIds,
+            reviewWordIds: nextReviewWordIds,
+            assignedWords: nextAssignedWords,
             pdfSegment: matchedSegs[0] || item.pdfSegment || prev?.pdfSegment,
             pdfSegments: matchedSegs.length > 0 ? matchedSegs : item.pdfSegments || prev?.pdfSegments,
             // Never delete already-generated lessons when editing outline!
@@ -3351,7 +4230,17 @@ async function startServer() {
         materials: course.materials,
         pdfSplitPlan: course.pdfSplitPlan,
         effectiveWords: course.englishConfig?.effectiveWords || [],
-        dailyWordCount: course.englishConfig?.dailyWordCount || 20,
+        dailyWordCount:
+          course.englishConfig?.newWordsPerArticle || course.englishConfig?.dailyWordCount || 15,
+        targetLanguage: course.englishConfig?.targetLanguage,
+        customLanguageName: course.englishConfig?.customLanguageName,
+        learningPurpose: course.englishConfig?.learningPurpose,
+        interestPreferences: course.englishConfig?.interestPreferences,
+        inputMode: course.englishConfig?.inputMode,
+        topicCount: course.englishConfig?.topicCount,
+        targetWordDensity: course.englishConfig?.targetWordDensity,
+        expectedRepeatsPerWord: course.englishConfig?.expectedRepeatsPerWord,
+        vocabThemePlan: course.englishConfig?.vocabThemePlan,
         existingSlots: course.dailyPlan,
         pdfAttachments: syllabusPdfAttachments,
         requireLlm: true,
@@ -3711,46 +4600,755 @@ async function startServer() {
     res.sendFile(pdfPath);
   });
 
-  // 8. English Course Vocabulary Re-allocation (random non-repeating, preserving started sections)
+  // 8. Language Course Parameter Update & Vocabulary Re-allocation
   app.post('/api/courses/:courseId/vocab/reallocate', async (req, res) => {
     try {
       const { courseId } = req.params;
-      const { dailyWordCount, preserveStartedSlots = true } = req.body || {};
+      const {
+        dailyWordCount,
+        newWordsPerArticle,
+        targetWordDensity,
+        expectedRepeatsPerWord,
+        topicCount,
+        learningPurpose,
+        interestPreferences,
+        preserveStartedSlots = true,
+        paramsOnly = false,
+        mode,
+      } = req.body || {};
       const db = loadDb();
       const course = db.courses.find((c) => c.id === courseId);
       if (!course || !course.englishConfig) {
-        res.status(404).json({ error: '未找到该英语课程配置' });
+        res.status(404).json({ error: '未找到该语言课程配置' });
         return;
       }
 
-      const nextDailyCount =
-        typeof dailyWordCount === 'number' && dailyWordCount > 0
-          ? Math.min(200, Math.floor(dailyWordCount))
-          : course.englishConfig.dailyWordCount || 20;
+      const nextNewWordsPerArticle =
+        typeof newWordsPerArticle === 'number' && newWordsPerArticle > 0
+          ? Math.min(100, Math.round(newWordsPerArticle))
+          : typeof dailyWordCount === 'number' && dailyWordCount > 0
+            ? Math.min(100, Math.round(dailyWordCount))
+            : course.englishConfig.newWordsPerArticle || course.englishConfig.dailyWordCount || 15;
 
-      course.englishConfig.dailyWordCount = nextDailyCount;
+      course.englishConfig.dailyWordCount = nextNewWordsPerArticle;
+      course.englishConfig.newWordsPerArticle = nextNewWordsPerArticle;
+
+      if (typeof targetWordDensity === 'number' && targetWordDensity > 0) {
+        course.englishConfig.targetWordDensity = Math.max(
+          0.005,
+          Math.min(0.25, targetWordDensity)
+        );
+      }
+      if (typeof expectedRepeatsPerWord === 'number' && expectedRepeatsPerWord >= 1) {
+        course.englishConfig.expectedRepeatsPerWord = Math.min(10, expectedRepeatsPerWord);
+      }
+      if (topicCount !== undefined) {
+        const parsedTopicCount = Number(topicCount);
+        course.englishConfig.topicCount =
+          Number.isFinite(parsedTopicCount) && parsedTopicCount >= 1
+            ? Math.min(50, Math.round(parsedTopicCount))
+            : null;
+      }
+      if (learningPurpose === 'interest' || learningPurpose === 'exam') {
+        course.englishConfig.learningPurpose = learningPurpose;
+      }
+      if (typeof interestPreferences === 'string') {
+        course.englishConfig.interestPreferences = interestPreferences.trim() || undefined;
+      }
+
+      if ((course.englishConfig.effectiveWords || []).length > 0) {
+        const readingStats = computeEnglishReadingPlanStats({
+          effectiveTotal: course.englishConfig.effectiveWords.length,
+          newWordsPerArticle: nextNewWordsPerArticle,
+          targetWordDensity: course.englishConfig.targetWordDensity || 0.04,
+          expectedRepeatsPerWord: course.englishConfig.expectedRepeatsPerWord || 2,
+        });
+        course.englishConfig.estimatedArticleCount = readingStats.estimatedArticleCount;
+        course.englishConfig.estimatedArticleWordLength = readingStats.estimatedArticleWordLength;
+      }
+
       course.englishConfig.lastAllocatedAt = new Date().toISOString();
 
-      const { buckets, coverageStats } = allocateEnglishWordsRandomly({
-        effectiveWords: course.englishConfig.effectiveWords || [],
-        durationDays: Math.max(1, course.dailyPlan.length || course.durationDays),
-        dailyWordCount: nextDailyCount,
-        existingSlots: course.dailyPlan,
-        masteredWords: course.masteredWords || [],
-        preserveStartedSlots: Boolean(preserveStartedSlots),
+      let coverageStats: any = undefined;
+      let reassignedResult: { reassignedCount: number; appendedSectionsCount: number } | undefined;
+
+      if (!paramsOnly) {
+        const hasTopicOutline =
+          course.dailyPlan.some((s) => Boolean(s.targetWordIds && s.targetWordIds.length > 0)) &&
+          Boolean(course.outlineConfirmed);
+        if (mode === 'reassign' || (hasTopicOutline && mode !== 'random')) {
+          const r = reassignVocabWordsToCourse(course, {
+            scope: 'both',
+            appendSupplementarySections: true,
+            wordsPerSection: nextNewWordsPerArticle,
+          });
+          reassignedResult = {
+            reassignedCount: r.reassignedCount,
+            appendedSectionsCount: r.appendedSectionsCount,
+          };
+        } else {
+          const allocated = allocateEnglishWordsRandomly({
+            effectiveWords: assignStableVocabIds(course.englishConfig.effectiveWords || []),
+            durationDays: Math.max(1, course.dailyPlan.length || course.durationDays),
+            dailyWordCount: nextNewWordsPerArticle,
+            existingSlots: course.dailyPlan,
+            masteredWords: course.masteredWords || [],
+            preserveStartedSlots: Boolean(preserveStartedSlots),
+          });
+          coverageStats = allocated.coverageStats;
+
+          for (let i = 0; i < course.dailyPlan.length; i++) {
+            const slot = course.dailyPlan[i];
+            const bucket = allocated.buckets[i] || [];
+            slot.assignedWords = bucket;
+            slot.targetWordIds = bucket.map((w) => w.id!).filter(Boolean);
+            if (!slot.lesson && slot.assignedWords.length > 0) {
+              const sample = slot.assignedWords
+                .slice(0, 3)
+                .map((w) => w.word)
+                .join(', ');
+              slot.title = `第 ${slot.dayIndex} 讲：语境精读与目标词汇 (${sample} 等 ${slot.assignedWords.length} 词)`;
+            }
+          }
+        }
+      }
+
+      const coverage = syncCourseVocabCoverage(course);
+      const settings = loadSettings();
+      await persistCourseToFolder(course, settings);
+      cleanupCourseSegmentPdfs(course, { onlyCompleted: true });
+      saveDb(db);
+
+      res.json({
+        course,
+        coverageStats,
+        coverage,
+        ...(reassignedResult || {}),
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || '更新词汇配置与分配失败' });
+    }
+  });
+
+  // 8b. Reassign unassigned or uncovered target word IDs to pending/supplementary sections
+  app.post('/api/courses/:courseId/vocab/reassign', async (req, res) => {
+    try {
+      const { courseId } = req.params;
+      const {
+        scope = 'both',
+        appendSupplementarySections = true,
+        wordsPerSection,
+      } = req.body || {};
+      const db = loadDb();
+      const course = db.courses.find((c) => c.id === courseId);
+      if (!course || !course.englishConfig) {
+        res.status(404).json({ error: '未找到该语言课程配置' });
+        return;
+      }
+
+      const safeScope: 'unassigned' | 'uncovered' | 'both' =
+        scope === 'unassigned' || scope === 'uncovered' ? scope : 'both';
+      const result = reassignVocabWordsToCourse(course, {
+        scope: safeScope,
+        appendSupplementarySections: Boolean(appendSupplementarySections),
+        wordsPerSection:
+          typeof wordsPerSection === 'number' && wordsPerSection > 0 ? wordsPerSection : undefined,
       });
 
-      for (let i = 0; i < course.dailyPlan.length; i++) {
-        const slot = course.dailyPlan[i];
-        slot.assignedWords = buckets[i] || [];
-        // Update unstarted slot titles to reflect new sample words
-        if (!slot.lesson && slot.assignedWords.length > 0) {
-          const sample = slot.assignedWords
-            .slice(0, 3)
-            .map((w) => w.word)
-            .join(', ');
-          slot.title = `第 ${slot.dayIndex} 讲：英语语境精读与目标词汇 (${sample} 等 ${slot.assignedWords.length} 词)`;
+      const settings = loadSettings();
+      await persistCourseToFolder(course, settings);
+      saveDb(db);
+
+      res.json({
+        course,
+        reassignedCount: result.reassignedCount,
+        appendedSectionsCount: result.appendedSectionsCount,
+        coverage: result.coverage,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || '重新分配目标词汇失败' });
+    }
+  });
+
+  // 8c. Manually verify or reject an uncertain/homograph vocabulary match in a section
+  app.post('/api/courses/:courseId/vocab-coverage/verify', async (req, res) => {
+    try {
+      const { courseId } = req.params;
+      const { sectionId, wordId, status, reviewer = 'manual', reason } = req.body || {};
+      if (!sectionId || !wordId || (status !== 'confirmed' && status !== 'rejected' && status !== 'reset')) {
+        res.status(400).json({ error: '缺少有效的 sectionId、wordId 或 status 参数' });
+        return;
+      }
+
+      const db = loadDb();
+      const course = db.courses.find((c) => c.id === courseId);
+      if (!course || !course.englishConfig) {
+        res.status(404).json({ error: '未找到该语言课程配置' });
+        return;
+      }
+
+      const coverage = setVocabManualVerification({
+        course,
+        sectionId: String(sectionId),
+        wordId: String(wordId),
+        status,
+        reviewer: reviewer === 'ai' ? 'ai' : 'manual',
+        reason: typeof reason === 'string' ? reason.trim() : undefined,
+      });
+
+      const settings = loadSettings();
+      await persistCourseToFolder(course, settings);
+      saveDb(db);
+
+      res.json({ course, coverage });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || '更新词汇语义确认状态失败' });
+    }
+  });
+
+  // 8d. Build AI semantic verification prompt for uncertain/homograph matches (for Chat/Agent)
+  app.get('/api/courses/:courseId/vocab-coverage/review-prompt', (req, res) => {
+    const { courseId } = req.params;
+    const sectionId =
+      typeof req.query.sectionId === 'string' && req.query.sectionId.trim()
+        ? req.query.sectionId.trim()
+        : undefined;
+    const db = loadDb();
+    const course = db.courses.find((c) => c.id === courseId);
+    if (!course || !course.englishConfig) {
+      res.status(404).json({ error: '未找到该语言课程配置' });
+      return;
+    }
+
+    const result = buildVocabSemanticReviewPrompt(course, sectionId);
+    res.json(result);
+  });
+
+  // 8e. Run AI semantic review (API mode) or apply imported AI review JSON
+  app.post('/api/courses/:courseId/vocab-coverage/ai-review', async (req, res) => {
+    try {
+      const { courseId } = req.params;
+      const { sectionId, reviews } = req.body || {};
+      const db = loadDb();
+      const course = db.courses.find((c) => c.id === courseId);
+      if (!course || !course.englishConfig) {
+        res.status(404).json({ error: '未找到该语言课程配置' });
+        return;
+      }
+
+      let reviewItems: Array<{
+        sectionId: string;
+        wordId: string;
+        status: 'confirmed' | 'rejected';
+        reason?: string;
+      }> = [];
+
+      if (Array.isArray(reviews)) {
+        reviewItems = reviews.filter(
+          (r: any) =>
+            r &&
+            typeof r.sectionId === 'string' &&
+            typeof r.wordId === 'string' &&
+            (r.status === 'confirmed' || r.status === 'rejected')
+        );
+      } else {
+        const { prompt, pendingItems } = buildVocabSemanticReviewPrompt(
+          course,
+          typeof sectionId === 'string' && sectionId.trim() ? sectionId.trim() : undefined
+        );
+        if (pendingItems.length === 0) {
+          res.json({
+            course,
+            coverage: syncCourseVocabCoverage(course),
+            appliedCount: 0,
+          });
+          return;
         }
+        const llmResp = await callLlmJson<{
+          reviews?: Array<{
+            sectionId: string;
+            wordId: string;
+            status: 'confirmed' | 'rejected';
+            reason?: string;
+          }>;
+        }>({
+          systemInstruction:
+            '你是语言教学语义复核助手。请根据目标词释义与文章原句语境判断该词在正文中是否表达了目标词义，仅返回合法 JSON。',
+          userPrompt: prompt,
+        });
+        reviewItems = Array.isArray(llmResp?.reviews) ? llmResp.reviews : [];
+      }
+
+      let appliedCount = 0;
+      for (const r of reviewItems) {
+        if (!r || !r.sectionId || !r.wordId) continue;
+        if (r.status !== 'confirmed' && r.status !== 'rejected') continue;
+        setVocabManualVerification({
+          course,
+          sectionId: r.sectionId,
+          wordId: r.wordId,
+          status: r.status,
+          reviewer: 'ai',
+          reason: typeof r.reason === 'string' ? r.reason.trim() : undefined,
+        });
+        appliedCount++;
+      }
+
+      const coverage = syncCourseVocabCoverage(course);
+      const settings = loadSettings();
+      await persistCourseToFolder(course, settings);
+      saveDb(db);
+
+      res.json({ course, coverage, appliedCount });
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'AI 语义复核失败' });
+    }
+  });
+
+  // 8f. Language Vocab Theme Planning & Semantic Allocation (Step 1A / 1B / 1C)
+  app.get('/api/courses/:courseId/vocab-plan/info', (req, res) => {
+    const { courseId } = req.params;
+    const db = loadDb();
+    const course = db.courses.find((c) => c.id === courseId);
+    if (!course || course.category !== 'english' || !course.englishConfig) {
+      res.status(404).json({ error: '未找到该语言课程配置' });
+      return;
+    }
+
+    const { absCourseDir, relCourseDir } = getCourseDirectory(course);
+    const sourcesDir = path.join(absCourseDir, 'sources');
+    fs.mkdirSync(sourcesDir, { recursive: true });
+    const compactPath = path.join(sourcesDir, 'vocabulary-compact.txt');
+    const effectiveWords = assignStableVocabIds(course.englishConfig.effectiveWords || []);
+    course.englishConfig.effectiveWords = effectiveWords;
+    if (effectiveWords.length > 0 && !fs.existsSync(compactPath)) {
+      fs.writeFileSync(compactPath, buildCompactVocabText(effectiveWords), 'utf-8');
+    }
+
+    const rawBatchSize = Number(req.query.batchSize);
+    const batchSize =
+      Number.isFinite(rawBatchSize) && rawBatchSize > 0
+        ? Math.max(20, Math.min(5000, Math.round(rawBatchSize)))
+        : 500;
+    const includeLocal =
+      req.query.includeLocal === 'true' || req.query.includeLocal === '1';
+
+    const plan: VocabThemePlan = course.englishConfig.vocabThemePlan || {
+      themes: [],
+      wordThemes: {},
+      interleaveThemes: true,
+    };
+
+    const progress = getVocabThemeMappingProgress(
+      effectiveWords,
+      plan.themes || [],
+      plan.wordThemes || {}
+    );
+    const nextBatch = getNextMappingBatch(effectiveWords, plan.wordThemes || {}, {
+      batchSize,
+      includeLocal,
+    });
+
+    const themeChat = buildVocabThemePlanningPrompt({
+      course,
+      mode: 'chat',
+      courseRelDir: relCourseDir,
+    });
+    const themeAgent = buildVocabThemePlanningPrompt({
+      course,
+      mode: 'agent',
+      courseRelDir: relCourseDir,
+    });
+    const themeApi = buildVocabThemePlanningPrompt({
+      course,
+      mode: 'api',
+      courseRelDir: relCourseDir,
+    });
+
+    let wordMappingPrompts: {
+      chatBatchPrompt: string;
+      chatFilePrompt: string;
+      agentPrompt: string;
+      batchWordIds: string[];
+      batchIndex: number;
+      totalBatches: number;
+      totalRemaining: number;
+      remainingAfterBatch: number;
+    } = {
+      chatBatchPrompt: '',
+      chatFilePrompt: '',
+      agentPrompt: '',
+      batchWordIds: [],
+      batchIndex: nextBatch.batchIndex,
+      totalBatches: nextBatch.totalBatches,
+      totalRemaining: nextBatch.totalRemaining,
+      remainingAfterBatch: nextBatch.remainingAfterBatch,
+    };
+
+    if (effectiveWords.length > 0 && (plan.themes || []).length > 0) {
+      const chatBatch = buildVocabWordMappingPrompt({
+        course,
+        themes: plan.themes,
+        batchWords: nextBatch.batchWords,
+        batchIndex: nextBatch.batchIndex,
+        totalBatches: nextBatch.totalBatches,
+        mode: 'chat',
+        fullFileMode: false,
+        courseRelDir: relCourseDir,
+      });
+      const chatFile = buildVocabWordMappingPrompt({
+        course,
+        themes: plan.themes,
+        batchWords: nextBatch.batchWords,
+        batchIndex: nextBatch.batchIndex,
+        totalBatches: nextBatch.totalBatches,
+        mode: 'chat',
+        fullFileMode: true,
+        courseRelDir: relCourseDir,
+      });
+      const agentMap = buildVocabWordMappingPrompt({
+        course,
+        themes: plan.themes,
+        batchWords: [],
+        batchIndex: 1,
+        totalBatches: 1,
+        mode: 'agent',
+        courseRelDir: relCourseDir,
+      });
+      wordMappingPrompts = {
+        chatBatchPrompt: nextBatch.batchWords.length > 0 ? chatBatch.userPrompt : '',
+        chatFilePrompt: chatFile.userPrompt,
+        agentPrompt: agentMap.userPrompt,
+        batchWordIds: nextBatch.batchWords.map((w) => w.id!).filter(Boolean),
+        batchIndex: nextBatch.batchIndex,
+        totalBatches: nextBatch.totalBatches,
+        totalRemaining: nextBatch.totalRemaining,
+        remainingAfterBatch: nextBatch.remainingAfterBatch,
+      };
+    }
+
+    res.json({
+      vocabThemePlan: plan,
+      progress,
+      themePlanningPrompts: {
+        chatPrompt: themeChat.userPrompt,
+        agentPrompt: themeAgent.userPrompt,
+        apiSystemPrompt: themeApi.systemPrompt,
+        apiUserPrompt: themeApi.userPrompt,
+      },
+      wordMappingPrompts,
+      compactVocabRelPath: 'sources/vocabulary-compact.txt',
+    });
+  });
+
+  app.post('/api/courses/:courseId/vocab-plan/themes', async (req, res) => {
+    try {
+      const { courseId } = req.params;
+      const { action, rawContent, themes: rawThemesInput, topicCount } = req.body || {};
+      const db = loadDb();
+      const course = db.courses.find((c) => c.id === courseId);
+      if (!course || course.category !== 'english' || !course.englishConfig) {
+        res.status(404).json({ error: '未找到该语言课程配置' });
+        return;
+      }
+
+      if (topicCount !== undefined) {
+        const parsedN = Number(topicCount);
+        course.englishConfig.topicCount =
+          Number.isFinite(parsedN) && parsedN >= 1 ? Math.min(50, Math.round(parsedN)) : null;
+      }
+
+      const effectiveWords = assignStableVocabIds(course.englishConfig.effectiveWords || []);
+      course.englishConfig.effectiveWords = effectiveWords;
+      const { relCourseDir } = getCourseDirectory(course);
+
+      let nextThemes;
+      if (action === 'generate_api') {
+        const prompts = buildVocabThemePlanningPrompt({
+          course,
+          mode: 'api',
+          courseRelDir: relCourseDir,
+        });
+        const llmRes = await callLlmJson<any>({
+          systemInstruction: prompts.systemPrompt,
+          userPrompt: prompts.userPrompt,
+        });
+        nextThemes = parseImportedVocabThemes(JSON.stringify(llmRes || {}));
+      } else if (action === 'import') {
+        nextThemes = parseImportedVocabThemes(String(rawContent || ''));
+      } else if (action === 'save') {
+        nextThemes = normalizeVocabThemes(Array.isArray(rawThemesInput) ? rawThemesInput : []);
+        if (nextThemes.length === 0) {
+          res.status(400).json({ error: '请至少保留 1 个有效课程主题' });
+          return;
+        }
+      } else {
+        res.status(400).json({ error: '不支持的主题操作类型' });
+        return;
+      }
+
+      const validThemeSet = new Set(nextThemes.map((t) => t.id));
+      const existingPlan = course.englishConfig.vocabThemePlan;
+      const prunedWordThemes: Record<string, VocabWordThemeMapping> = {};
+      if (existingPlan?.wordThemes) {
+        for (const [wid, entry] of Object.entries(existingPlan.wordThemes)) {
+          const validIds = (entry.themeIds || []).filter((tid) => validThemeSet.has(tid));
+          if (validIds.length > 0) {
+            prunedWordThemes[wid] = { ...entry, themeIds: validIds };
+          }
+        }
+      }
+
+      course.englishConfig.vocabThemePlan = {
+        themes: nextThemes,
+        wordThemes: prunedWordThemes,
+        interleaveThemes: existingPlan?.interleaveThemes ?? true,
+        lastThemesUpdatedAt: new Date().toISOString(),
+        lastMappingUpdatedAt: existingPlan?.lastMappingUpdatedAt,
+        lastAllocatedAt: existingPlan?.lastAllocatedAt,
+        allocationSummary: existingPlan?.allocationSummary,
+      };
+
+      const settings = loadSettings();
+      await persistCourseToFolder(course, settings);
+      saveDb(db);
+
+      res.json({ course, themes: nextThemes });
+    } catch (err: any) {
+      res.status(400).json({ error: err?.message || '规划或保存课程主题失败' });
+    }
+  });
+
+  app.post('/api/courses/:courseId/vocab-plan/map', async (req, res) => {
+    try {
+      const { courseId } = req.params;
+      const {
+        action,
+        rawContent,
+        batchSize = 220,
+        maxBatches = 1,
+        includeLocal = false,
+        mode = 'confident_only',
+        overwriteExisting = false,
+        scope = 'all',
+      } = req.body || {};
+
+      const db = loadDb();
+      const course = db.courses.find((c) => c.id === courseId);
+      if (!course || course.category !== 'english' || !course.englishConfig) {
+        res.status(404).json({ error: '未找到该语言课程配置' });
+        return;
+      }
+
+      const plan = course.englishConfig.vocabThemePlan;
+      if (!plan || !Array.isArray(plan.themes) || plan.themes.length === 0) {
+        res.status(400).json({ error: '请先在步骤 1A 中规划并保存课程主题，再执行词汇归类' });
+        return;
+      }
+
+      const effectiveWords = assignStableVocabIds(course.englishConfig.effectiveWords || []);
+      course.englishConfig.effectiveWords = effectiveWords;
+      const currentWordThemes: Record<string, VocabWordThemeMapping> = {
+        ...(plan.wordThemes || {}),
+      };
+      const settings = loadSettings();
+      const { relCourseDir } = getCourseDirectory(course);
+
+      if (action === 'import') {
+        const parsed = parseImportedWordThemeMappings(
+          String(rawContent || ''),
+          effectiveWords,
+          plan.themes,
+          'ai'
+        );
+        if (parsed.acceptedWordCount === 0) {
+          res.status(400).json({
+            error: '未能识别到有效的词条与主题 ID 映射，请检查词条 ID（如 w-0001）与主题 ID（如 T01）。',
+          });
+          return;
+        }
+        const merged = { ...currentWordThemes, ...parsed.mappings };
+        plan.wordThemes = merged;
+        plan.lastMappingUpdatedAt = new Date().toISOString();
+        await persistCourseToFolder(course, settings);
+        saveDb(db);
+        const progress = getVocabThemeMappingProgress(effectiveWords, plan.themes, merged);
+        res.json({
+          course,
+          importedCount: parsed.acceptedWordCount,
+          ignoredEntriesCount: parsed.ignoredEntriesCount,
+          totalMappedCount: progress.totalMappedCount,
+          remainingCount: progress.unmappedWordIds.length,
+        });
+        return;
+      }
+
+      if (action === 'generate_api') {
+        const safeBatchSize = Math.max(20, Math.min(400, Math.round(Number(batchSize) || 220)));
+        const safeMaxBatches = Math.max(1, Math.min(10, Math.round(Number(maxBatches) || 1)));
+        let batchesProcessed = 0;
+        let batchMappedCount = 0;
+        let workingMap = { ...currentWordThemes };
+
+        for (let b = 0; b < safeMaxBatches; b++) {
+          const batchInfo = getNextMappingBatch(effectiveWords, workingMap, {
+            batchSize: safeBatchSize,
+            includeLocal: Boolean(includeLocal),
+          });
+          if (batchInfo.batchWords.length === 0) break;
+
+          const prompt = buildVocabWordMappingPrompt({
+            course,
+            themes: plan.themes,
+            batchWords: batchInfo.batchWords,
+            batchIndex: batchInfo.batchIndex,
+            totalBatches: batchInfo.totalBatches,
+            mode: 'api',
+            courseRelDir: relCourseDir,
+          });
+          const llmRes = await callLlmJson<any>({
+            systemInstruction: prompt.systemPrompt,
+            userPrompt: prompt.userPrompt,
+          });
+          const parsed = parseImportedWordThemeMappings(
+            JSON.stringify(llmRes || {}),
+            batchInfo.batchWords,
+            plan.themes,
+            'ai'
+          );
+          if (parsed.acceptedWordCount === 0) {
+            throw new Error('API 语义归类本批未返回有效的主题映射 JSON');
+          }
+          workingMap = { ...workingMap, ...parsed.mappings };
+          plan.wordThemes = workingMap;
+          plan.lastMappingUpdatedAt = new Date().toISOString();
+          batchesProcessed++;
+          batchMappedCount += parsed.acceptedWordCount;
+          await persistCourseToFolder(course, settings);
+          saveDb(db);
+        }
+
+        const progress = getVocabThemeMappingProgress(effectiveWords, plan.themes, workingMap);
+        res.json({
+          course,
+          batchMappedCount,
+          totalMappedCount: progress.totalMappedCount,
+          remainingCount: progress.unmappedWordIds.length,
+          batchesProcessed,
+        });
+        return;
+      }
+
+      if (action === 'local_pretag') {
+        const localMode = mode === 'fill_remaining' ? 'fill_remaining' : 'confident_only';
+        const localRes = matchWordsToThemesLocally(effectiveWords, plan.themes, currentWordThemes, {
+          mode: localMode,
+          overwriteExisting: Boolean(overwriteExisting),
+        });
+        plan.wordThemes = localRes.mappings;
+        plan.lastMappingUpdatedAt = new Date().toISOString();
+        await persistCourseToFolder(course, settings);
+        saveDb(db);
+        const progress = getVocabThemeMappingProgress(effectiveWords, plan.themes, localRes.mappings);
+        res.json({
+          course,
+          matchedCount: localRes.matchedCount,
+          fallbackCount: localRes.fallbackCount,
+          totalMappedCount: progress.totalMappedCount,
+          remainingCount: progress.unmappedWordIds.length,
+        });
+        return;
+      }
+
+      if (action === 'clear') {
+        if (scope === 'local') {
+          const kept: Record<string, VocabWordThemeMapping> = {};
+          for (const [wid, entry] of Object.entries(currentWordThemes)) {
+            if (entry.source !== 'local') kept[wid] = entry;
+          }
+          plan.wordThemes = kept;
+        } else {
+          plan.wordThemes = {};
+        }
+        plan.lastMappingUpdatedAt = new Date().toISOString();
+        await persistCourseToFolder(course, settings);
+        saveDb(db);
+        res.json({ course });
+        return;
+      }
+
+      res.status(400).json({ error: '不支持的词条映射操作类型' });
+    } catch (err: any) {
+      res.status(400).json({ error: err?.message || '词汇主题映射失败' });
+    }
+  });
+
+  app.post('/api/courses/:courseId/vocab-plan/allocate', async (req, res) => {
+    try {
+      const { courseId } = req.params;
+      const {
+        newWordsPerArticle,
+        totalArticles,
+        targetWordDensity,
+        expectedRepeatsPerWord,
+        interleaveThemes = true,
+        preserveStartedSlots = true,
+        fallbackUnmapped = true,
+        confirmOutline = false,
+      } = req.body || {};
+
+      const db = loadDb();
+      const course = db.courses.find((c) => c.id === courseId);
+      if (!course || course.category !== 'english' || !course.englishConfig) {
+        res.status(404).json({ error: '未找到该语言课程配置' });
+        return;
+      }
+
+      const plan = course.englishConfig.vocabThemePlan;
+      if (!plan || !Array.isArray(plan.themes) || plan.themes.length === 0) {
+        res.status(400).json({ error: '请先在步骤 1A 中规划课程主题并保存到本地' });
+        return;
+      }
+
+      if (typeof newWordsPerArticle === 'number' && newWordsPerArticle > 0) {
+        const clampedNew = Math.max(1, Math.min(100, Math.round(newWordsPerArticle)));
+        course.englishConfig.newWordsPerArticle = clampedNew;
+        course.englishConfig.dailyWordCount = clampedNew;
+      }
+      if (typeof targetWordDensity === 'number' && targetWordDensity > 0) {
+        course.englishConfig.targetWordDensity = Math.max(0.005, Math.min(0.25, targetWordDensity));
+      }
+      if (typeof expectedRepeatsPerWord === 'number' && expectedRepeatsPerWord >= 1) {
+        course.englishConfig.expectedRepeatsPerWord = Math.min(10, expectedRepeatsPerWord);
+      }
+
+      const effectiveWords = assignStableVocabIds(course.englishConfig.effectiveWords || []);
+      if (effectiveWords.length > 0) {
+        const stats = computeEnglishReadingPlanStats({
+          effectiveTotal: effectiveWords.length,
+          newWordsPerArticle:
+            course.englishConfig.newWordsPerArticle || course.englishConfig.dailyWordCount || 15,
+          targetWordDensity: course.englishConfig.targetWordDensity || 0.04,
+          expectedRepeatsPerWord: course.englishConfig.expectedRepeatsPerWord || 2,
+        });
+        course.englishConfig.estimatedArticleCount = stats.estimatedArticleCount;
+        course.englishConfig.estimatedArticleWordLength = stats.estimatedArticleWordLength;
+      } else if (typeof totalArticles === 'number' && totalArticles > 0) {
+        course.englishConfig.estimatedArticleCount = Math.max(1, Math.min(200, Math.round(totalArticles)));
+      }
+
+      const alloc = allocateVocabByThemes(course, plan, {
+        newWordsPerArticle:
+          course.englishConfig.newWordsPerArticle || course.englishConfig.dailyWordCount || 15,
+        totalArticles:
+          typeof totalArticles === 'number' && totalArticles > 0 ? Math.round(totalArticles) : undefined,
+        interleaveThemes: Boolean(interleaveThemes),
+        preserveStartedSlots: Boolean(preserveStartedSlots),
+        fallbackUnmapped: Boolean(fallbackUnmapped),
+      });
+
+      if (confirmOutline === true) {
+        course.outlineConfirmed = true;
       }
 
       const settings = loadSettings();
@@ -3760,10 +5358,12 @@ async function startServer() {
 
       res.json({
         course,
-        coverageStats,
+        summary: alloc.summary,
+        coverage: alloc.coverage,
+        totalSections: alloc.totalSections,
       });
     } catch (err: any) {
-      res.status(500).json({ error: err?.message || '重新随机分配词汇失败' });
+      res.status(400).json({ error: err?.message || '按主题语义分配小节失败' });
     }
   });
 
@@ -3892,6 +5492,8 @@ async function startServer() {
           fs.writeFileSync(path.join(absCourseDir, 'outline.json'), item.content, 'utf-8');
         } else if (baseName === 'split-plan.json') {
           fs.writeFileSync(path.join(segmentsDir, 'split-plan.json'), item.content, 'utf-8');
+        } else if (baseName === 'vocab-theme-plan.json') {
+          fs.writeFileSync(path.join(segmentsDir, 'vocab-theme-plan.json'), item.content, 'utf-8');
         } else {
           fs.writeFileSync(path.join(lessonsDir, baseName), item.content, 'utf-8');
         }
@@ -3907,6 +5509,7 @@ async function startServer() {
       importedDays: syncResult.importedDays,
       syllabusUpdated: syncResult.syllabusUpdated,
       splitPlanUpdated: syncResult.splitPlanUpdated,
+      vocabThemePlanUpdated: syncResult.vocabThemePlanUpdated,
     });
   });
 
@@ -4012,7 +5615,35 @@ async function startServer() {
             caption: d.caption || '',
           }));
 
-    const stage2Prompt =
+    const simplifyQueryRaw = String(req.query.simplifySynonyms ?? '').trim().toLowerCase();
+    const allowSynonymReplacement =
+      simplifyQueryRaw === '1' || simplifyQueryRaw === 'true'
+        ? true
+        : simplifyQueryRaw === '0' || simplifyQueryRaw === 'false'
+          ? false
+          : isWeakBaselineForVocabSimplification(course);
+
+    const englishAssociatedVocabStats =
+      course.category === 'english' && stageBaseLesson?.englishPayload
+        ? computeSectionAssociatedVocabStats(course, enrichedSlot, stageBaseLesson)
+        : undefined;
+    const markedBankWords = getMarkedVocabBankWords(settings);
+    const pendingWordGlosses =
+      course.category === 'english' && stageBaseLesson?.englishPayload
+        ? extractPendingGlossWordsForSection(
+            course,
+            enrichedSlot,
+            stageBaseLesson,
+            markedBankWords
+          )
+        : [];
+    const shouldOfferEnglishStep2 =
+      course.category === 'english' &&
+      Boolean(stageBaseLesson?.englishPayload) &&
+      (pendingWordGlosses.length > 0 ||
+        (allowSynonymReplacement && (englishAssociatedVocabStats?.associatedWordCount || 0) > 0));
+
+    let stage2Prompt =
       allStageDiagramSpecs.length > 0
         ? buildLessonStage2DiagramsPrompt({
             courseName: course.name,
@@ -4020,6 +5651,17 @@ async function startServer() {
             diagramSpecs: allStageDiagramSpecs,
           })
         : '';
+    if (shouldOfferEnglishStep2 && stageBaseLesson) {
+      stage2Prompt = buildEnglishStage2WordGlossPrompt({
+        course,
+        slot: enrichedSlot,
+        lesson: stageBaseLesson,
+        pendingWords: pendingWordGlosses,
+        allowSynonymReplacement,
+        mode: 'chat',
+      }).userPrompt;
+    }
+
     let stage2PromptMdRelPath = '';
     if (stage2Prompt) {
       stage2PromptMdRelPath = `prompts/${secId}-stage2-prompt.md`;
@@ -4038,7 +5680,7 @@ async function startServer() {
     fs.writeFileSync(path.join(secPromptDir, 'agent-stage1-prompt.md'), agentStage1Prompt, 'utf-8');
     fs.writeFileSync(path.join(promptsDir, `${secId}-agent-stage1-prompt.md`), agentStage1Prompt, 'utf-8');
 
-    const agentStage2Prompt =
+    let agentStage2Prompt =
       allStageDiagramSpecs.length > 0
         ? buildAgentSectionStagePrompt({
             course,
@@ -4049,6 +5691,18 @@ async function startServer() {
             diagramSpecs: allStageDiagramSpecs,
           })
         : '';
+    if (shouldOfferEnglishStep2 && stageBaseLesson) {
+      agentStage2Prompt = buildAgentSectionStagePrompt({
+        course,
+        slot: enrichedSlot,
+        workspaceDir: relCourseDir,
+        stage: 'stage2',
+        teachingSystemPrompt,
+        allowSynonymReplacement,
+        pendingWords: pendingWordGlosses,
+      });
+    }
+
     let agentStage2PromptMdRelPath = '';
     if (agentStage2Prompt) {
       agentStage2PromptMdRelPath = `prompts/${secId}-agent-stage2-prompt.md`;
@@ -4069,6 +5723,9 @@ async function startServer() {
       agentStage2PromptMdRelPath,
       pendingDiagramSpecs,
       allStageDiagramSpecs,
+      pendingWordGlosses,
+      englishAssociatedVocabStats,
+      allowSynonymReplacement,
       hasStage1Draft: Boolean(slot.stage1Draft),
       hasFinalLesson: Boolean(slot.lesson),
       syllabusPrompt,
@@ -4236,6 +5893,178 @@ async function startServer() {
     }
   });
 
+  // 13b. English reading Step 2: contextual word glosses, weak-baseline synonym simplification, and associated vocab recount
+  app.post('/api/courses/:courseId/days/:dayIndex/word-glosses', async (req, res) => {
+    try {
+      const { courseId, dayIndex } = req.params;
+      const dayNum = Number(dayIndex);
+      const {
+        action = 'import',
+        rawContent = '',
+        allowSynonymReplacement,
+      } = req.body || {};
+
+      const db = loadDb();
+      const course = db.courses.find((c) => c.id === courseId);
+      if (!course) {
+        res.status(404).json({ error: '未找到该课程' });
+        return;
+      }
+      const slot = course.dailyPlan.find((d) => d.dayIndex === dayNum);
+      if (!slot) {
+        res.status(404).json({ error: '未找到指定小节计划' });
+        return;
+      }
+      const baseLesson = slot.lesson || slot.stage1Draft;
+      if (!baseLesson?.englishPayload) {
+        res.status(400).json({ error: '当前小节尚未生成英文阅读文章（Step 1），无法执行 Step 2 补充词义。' });
+        return;
+      }
+
+      const allowSynonym =
+        typeof allowSynonymReplacement === 'boolean'
+          ? allowSynonymReplacement
+          : isWeakBaselineForVocabSimplification(course);
+      const settings = loadSettings();
+      const markedBankWords = getMarkedVocabBankWords(settings);
+
+      if (action === 'recount') {
+        const synced = applyStep2EnglishEnhancementToLesson({
+          course,
+          slot,
+          lesson: baseLesson,
+          parsed: {
+            extraWordGlosses: [],
+            paragraphUpdates: [],
+            fullParagraphs: [],
+            synonymReplacements: [],
+          },
+          allowSynonymReplacement: allowSynonym,
+        });
+        slot.lesson = sanitizeLessonCitations(synced.lesson);
+        syncCourseVocabCoverage(course);
+        await persistCourseToFolder(course, settings);
+        saveDb(db);
+        const pendingWordGlosses = extractPendingGlossWordsForSection(
+          course,
+          slot,
+          slot.lesson,
+          markedBankWords
+        );
+        res.json({
+          course,
+          lesson: slot.lesson,
+          beforeStats: synced.beforeStats,
+          afterStats: synced.afterStats,
+          pendingWordGlosses,
+        });
+        return;
+      }
+
+      if (action === 'generate_api') {
+        const apiRes = await runEnglishStep2ViaApi(course, slot, baseLesson, {
+          allowSynonymReplacement: allowSynonym,
+        });
+        slot.lesson = {
+          ...apiRes.lesson,
+          sectionId: ensureStableSectionId(slot.dayIndex, slot.id),
+          dayIndex: slot.dayIndex,
+          date: slot.date,
+          generationStage: 'complete',
+        };
+        backfillMarkedVocabBankMeanings(
+          settings,
+          slot.lesson.englishPayload?.extraWordGlosses || []
+        );
+        syncCourseVocabCoverage(course);
+        await persistCourseToFolder(course, settings);
+        saveDb(db);
+        const pendingWordGlosses = extractPendingGlossWordsForSection(
+          course,
+          slot,
+          slot.lesson,
+          getMarkedVocabBankWords(settings)
+        );
+        res.json({
+          course,
+          lesson: slot.lesson,
+          beforeStats: apiRes.beforeStats,
+          afterStats: apiRes.afterStats,
+          appliedReplacementsCount: apiRes.appliedReplacementsCount,
+          pendingWordGlosses,
+        });
+        return;
+      }
+
+      // action === 'import'
+      const rawText = String(rawContent || '').trim();
+      if (!rawText) {
+        res.status(400).json({ error: '导入的 Step 2 补词内容为空，请粘贴 JSON 或逐行词义结果。' });
+        return;
+      }
+      const pendingBefore = extractPendingGlossWordsForSection(
+        course,
+        slot,
+        baseLesson,
+        markedBankWords
+      );
+      const parsed = parseImportedStep2EnglishOutput(rawText, pendingBefore);
+      if (
+        parsed.extraWordGlosses.length === 0 &&
+        parsed.paragraphUpdates.length === 0 &&
+        parsed.fullParagraphs.length === 0 &&
+        parsed.synonymReplacements.length === 0
+      ) {
+        res.status(400).json({
+          error:
+            '未能从内容中识别出 Step 2 词义（extraWordGlosses / word|meaning 行）或段落同义替换结果，请检查格式后重试。',
+        });
+        return;
+      }
+
+      const applied = applyStep2EnglishEnhancementToLesson({
+        course,
+        slot,
+        lesson: baseLesson,
+        parsed,
+        allowSynonymReplacement: allowSynonym,
+      });
+      slot.lesson = sanitizeLessonCitations({
+        ...applied.lesson,
+        sectionId: ensureStableSectionId(slot.dayIndex, slot.id),
+        dayIndex: slot.dayIndex,
+        date: slot.date,
+        generationStage: 'complete',
+      });
+      backfillMarkedVocabBankMeanings(
+        settings,
+        slot.lesson.englishPayload?.extraWordGlosses || []
+      );
+      syncCourseVocabCoverage(course);
+      await persistCourseToFolder(course, settings);
+      saveDb(db);
+      const pendingWordGlosses = extractPendingGlossWordsForSection(
+        course,
+        slot,
+        slot.lesson,
+        getMarkedVocabBankWords(settings)
+      );
+      res.json({
+        course,
+        lesson: slot.lesson,
+        beforeStats: applied.beforeStats,
+        afterStats: applied.afterStats,
+        addedGlossCount: applied.addedGlossCount,
+        appliedParagraphEditCount: applied.appliedParagraphEditCount,
+        rejectedParagraphEdits: applied.rejectedParagraphEdits,
+        appliedReplacements: applied.appliedReplacements,
+        pendingWordGlosses,
+      });
+    } catch (err: any) {
+      res.status(400).json({ error: err?.message || '处理 Step 2 单词释义与关联生词统计失败' });
+    }
+  });
+
   // 14. Import Chat/Agent Syllabus JSON into course without overwriting existing lessons
   app.post('/api/courses/:courseId/import-syllabus', async (req, res) => {
     try {
@@ -4281,7 +6110,7 @@ async function startServer() {
   app.put('/api/courses/:courseId/days/:dayIndex/lesson', async (req, res) => {
     const { courseId, dayIndex } = req.params;
     const dayNum = Number(dayIndex);
-    const { title, summary, markdownBody, uploadedAssets = {} } = req.body || {};
+    const { title, summary, markdownBody, englishPayload, uploadedAssets = {} } = req.body || {};
 
     const db = loadDb();
     const course = db.courses.find((c) => c.id === courseId);
@@ -4312,6 +6141,9 @@ async function startServer() {
     }
     if (typeof markdownBody === 'string') {
       slot.lesson.markdownBody = stripAiCitationArtifacts(markdownBody);
+    }
+    if (englishPayload && typeof englishPayload === 'object') {
+      slot.lesson.englishPayload = englishPayload;
     }
 
     slot.lesson = resolveLessonAssetReferences(
@@ -4566,7 +6398,7 @@ async function startServer() {
   // 18. Save offline-graded exercise submission (prefer sectionId key when supplied so multi-section days stay isolated)
   app.post('/api/courses/:courseId/exercises', async (req, res) => {
     const { courseId } = req.params;
-    const { sectionId, date, userAnswers, score, total } = req.body || {};
+    const { sectionId, date, userAnswers, selfUnderstoodIds, score, total } = req.body || {};
     const db = loadDb();
     const course = db.courses.find((c) => c.id === courseId);
     if (!course) {
@@ -4579,10 +6411,16 @@ async function startServer() {
       res.status(400).json({ error: '缺少 sectionId 或 date 参数' });
       return;
     }
+    const cleanUnderstood = Array.isArray(selfUnderstoodIds)
+      ? Array.from(new Set(selfUnderstoodIds.map(String).filter(Boolean)))
+      : undefined;
     const record = {
       sectionId: cleanSectionId,
       date: typeof date === 'string' ? date : undefined,
       userAnswers: userAnswers || {},
+      ...(cleanUnderstood && cleanUnderstood.length > 0
+        ? { selfUnderstoodIds: cleanUnderstood }
+        : {}),
       score: Number(score) || 0,
       total: Number(total) || 0,
       submittedAt: new Date().toISOString(),
@@ -4684,7 +6522,13 @@ async function startServer() {
     }
     try {
       const pyRes = await callPythonJson('/api/py/health');
-      res.status(pyRes.status).json(pyRes.data);
+      const pyData =
+        pyRes.data && typeof pyRes.data === 'object' ? (pyRes.data as Record<string, any>) : {};
+      res.status(pyRes.status).json({
+        ...pyData,
+        nodePid: process.pid,
+        pythonPid: managedPythonProcess?.pid ?? pyData.pid ?? null,
+      });
     } catch (err: any) {
       res.status(503).json({ ok: false, error: err?.message || 'Python 后端连接失败' });
     }
@@ -4906,12 +6750,20 @@ async function startServer() {
             }
           }
         } else if (delRel.startsWith('lessons/')) {
-          const stem = path.basename(delRel).replace(/\.(json|md)$/i, '');
+          const baseName = path.basename(delRel);
+          const isStage1 = /\.stage1\.json$/i.test(baseName);
+          const stem = baseName.replace(/(?:\.stage1)?\.(json|md)$/i, '');
           const dayMatch = stem.match(/^(?:sec|day)-0*(\d+)$/i);
           const dayNum = dayMatch ? Number(dayMatch[1]) : NaN;
           for (const slot of course.dailyPlan) {
             if (slot.id === stem || (!Number.isNaN(dayNum) && slot.dayIndex === dayNum)) {
-              slot.lesson = undefined;
+              if (isStage1) {
+                slot.stage1Draft = undefined;
+              } else {
+                slot.lesson = undefined;
+                slot.stage1Draft = undefined;
+                slot.estimatedMinutes = undefined;
+              }
             }
           }
         } else if (delRel.startsWith('assets/')) {

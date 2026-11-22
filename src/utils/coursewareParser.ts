@@ -9,6 +9,7 @@ import type {
   LessonDiagram,
   LessonSymbolEntry,
   PdfSplitPlanItem,
+  VocabItem,
 } from '../types';
 import {
   isValidDiagramSpec,
@@ -45,6 +46,31 @@ export function stripAiCitationArtifacts(text: string): string {
   // 4. Remove stray spaces introduced right before CJK punctuation after tag removal
   cleaned = cleaned.replace(/[ \t]+([，。；：！？、])/g, '$1');
   return cleaned;
+}
+
+function sanitizeVocabItem(w: VocabItem): VocabItem {
+  return {
+    ...w,
+    ...(typeof w.id === 'string' && w.id.trim() ? { id: w.id.trim() } : {}),
+    word: String(w.word || '').trim(),
+    meaning: stripAiCitationArtifacts(w.meaning || ''),
+    ...(typeof w.usageNote === 'string' && w.usageNote.trim()
+      ? { usageNote: stripAiCitationArtifacts(w.usageNote) }
+      : {}),
+    ...(Array.isArray(w.collocations)
+      ? {
+          collocations: w.collocations
+            .map((c) => stripAiCitationArtifacts(String(c)).trim())
+            .filter(Boolean),
+        }
+      : {}),
+    ...(typeof w.isReview === 'boolean' ? { isReview: w.isReview } : {}),
+    example: w.example ? stripAiCitationArtifacts(w.example) : w.example,
+    exampleTranslation: w.exampleTranslation
+      ? stripAiCitationArtifacts(w.exampleTranslation)
+      : w.exampleTranslation,
+    ...(Array.isArray(w.tags) ? { tags: w.tags.map(String).filter(Boolean) } : {}),
+  };
 }
 
 /**
@@ -113,19 +139,68 @@ export function sanitizeLessonCitations(lesson: DailyLessonContent): DailyLesson
       ? {
         ...lesson.englishPayload,
         articleTitle: stripAiCitationArtifacts(lesson.englishPayload.articleTitle || ''),
+        ...(lesson.englishPayload.contentOrigin === 'authentic_article' ||
+        lesson.englishPayload.contentOrigin === 'adapted_article' ||
+        lesson.englishPayload.contentOrigin === 'ai_original'
+          ? { contentOrigin: lesson.englishPayload.contentOrigin }
+          : {}),
         sourceReference: lesson.englishPayload.sourceReference
           ? stripAiCitationArtifacts(lesson.englishPayload.sourceReference)
           : lesson.englishPayload.sourceReference,
+        ...(typeof lesson.englishPayload.publishDate === 'string' &&
+        lesson.englishPayload.publishDate.trim()
+          ? { publishDate: lesson.englishPayload.publishDate.trim() }
+          : {}),
+        ...(typeof lesson.englishPayload.sourceUrl === 'string' &&
+        lesson.englishPayload.sourceUrl.trim()
+          ? { sourceUrl: stripAiCitationArtifacts(lesson.englishPayload.sourceUrl).trim() }
+          : {}),
+        ...(typeof lesson.englishPayload.originNote === 'string' &&
+        lesson.englishPayload.originNote.trim()
+          ? { originNote: stripAiCitationArtifacts(lesson.englishPayload.originNote) }
+          : {}),
         targetWords: Array.isArray(lesson.englishPayload.targetWords)
-          ? lesson.englishPayload.targetWords.map((w) => ({
-            ...w,
-            meaning: stripAiCitationArtifacts(w.meaning || ''),
-            example: w.example ? stripAiCitationArtifacts(w.example) : w.example,
-            exampleTranslation: w.exampleTranslation
-              ? stripAiCitationArtifacts(w.exampleTranslation)
-              : w.exampleTranslation,
-          }))
+          ? lesson.englishPayload.targetWords.map(sanitizeVocabItem)
           : [],
+        ...(Array.isArray(lesson.englishPayload.extraWordGlosses)
+          ? {
+              extraWordGlosses: lesson.englishPayload.extraWordGlosses
+                .map(sanitizeVocabItem)
+                .filter((w) => w.word && w.meaning),
+            }
+          : {}),
+        ...(Array.isArray(lesson.englishPayload.synonymReplacements)
+          ? {
+              synonymReplacements: lesson.englishPayload.synonymReplacements
+                .filter(
+                  (r) =>
+                    r &&
+                    typeof r.paragraphIndex === 'number' &&
+                    typeof r.originalWord === 'string' &&
+                    typeof r.replacedWith === 'string'
+                )
+                .map((r) => ({
+                  paragraphIndex: Math.max(0, Math.round(r.paragraphIndex)),
+                  originalWord: stripAiCitationArtifacts(r.originalWord).trim(),
+                  ...(typeof r.originalWordId === 'string' && r.originalWordId.trim()
+                    ? { originalWordId: r.originalWordId.trim() }
+                    : {}),
+                  replacedWith: stripAiCitationArtifacts(r.replacedWith).trim(),
+                  ...(typeof r.reason === 'string' && r.reason.trim()
+                    ? { reason: stripAiCitationArtifacts(r.reason).trim() }
+                    : {}),
+                }))
+                .filter((r) => r.originalWord && r.replacedWith),
+            }
+          : {}),
+        ...(lesson.englishPayload.step2VocabStats &&
+        typeof lesson.englishPayload.step2VocabStats === 'object'
+          ? {
+              step2VocabStats: {
+                ...lesson.englishPayload.step2VocabStats,
+              },
+            }
+          : {}),
         paragraphs: Array.isArray(lesson.englishPayload.paragraphs)
           ? lesson.englishPayload.paragraphs.map((p) => ({
             english: stripAiCitationArtifacts(p.english || ''),
@@ -1154,8 +1229,22 @@ export function parseImportedSyllabusContent(
         : existing?.connectionNote,
       regionId: resolvedRegionIds[0] || item?.regionId || existing?.regionId,
       regionIds: resolvedRegionIds.length > 0 ? resolvedRegionIds : undefined,
+      topicGroup:
+        typeof item?.topicGroup === 'string' && item.topicGroup.trim()
+          ? stripAiCitationArtifacts(item.topicGroup.trim())
+          : existing?.topicGroup,
+      themeId:
+        typeof item?.themeId === 'string' && item.themeId.trim()
+          ? item.themeId.trim()
+          : existing?.themeId,
+      targetWordIds: Array.isArray(item?.targetWordIds)
+        ? item.targetWordIds.map((id: any) => String(id).trim()).filter(Boolean)
+        : existing?.targetWordIds,
+      reviewWordIds: Array.isArray(item?.reviewWordIds)
+        ? item.reviewWordIds.map((id: any) => String(id).trim()).filter(Boolean)
+        : existing?.reviewWordIds,
       keyTopics,
-      assignedWords: existing?.assignedWords,
+      assignedWords: Array.isArray(item?.assignedWords) ? item.assignedWords : existing?.assignedWords,
       pdfSegment: existing?.pdfSegment,
       pdfSegments: existing?.pdfSegments,
       // Preserve any already-generated lesson or stage1Draft so modifying outline NEVER deletes existing work!

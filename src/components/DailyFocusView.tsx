@@ -440,7 +440,7 @@ export const DailyFocusView: React.FC<DailyFocusViewProps> = ({
                             course.id,
                             course.outlineConfirmed
                               ? 'lessons'
-                              : hasPdf || course.category === 'english'
+                              : hasPdf || (course.englishConfig?.effectiveWords?.length || 0) > 0
                                 ? 'split_vocab'
                                 : 'outline'
                           );

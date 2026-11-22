@@ -59,8 +59,8 @@ Schema and formatting/JSON details live cleanly in stage prompt templates so tea
      - `plot2d`：函数曲线、切线、定积分阴影、概率密度、模电伏安特性、供需曲线（`xRange`, `yRange`, `functions` [须标准表达式如 `x^2`/`sin(x)`/`exp(-x)`/`1/x`], `shadedRegions`, `points`, `vlines`, `hlines`）；
      - `graph`：二叉树/图、有限状态机 FSM、自控框图、协议状态转移与流程图（`direction`: `LR|TB`, `nodes` [`rect|round|circle|diamond|pill|sum`], `edges`）；
      - `wavedrom`：数电时序波形、SPI/I2C/UART 通信时序与寄存器位域图（`signal` / `reg`）；
-     - `circuit`：基于相对走向与命名锚点的直流/交流/运放电路原理图（`elements`: `voltage_dc|voltage_ac|current_source|resistor|capacitor|inductor|diode|ground|wire|node|opamp`，支持 `dir` 与 `anchor`/`fromAnchor`/`toAnchor`/`currentLabel`/`polarity`）。
-   - **回退使用原来的“自由图表”（`svgCode`）**：**仅当上述 5 类结构化图表均无法符合本图教学表达需求时**（如三维空间几何与曲面、任意角度受力分析与滑轮/斜面机械图、光学反射折射光路、物理化学实验装置与分子结构、半导体器件物理剖面、或超出 `circuit` 内置 11 种基础元件的复杂专用器件电路），才回退输出手写深色高对比自由图表 `svgCode`（含 `viewBox`，文字距边界 `>= 18px`，长标注用 `<tspan>` 换行，文本直接写清晰符号如 `u_O`、`R_f`，不使用 `$` 符号或复杂 LaTeX 宏；与 `diagramSpec` 二选一，勿同时冗余输出）。
+     - `circuit`：基于相对走向与命名锚点的直流/交流/运放/BJT/MOSFET 电路原理图（`elements`: `voltage_dc|voltage_ac|current_source|resistor|capacitor|inductor|diode|ground|wire|node|opamp|npn|pnp|nmos|pmos`，支持 `dir` 与 `anchor`/`fromAnchor`/`toAnchor`/`currentLabel`/`polarity`/`pin`/`flip`/`route`/`depletion`；引擎自动以直角折线布线，保证横平竖直）。
+   - **回退使用原来的“自由图表”（`svgCode`）**：**仅当上述 5 类结构化图表均无法符合本图教学表达需求时**（如三维空间几何与曲面、任意角度受力分析与滑轮/斜面机械图、光学反射折射光路、物理化学实验装置与分子结构、半导体器件物理剖面、或超出 `circuit` 内置 15 种元件（含 BJT/MOSFET）的复杂专用器件电路（如 JFET、晶闸管、变压器、多发射极晶体管）），才回退输出手写深色高对比自由图表 `svgCode`（含 `viewBox`，文字距边界 `>= 18px`，长标注用 `<tspan>` 换行，文本直接写清晰符号如 `u_O`、`R_f`，不使用 `$` 符号或复杂 LaTeX 宏；与 `diagramSpec` 二选一，勿同时冗余输出）。
 3. **LaTeX 规范与符号表（`symbolGlossary`）**：
    - 正文及所有字段中涉及数学符号、方程、上下标与物理单位，统一使用标准 `$...$` 或 `$$...$$`（如 `$20\,\text{nA}$`，禁止 `\text{...}` 内写裸下划线 `_`）。
    - 核心物理/数学符号须在首次代入推导前先用文字解释含义和单位，并在 `symbolGlossary` 中列出 `symbol`（不含 `$`）、`name`、`definition`、`unit`。

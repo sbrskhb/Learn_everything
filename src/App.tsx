@@ -24,6 +24,7 @@ import type {
   LastBrowsingState,
   PromptModuleToggles,
   StudyStats,
+  VocabBank,
 } from './types';
 import type { PromptPresetItem } from './prompts/promptLibrary';
 import {
@@ -34,6 +35,7 @@ import {
   getTodayDateString,
   resolveSlotPdfSegments,
 } from './utils/learningLogic';
+import { resolveLanguageInputMode } from './utils/vocabCoverage';
 import {
   computeBrowsingViewKey,
   loadBrowsingStateFromLocalStorage,
@@ -47,6 +49,7 @@ import type { OutlineWorkbenchStep } from './components/CourseOutlineModal';
 import { DailyFocusView } from './components/DailyFocusView';
 import { DeleteCourseModal } from './components/DeleteCourseModal';
 import { SettingsModal } from './components/SettingsModal';
+import { VocabBankManagerModal } from './components/VocabBankManagerModal';
 import { WelcomeModal } from './components/WelcomeModal';
 import { readApiJson } from './utils/fileExtractor';
 import { renderInlineMathWithLatex } from './utils/markdownMath';
@@ -203,6 +206,8 @@ export default function App() {
   });
 
   const [isAddCourseOpen, setIsAddCourseOpen] = useState(false);
+  const [isVocabManagerOpen, setIsVocabManagerOpen] = useState(false);
+  const [vocabBanks, setVocabBanks] = useState<VocabBank[]>([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isBrandShowcaseOpen, setIsBrandShowcaseOpen] = useState(false);
   const [outlineModalState, setOutlineModalState] = useState<OutlineModalState | null>(() =>
@@ -415,6 +420,9 @@ export default function App() {
           const data = await res.json();
           const loadedCourses: Course[] = Array.isArray(data.courses) ? data.courses : [];
           setCourses(loadedCourses);
+          if (Array.isArray(data.vocabBanks)) {
+            setVocabBanks(data.vocabBanks);
+          }
           setOutlineModalState((prev) =>
             prev && loadedCourses.some((c) => c.id === prev.courseId) ? prev : null
           );
@@ -528,10 +536,13 @@ export default function App() {
     const hasPdf = newCourse.materials?.some(
       (m) => m.isPdf || m.fileName.toLowerCase().endsWith('.pdf')
     );
-    // Step 1: Region split & local PDF slicing (or English vocab allocation) before Step 2 outline generation
+    const hasVocab =
+      newCourse.category === 'english' &&
+      (newCourse.englishConfig?.effectiveWords?.length || 0) > 0;
+    // Step 1: Region split & local PDF slicing (or vocab allocation overview) before Step 2 outline generation
     setOutlineModalState({
       courseId: newCourse.id,
-      step: hasPdf || newCourse.category === 'english' ? 'split_vocab' : 'outline',
+      step: hasPdf || hasVocab ? 'split_vocab' : 'outline',
     });
   };
 
@@ -1105,6 +1116,18 @@ export default function App() {
 
                   <button
                     type="button"
+                    onClick={() => setIsVocabManagerOpen(true)}
+                    title="管理本地自定义词库（导入/编辑/去重/导出）"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors whitespace-nowrap"
+                  >
+                    <BookOpen className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">
+                      词库管理{vocabBanks.length > 0 ? ` (${vocabBanks.length})` : ''}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={() => setIsAddCourseOpen(true)}
                     className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors whitespace-nowrap shrink-0"
                   >
@@ -1258,11 +1281,35 @@ export default function App() {
                           存储目录：{course.courseDirPath || `courses/${course.folderName}/`}
                           {pdfStatusText}
                         </p>
-                        {course.englishConfig && (
-                          <p className="text-xs text-neutral-500 font-mono truncate">
-                            词库：{course.englishConfig.targetBankName} ({course.englishConfig.totalTargetCount}) − 排除 ({course.englishConfig.excludedCount}) = 待学 {course.englishConfig.effectiveWords.length} 词 · 每节 {course.englishConfig.dailyWordCount || 20} 词
-                          </p>
-                        )}
+                        {course.englishConfig && (() => {
+                          const cfg = course.englishConfig;
+                          const purposeLabel = cfg.learningPurpose === 'exam' ? '备考' : '兴趣';
+                          const inputMode =
+                            cfg.inputMode ||
+                            resolveLanguageInputMode(
+                              cfg.effectiveWords?.length || 0,
+                              course.materials?.length || 0
+                            );
+                          const inputModeLabel =
+                            inputMode === 'vocab_and_material'
+                              ? '词库+教材'
+                              : inputMode === 'vocab_only'
+                                ? '仅词库'
+                                : inputMode === 'material_only'
+                                  ? '仅教材'
+                                  : 'AI 自主规划';
+                          const cov = cfg.vocabCoverage;
+                          return (
+                            <p className="text-xs text-neutral-500 font-mono truncate">
+                              语言学习 · {purposeLabel} · {inputModeLabel}
+                              {cfg.effectiveWords.length > 0
+                                ? cov
+                                  ? ` · 目标词 ${cfg.effectiveWords.length}（已覆盖 ${cov.actualCoveredWordIds.length}/${cov.totalTargetWords} = ${cov.actualCoverageRate}% · 未覆盖 ${cov.actualUncoveredWordIds.length}）`
+                                  : ` · 待学 ${cfg.effectiveWords.length} 词（每篇 ${cfg.newWordsPerArticle || cfg.dailyWordCount || 15} 新词）`
+                                : ''}
+                            </p>
+                          );
+                        })()}
                       </div>
 
                       <button
@@ -1304,7 +1351,7 @@ export default function App() {
                               courseId: course.id,
                               step: course.outlineConfirmed
                                 ? 'lessons'
-                                : hasPdf || course.category === 'english'
+                                : hasPdf || (course.englishConfig?.effectiveWords?.length || 0) > 0
                                   ? 'split_vocab'
                                   : 'outline',
                             })
@@ -1635,8 +1682,18 @@ export default function App() {
           defaultLearningDepth={settings.defaultLearningDepth}
           defaultCustomLearningDepth={settings.defaultCustomLearningDepth}
           defaultGenerationMode={preferredMode}
+          vocabBanks={vocabBanks}
+          onVocabBanksChanged={setVocabBanks}
+          onOpenVocabManager={() => setIsVocabManagerOpen(true)}
           onClose={() => setIsAddCourseOpen(false)}
           onCourseCreated={handleCourseCreated}
+        />
+
+        <VocabBankManagerModal
+          isOpen={isVocabManagerOpen}
+          vocabBanks={vocabBanks}
+          onClose={() => setIsVocabManagerOpen(false)}
+          onVocabBanksChanged={setVocabBanks}
         />
 
 

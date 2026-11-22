@@ -1,4 +1,5 @@
 import { estimateWrittenLessonMinutes } from '../utils/learningLogic';
+import { resolveEnglishQuoteAnchors } from '../utils/vocabCoverage';
 import React, { useEffect, useMemo, useRef } from 'react';
 import { Check, Eye, X, AlertTriangle } from 'lucide-react';
 import type {
@@ -116,7 +117,10 @@ export const LessonPreviewModal: React.FC<LessonPreviewModalProps> = ({
           (e.id || `ex-${idx + 1}`).trim().toLowerCase() === ref.trim().toLowerCase()
       );
 
-    const rawMd = lesson.markdownBody || '';
+    const rawMd = resolveEnglishQuoteAnchors(
+      lesson.markdownBody || '',
+      lesson.englishPayload?.paragraphs
+    );
     const tokenRegex =
       /`?\s*(?:\{\{|\[{2})\s*(heuristic|diagram|diag|exercise)\s*:\s*([^}\]]+?)\s*(?:\}\}|\]{2})\s*`?/gi;
 

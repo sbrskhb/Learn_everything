@@ -32,12 +32,21 @@ import type {
 } from '../types';
 import {
   addDaysToDateString,
+  assignStableVocabIds,
   bindAndEnsureAllPdfRegionsCovered,
-  computeVocabCoverageStats,
   ensureStableSectionId,
   getEvaluatedSectionMinutes,
   resolveSlotPdfSegments,
 } from '../utils/learningLogic';
+import {
+  computeEnglishReadingPlanStats,
+  computeSectionAssociatedVocabStats,
+  extractPendingGlossWordsForSection,
+  isWeakBaselineForVocabSimplification,
+  parseImportedStep2EnglishOutput,
+  resolveLanguageInputMode,
+  syncCourseVocabCoverage,
+} from '../utils/vocabCoverage';
 import {
   copyCourseFileToClipboard,
   copyPromptText,
@@ -60,6 +69,7 @@ import {
   tryExtractJsonObject,
 } from '../utils/coursewareParser';
 import { LessonPreviewModal } from './LessonPreviewModal';
+import { VocabThemePlanningPanel } from './VocabThemePlanningPanel';
 
 export type OutlineWorkbenchStep = 'outline' | 'split_vocab' | 'lessons' | 'files';
 
@@ -164,10 +174,20 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
   const [isExecutingSplit, setIsExecutingSplit] = useState(false);
   const [isSyncingAgentInline, setIsSyncingAgentInline] = useState(false);
   const [slicingSectionId, setSlicingSectionId] = useState<string | null>(null);
+  const [showEmptyPdfSplitPanel, setShowEmptyPdfSplitPanel] = useState(false);
 
-  // English vocab allocation states
-  const [dailyWordCountInput, setDailyWordCountInput] = useState<number>(20);
+  // Language course & vocab coverage states
+  const [dailyWordCountInput, setDailyWordCountInput] = useState<number>(15);
+  const [targetWordDensityPctInput, setTargetWordDensityPctInput] = useState<number>(4);
+  const [expectedRepeatsInput, setExpectedRepeatsInput] = useState<number>(2);
   const [isReallocatingVocab, setIsReallocatingVocab] = useState(false);
+  const [isVerifyingWordKey, setIsVerifyingWordKey] = useState<string | null>(null);
+  const [isRunningAiReview, setIsRunningAiReview] = useState(false);
+  const [aiReviewPromptData, setAiReviewPromptData] = useState<{
+    prompt: string;
+    pendingCount: number;
+  } | null>(null);
+  const [aiReviewJsonInput, setAiReviewJsonInput] = useState('');
 
   // Step 3: Per-section quick material & generation states
   const [generatingDayIndex, setGeneratingDayIndex] = useState<number | null>(null);
@@ -185,24 +205,62 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     course.generationMode || 'api'
   );
   const [agentSectionPrompt, setAgentSectionPrompt] = useState<{ dayIndex: number; text: string } | null>(null);
+  const [agentStep2Prompt, setAgentStep2Prompt] = useState<{ dayIndex: number; text: string } | null>(null);
   const [agentPromptError, setAgentPromptError] = useState('');
+  const [step3SimplifySynonyms, setStep3SimplifySynonyms] = useState<boolean>(() =>
+    isWeakBaselineForVocabSimplification(course)
+  );
+  const [isRunningStep3Gloss, setIsRunningStep3Gloss] = useState(false);
+
+  useEffect(() => {
+    setStep3SimplifySynonyms(isWeakBaselineForVocabSimplification(course));
+  }, [course.id, course.learnerBaseline, course.customLearnerBaseline, course.learnerLevel]);
+
+  const activeAgentSlotUpdatedAt = useMemo(() => {
+    const target = course.dailyPlan.find((s) => s.dayIndex === selectedStep3ChatDay);
+    return target?.lesson?.englishPayload?.step2VocabStats?.updatedAt || target?.lesson?.generatedAt || '';
+  }, [course.dailyPlan, selectedStep3ChatDay]);
+
   useEffect(() => {
     if (workbenchMode !== 'agent' || activeStep !== 'lessons') return;
     const controller = new AbortController();
     setAgentSectionPrompt(null);
+    setAgentStep2Prompt(null);
     setAgentPromptError('');
     setCopiedKey(null);
-    fetch(`/api/courses/${encodeURIComponent(course.id)}/days/${selectedStep3ChatDay}/chat-prompt`, { signal: controller.signal })
+    const qs =
+      course.category === 'english'
+        ? `?simplifySynonyms=${step3SimplifySynonyms ? '1' : '0'}`
+        : '';
+    fetch(
+      `/api/courses/${encodeURIComponent(course.id)}/days/${selectedStep3ChatDay}/chat-prompt${qs}`,
+      { signal: controller.signal }
+    )
       .then(async (response) => {
         const data = await response.json();
         if (!response.ok || !data.agentStage1Prompt) throw new Error(data.error || '未找到本节 Agent 生成指令');
-        if (!controller.signal.aborted) setAgentSectionPrompt({ dayIndex: selectedStep3ChatDay, text: data.agentStage1Prompt });
+        if (!controller.signal.aborted) {
+          setAgentSectionPrompt({ dayIndex: selectedStep3ChatDay, text: data.agentStage1Prompt });
+          setAgentStep2Prompt(
+            data.agentStage2Prompt
+              ? { dayIndex: selectedStep3ChatDay, text: String(data.agentStage2Prompt) }
+              : null
+          );
+        }
       })
       .catch((error) => {
         if (!controller.signal.aborted) setAgentPromptError(error.message || '读取本节指令失败');
       });
     return () => controller.abort();
-  }, [course.id, activeStep, workbenchMode, selectedStep3ChatDay]);
+  }, [
+    course.id,
+    course.category,
+    activeStep,
+    workbenchMode,
+    selectedStep3ChatDay,
+    step3SimplifySynonyms,
+    activeAgentSlotUpdatedAt,
+  ]);
 
   const [isSwitchingMode, setIsSwitchingMode] = useState(false);
   const [step3PendingDraft, setStep3PendingDraft] = useState<DailyLessonContent | null>(null);
@@ -343,7 +401,15 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     setShowSyllabusImportBox((mode === 'chat' || mode === 'agent') && !course.outlineConfirmed);
     setPageOffset(course.pdfPageOffset || 0);
     setDraftSplitPlan(course.pdfSplitPlan || []);
-    setDailyWordCountInput(course.englishConfig?.dailyWordCount || 20);
+    setDailyWordCountInput(
+      course.englishConfig?.newWordsPerArticle || course.englishConfig?.dailyWordCount || 15
+    );
+    setTargetWordDensityPctInput(
+      Math.round((course.englishConfig?.targetWordDensity || 0.04) * 1000) / 10
+    );
+    setExpectedRepeatsInput(course.englishConfig?.expectedRepeatsPerWord || 2);
+    setAiReviewPromptData(null);
+    setAiReviewJsonInput('');
     setStatusMessage(null);
     setErrorMessage(null);
 
@@ -403,14 +469,78 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     }
   }, [activeStep, isOpen, course?.id, course?.generationMode, course?.outlineConfirmed]);
 
-  const vocabCoverage = useMemo(() => {
-    if (!course?.englishConfig) return null;
-    return computeVocabCoverageStats(
-      course.englishConfig.effectiveWords?.length || 0,
-      draftSlots.length || course.durationDays,
-      dailyWordCountInput
-    );
-  }, [course?.englishConfig, draftSlots.length, course?.durationDays, dailyWordCountInput]);
+  const englishReadingStats = useMemo(() => {
+    if (!course || course.category !== 'english') return null;
+    return computeEnglishReadingPlanStats({
+      effectiveTotal: course.englishConfig?.effectiveWords?.length || 0,
+      newWordsPerArticle: dailyWordCountInput,
+      targetWordDensity: Math.max(0.005, (Number(targetWordDensityPctInput) || 4) / 100),
+      expectedRepeatsPerWord: expectedRepeatsInput,
+    });
+  }, [
+    course,
+    dailyWordCountInput,
+    targetWordDensityPctInput,
+    expectedRepeatsInput,
+  ]);
+
+  const courseVocabCoverage = useMemo(() => {
+    if (!course?.englishConfig) return undefined;
+    return syncCourseVocabCoverage({
+      ...course,
+      englishConfig: {
+        ...course.englishConfig,
+        effectiveWords: [...(course.englishConfig.effectiveWords || [])],
+        vocabCoverage: course.englishConfig.vocabCoverage
+          ? { ...course.englishConfig.vocabCoverage }
+          : undefined,
+      },
+      dailyPlan: draftSlots.map((s) => ({ ...s })),
+    });
+  }, [course, draftSlots]);
+
+  const vocabWordById = useMemo(() => {
+    const map = new Map<string, { word: string; meaning: string }>();
+    for (const w of assignStableVocabIds(course?.englishConfig?.effectiveWords || [])) {
+      if (w.id) map.set(w.id, { word: w.word, meaning: w.meaning });
+    }
+    return map;
+  }, [course?.englishConfig?.effectiveWords]);
+
+  const pendingReviewMatches = useMemo(() => {
+    if (!courseVocabCoverage) return [];
+    const list: Array<{
+      sectionId: string;
+      dayIndex: number;
+      wordId: string;
+      word: string;
+      meaning: string;
+      matchedForms: string[];
+      snippets: string[];
+      reviewReason?: string;
+    }> = [];
+    for (const [secId, secRec] of Object.entries(courseVocabCoverage.bySection)) {
+      const matchedSlot = draftSlots.find(
+        (s) => ensureStableSectionId(s.dayIndex, s.id) === secId
+      );
+      const dayIdx = matchedSlot?.dayIndex || Number(secId.replace(/\D+/g, '')) || 1;
+      for (const m of secRec.matches) {
+        if (m.semanticStatus === 'needs_review') {
+          list.push({
+            sectionId: secId,
+            dayIndex: dayIdx,
+            wordId: m.wordId,
+            word: m.word,
+            meaning: vocabWordById.get(m.wordId)?.meaning || '待结合语境确认',
+            matchedForms: m.matchedForms,
+            snippets: m.snippets,
+            reviewReason: m.reviewReason,
+          });
+        }
+      }
+    }
+    return list;
+  }, [courseVocabCoverage, draftSlots, vocabWordById]);
 
   const triggerCopyFeedback = async (key: string, text: string, fallbackTitle?: string) => {
     setErrorMessage(null);
@@ -490,7 +620,9 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
       setStatusMessage(
         `已扫描并同步本地课程文件夹：关联 ${importedCount} 节课件${
           data.syllabusUpdated ? '，已同步 outline.json' : ''
-        }${data.splitPlanUpdated ? '，已同步 segments/split-plan.json' : ''}。`
+        }${data.splitPlanUpdated ? '，已同步 segments/split-plan.json' : ''}${
+          data.vocabThemePlanUpdated ? '，已同步 segments/vocab-theme-plan.json' : ''
+        }。`
       );
       loadDiskFiles(course.id);
     } catch (err: any) {
@@ -1154,7 +1286,34 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     }
   };
 
-  // --- Step 2b Handlers: English Vocab Re-allocation ---
+  // --- Step 2b Handlers: Language Params Update, Vocab Reassignment & Coverage Review ---
+  const handleSaveLanguageReadingParams = async () => {
+    setIsReallocatingVocab(true);
+    setErrorMessage(null);
+    setStatusMessage(null);
+    try {
+      const res = await fetch(`/api/courses/${course.id}/vocab/reallocate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          newWordsPerArticle: dailyWordCountInput,
+          dailyWordCount: dailyWordCountInput,
+          targetWordDensity: Math.max(0.005, (Number(targetWordDensityPctInput) || 4) / 100),
+          expectedRepeatsPerWord: expectedRepeatsInput,
+          paramsOnly: true,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '更新阅读参数失败');
+      onCourseUpdated(data.course);
+      setStatusMessage('已更新语言阅读规划参数并重算预计文章数与参考长度。');
+    } catch (err: any) {
+      setErrorMessage(err?.message || '更新阅读参数失败');
+    } finally {
+      setIsReallocatingVocab(false);
+    }
+  };
+
   const handleReallocateEnglishVocab = async (preserveStartedSlots = true) => {
     setIsReallocatingVocab(true);
     setErrorMessage(null);
@@ -1165,7 +1324,11 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           dailyWordCount: dailyWordCountInput,
+          newWordsPerArticle: dailyWordCountInput,
+          targetWordDensity: Math.max(0.005, (Number(targetWordDensityPctInput) || 4) / 100),
+          expectedRepeatsPerWord: expectedRepeatsInput,
           preserveStartedSlots,
+          mode: 'random',
         }),
       });
       const data = await res.json();
@@ -1173,12 +1336,136 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
       onCourseUpdated(data.course);
       setDraftSlots(data.course.dailyPlan);
       setStatusMessage(
-        '已按每节目标词数重新随机分配尚未开始学习的词汇（已生成课件的小节保持不变，结果已稳定保存）。'
+        '已按每篇新词数重新分配尚未生成课件的小节词汇（已生成课件的小节保持不变）。'
       );
     } catch (err: any) {
       setErrorMessage(err?.message || '重新分配词汇失败');
     } finally {
       setIsReallocatingVocab(false);
+    }
+  };
+
+  const handleReassignVocab = async (scope: 'unassigned' | 'uncovered' | 'both') => {
+    setIsReallocatingVocab(true);
+    setErrorMessage(null);
+    setStatusMessage(null);
+    try {
+      const res = await fetch(`/api/courses/${course.id}/vocab/reassign`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          scope,
+          appendSupplementarySections: true,
+          wordsPerSection: dailyWordCountInput,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '重新分配目标词汇失败');
+      onCourseUpdated(data.course);
+      setDraftSlots(data.course.dailyPlan);
+      setStatusMessage(
+        data.reassignedCount > 0
+          ? `已重新分配 ${data.reassignedCount} 个目标词${
+              data.appendedSectionsCount > 0
+                ? `（新增 ${data.appendedSectionsCount} 个补充巩固小节）`
+                : '到待生成小节'
+            }。`
+          : '所有未分配/未覆盖词汇均已在后续待生成小节中安排。'
+      );
+    } catch (err: any) {
+      setErrorMessage(err?.message || '重新分配目标词汇失败');
+    } finally {
+      setIsReallocatingVocab(false);
+    }
+  };
+
+  const handleVerifyVocabMatch = async (
+    sectionId: string,
+    wordId: string,
+    status: 'confirmed' | 'rejected' | 'reset'
+  ) => {
+    const key = `${sectionId}::${wordId}`;
+    setIsVerifyingWordKey(key);
+    setErrorMessage(null);
+    try {
+      const res = await fetch(`/api/courses/${course.id}/vocab-coverage/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sectionId, wordId, status, reviewer: 'manual' }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '更新语义确认失败');
+      onCourseUpdated(data.course);
+      setStatusMessage(
+        status === 'confirmed'
+          ? '已人工确认该词正文语义匹配，计入实际覆盖。'
+          : status === 'rejected'
+            ? '已标记该词正文出现与目标词义不符，已移入未覆盖列表。'
+            : '已重置该词的人工复核状态。'
+      );
+    } catch (err: any) {
+      setErrorMessage(err?.message || '更新语义确认失败');
+    } finally {
+      setIsVerifyingWordKey(null);
+    }
+  };
+
+  const handleRunAiSemanticReview = async () => {
+    setIsRunningAiReview(true);
+    setErrorMessage(null);
+    setStatusMessage(null);
+    try {
+      if (workbenchMode === 'api') {
+        const res = await fetch(`/api/courses/${course.id}/vocab-coverage/ai-review`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'AI 语义复核失败');
+        onCourseUpdated(data.course);
+        setStatusMessage(`AI 已复核 ${data.appliedCount || 0} 个存疑词条并同步更新覆盖记录。`);
+      } else {
+        const res = await fetch(`/api/courses/${course.id}/vocab-coverage/review-prompt`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || '生成复核提示词失败');
+        setAiReviewPromptData({
+          prompt: data.prompt || '',
+          pendingCount: Array.isArray(data.pendingItems) ? data.pendingItems.length : 0,
+        });
+      }
+    } catch (err: any) {
+      setErrorMessage(err?.message || '语义复核操作失败');
+    } finally {
+      setIsRunningAiReview(false);
+    }
+  };
+
+  const handleApplyAiReviewJson = async () => {
+    const parsed = tryExtractJsonObject(aiReviewJsonInput);
+    const reviews = Array.isArray(parsed?.reviews) ? parsed.reviews : null;
+    if (!reviews) {
+      setErrorMessage('未能从粘贴内容中解析出 reviews 数组，请粘贴包含 { "reviews": [...] } 的 JSON。');
+      return;
+    }
+    setIsRunningAiReview(true);
+    setErrorMessage(null);
+    try {
+      const res = await fetch(`/api/courses/${course.id}/vocab-coverage/ai-review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reviews }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '应用 AI 复核结果失败');
+      onCourseUpdated(data.course);
+      setAiReviewJsonInput('');
+      setAiReviewPromptData(null);
+      setStatusMessage(`已应用 ${data.appliedCount || 0} 条语义复核结果并重算覆盖率。`);
+    } catch (err: any) {
+      setErrorMessage(err?.message || '应用 AI 复核结果失败');
+    } finally {
+      setIsRunningAiReview(false);
     }
   };
 
@@ -1283,7 +1570,11 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     if (!isOpen || activeStep !== 'lessons' || !selectedStep3Slot) return;
     const targetDay = selectedStep3Slot.dayIndex;
     const controller = new AbortController();
-    fetch(`/api/courses/${encodeURIComponent(course.id)}/days/${targetDay}/chat-prompt`, {
+    const qs =
+      course.category === 'english'
+        ? `?simplifySynonyms=${step3SimplifySynonyms ? '1' : '0'}`
+        : '';
+    fetch(`/api/courses/${encodeURIComponent(course.id)}/days/${targetDay}/chat-prompt${qs}`, {
       signal: controller.signal,
     })
       .then(async (res) => (res.ok ? res.json() : null))
@@ -1305,11 +1596,14 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
   }, [
     isOpen,
     course.id,
+    course.category,
     activeStep,
     selectedStep3Slot?.dayIndex,
     selectedStep3Slot?.stage1Draft?.generatedAt,
     selectedStep3Slot?.lesson?.generatedAt,
+    selectedStep3Slot?.lesson?.englishPayload?.step2VocabStats?.updatedAt,
     step3PendingDraft,
+    step3SimplifySynonyms,
   ]);
 
   const duplicateLessonDaysByDay = useMemo(() => {
@@ -1365,6 +1659,35 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     [step3Stage1BaseLesson]
   );
 
+  const step3EnglishStats = useMemo(() => {
+    if (
+      course.category !== 'english' ||
+      !selectedStep3Slot ||
+      !step3Stage1BaseLesson?.englishPayload
+    ) {
+      return null;
+    }
+    return computeSectionAssociatedVocabStats(course, selectedStep3Slot, step3Stage1BaseLesson);
+  }, [course, selectedStep3Slot, step3Stage1BaseLesson]);
+
+  const pendingStep3WordGlosses = useMemo(() => {
+    if (
+      course.category !== 'english' ||
+      !selectedStep3Slot ||
+      !step3Stage1BaseLesson?.englishPayload
+    ) {
+      return [];
+    }
+    return extractPendingGlossWordsForSection(course, selectedStep3Slot, step3Stage1BaseLesson);
+  }, [course, selectedStep3Slot, step3Stage1BaseLesson]);
+
+  const showEnglishChatStep2Controls = Boolean(
+    course.category === 'english' &&
+      step3Stage1BaseLesson?.englishPayload &&
+      (pendingStep3WordGlosses.length > 0 ||
+        (step3SimplifySynonyms && (step3EnglishStats?.associatedWordCount || 0) > 0))
+  );
+
   const autoStep3Stage: 'repair' | 'stage2' | 'stage1' | 'complete' = useMemo(() => {
     if (step3PendingDraftAudit && step3PendingDraftAudit.report.issues.length > 0) {
       return 'repair';
@@ -1373,6 +1696,13 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
       return 'stage2';
     }
     if (selectedStep3Slot?.lesson) {
+      if (
+        course.category === 'english' &&
+        selectedStep3Slot.lesson.englishPayload &&
+        pendingStep3WordGlosses.length > 0
+      ) {
+        return 'stage2';
+      }
       return pendingStep3Specs.length > 0 ? 'stage2' : 'complete';
     }
     if (selectedStep3Slot?.stage1Draft && pendingStep3Specs.length > 0) {
@@ -1380,12 +1710,14 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     }
     return 'stage1';
   }, [
+    course.category,
     step3PendingDraftAudit,
     stage1IsNewerThanLesson,
     selectedStep3Slot?.stage1Draft,
     selectedStep3Slot?.lesson,
     step3PendingDraft,
     pendingStep3Specs.length,
+    pendingStep3WordGlosses.length,
   ]);
 
   const handleCopySectionStagePrompt = async (
@@ -1424,14 +1756,23 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
         return;
       }
 
+      const stage2Label =
+        course.category === 'english'
+          ? `${secId} Step 2 补充词义提示词`
+          : `${secId} 阶段二图表提示词`;
+      const agentStage2Label =
+        course.category === 'english'
+          ? `${secId} Agent Step 2 补充词义指令`
+          : `${secId} Agent 阶段二指令`;
+
       const cached = currentStep3Prompts?.dayIndex === dayIndex ? currentStep3Prompts : null;
-      if (cached) {
+      if (cached && course.category !== 'english') {
         if (target === 'stage1' && cached.stage1Prompt) {
           await deliverPrompt(cached.stage1Prompt, `${secId}-stage1-prompt.md`, `${secId} 阶段一提示词`);
           return;
         }
         if (target === 'stage2' && cached.stage2Prompt) {
-          await deliverPrompt(cached.stage2Prompt, `${secId}-stage2-prompt.md`, `${secId} 阶段二图表提示词`);
+          await deliverPrompt(cached.stage2Prompt, `${secId}-stage2-prompt.md`, stage2Label);
           return;
         }
         if (target === 'agent_stage1' && cached.agentStage1Prompt) {
@@ -1439,7 +1780,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
           return;
         }
         if (target === 'agent_stage2' && cached.agentStage2Prompt) {
-          await deliverPrompt(cached.agentStage2Prompt, `${secId}-agent-stage2-prompt.md`, `${secId} Agent 阶段二指令`);
+          await deliverPrompt(cached.agentStage2Prompt, `${secId}-agent-stage2-prompt.md`, agentStage2Label);
           return;
         }
         if (target === 'legacy' && cached.lessonPrompt) {
@@ -1448,7 +1789,11 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
         }
       }
 
-      const res = await fetch(`/api/courses/${course.id}/days/${dayIndex}/chat-prompt`);
+      const qs =
+        course.category === 'english'
+          ? `?simplifySynonyms=${step3SimplifySynonyms ? '1' : '0'}`
+          : '';
+      const res = await fetch(`/api/courses/${course.id}/days/${dayIndex}/chat-prompt${qs}`);
       if (!res.ok) {
         throw new Error('获取本节提示词失败');
       }
@@ -1468,17 +1813,25 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
         await deliverPrompt(text, `${secId}-stage1-prompt.md`, `${secId} 阶段一提示词`);
       } else if (target === 'stage2') {
         if (!data?.stage2Prompt) {
-          throw new Error('当前阶段一没有待生成的图表规格，可直接保存阶段一为完整课件。');
+          throw new Error(
+            course.category === 'english'
+              ? '当前英文文章没有待补充释义的生词（或无需执行 Step 2）。'
+              : '当前阶段一没有待生成的图表规格，可直接保存阶段一为完整课件。'
+          );
         }
-        await deliverPrompt(data.stage2Prompt, `${secId}-stage2-prompt.md`, `${secId} 阶段二图表提示词`);
+        await deliverPrompt(data.stage2Prompt, `${secId}-stage2-prompt.md`, stage2Label);
       } else if (target === 'agent_stage1') {
         if (!data?.agentStage1Prompt) throw new Error('未找到本节 Agent 阶段一指令');
         await deliverPrompt(data.agentStage1Prompt, `${secId}-agent-stage1-prompt.md`, `${secId} Agent 阶段一指令`);
       } else if (target === 'agent_stage2') {
         if (!data?.agentStage2Prompt) {
-          throw new Error('请先让 Agent 完成阶段一并同步后，再复制本节阶段二图表生成指令。');
+          throw new Error(
+            course.category === 'english'
+              ? '当前英文文章暂无需执行的 Agent Step 2 补词指令。'
+              : '请先让 Agent 完成阶段一并同步后，再复制本节阶段二图表生成指令。'
+          );
         }
-        await deliverPrompt(data.agentStage2Prompt, `${secId}-agent-stage2-prompt.md`, `${secId} Agent 阶段二指令`);
+        await deliverPrompt(data.agentStage2Prompt, `${secId}-agent-stage2-prompt.md`, agentStage2Label);
       } else {
         if (!data?.lessonPrompt) throw new Error('未能获取本节提示词');
         await deliverPrompt(data.lessonPrompt, `${secId}-prompt.md`, `${secId} 课件生成提示词`);
@@ -1552,6 +1905,23 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
       }
 
       const note = options?.summaryNote ? ` · ${options.summaryNote}` : '';
+      if (course.category === 'english') {
+        const savedSlot = updatedSlots.find((s) => s.dayIndex === savedDay);
+        if (savedSlot?.lesson?.englishPayload) {
+          const remainingStep2 = extractPendingGlossWordsForSection(
+            data.course,
+            savedSlot,
+            savedSlot.lesson
+          );
+          if (remainingStep2.length > 0) {
+            const stayMsg = `✅ 已保存第 ${savedDay} 讲 Step 1 文章（lessons/${savedSecId}.json）${note}，检测到 ${remainingStep2.length} 个未标注关联生词，请继续执行 Step 2 补充词义${step3SimplifySynonyms ? '与同义简化' : ''}。`;
+            setStep3ImportNotice({ ok: true, message: stayMsg });
+            setStatusMessage(stayMsg);
+            return;
+          }
+        }
+      }
+
       if (options?.advanceToNext !== false) {
         const nextPending =
           updatedSlots.find((s) => s.dayIndex > savedDay && !s.lesson) ||
@@ -1681,6 +2051,107 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     const assets = course.customAssets || {};
 
     try {
+      // Check for English reading Step 2 payload (glosses / synonym simplification) before full-lesson parser
+      if (course.category === 'english' && selectedStep3Slot.lesson?.englishPayload) {
+        let looksLikeFullEnglishLesson = false;
+        try {
+          const objMatch = trimmed.match(/\{[\s\S]*\}/);
+          if (objMatch) {
+            const parsedObj = JSON.parse(objMatch[0]);
+            if (
+              parsedObj &&
+              typeof parsedObj === 'object' &&
+              (parsedObj.englishPayload ||
+                parsedObj.readingPassage ||
+                (Array.isArray(parsedObj.paragraphs) &&
+                  Array.isArray(parsedObj.targetWords) &&
+                  parsedObj.articleTitle))
+            ) {
+              looksLikeFullEnglishLesson = true;
+            }
+          }
+        } catch {
+          // Non-JSON compact line format will fail JSON.parse cleanly and continue to Step 2 check
+        }
+
+        if (!looksLikeFullEnglishLesson && !/^#\s+一、/m.test(trimmed)) {
+          const step2Parsed = parseImportedStep2EnglishOutput(trimmed, pendingStep3WordGlosses);
+          if (
+            step2Parsed.extraWordGlosses.length > 0 ||
+            step2Parsed.paragraphUpdates.length > 0 ||
+            step2Parsed.synonymReplacements.length > 0 ||
+            step2Parsed.fullParagraphs.length > 0
+          ) {
+            setIsSavingStep3Import(true);
+            try {
+              const res = await fetch(
+                `/api/courses/${course.id}/days/${selectedStep3Slot.dayIndex}/word-glosses`,
+                {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    action: 'import',
+                    rawContent: trimmed,
+                    allowSynonymReplacement: step3SimplifySynonyms,
+                  }),
+                }
+              );
+              const data = await res.json();
+              if (!res.ok) {
+                throw new Error(data.error || '应用 Step 2 补充词义失败');
+              }
+              onCourseUpdated(data.course);
+              const nextSlots: DailyPlanSlot[] = data.course.dailyPlan || [];
+              setDraftSlots(nextSlots);
+              loadDiskFiles(course.id);
+              setStep3RawImportText('');
+              setShowStep3FallbackPaste(false);
+              setCurrentStep3Prompts(null);
+
+              const savedDay = selectedStep3Slot.dayIndex;
+              const remaining = Array.isArray(data.pendingWordGlosses)
+                ? data.pendingWordGlosses.length
+                : 0;
+              const beforeCount = data?.beforeStats?.associatedWordCount;
+              const afterCount = data?.afterStats?.associatedWordCount;
+              const recountNote =
+                typeof beforeCount === 'number' &&
+                typeof afterCount === 'number' &&
+                beforeCount !== afterCount
+                  ? `关联生词 ${beforeCount} → ${afterCount} 词`
+                  : `当前关联生词 ${afterCount ?? 0} 词`;
+              const rejectedCount = Array.isArray(data.rejectedParagraphEdits)
+                ? data.rejectedParagraphEdits.length
+                : 0;
+              const rejectSuffix =
+                rejectedCount > 0 ? `（另有 ${rejectedCount} 段因涉及受保护目标词已回退）` : '';
+
+              if (remaining === 0) {
+                const nextPending =
+                  nextSlots.find((s) => s.dayIndex > savedDay && !s.lesson) ||
+                  nextSlots.find((s) => !s.lesson);
+                if (nextPending && nextPending.dayIndex !== savedDay) {
+                  setSelectedStep3ChatDay(nextPending.dayIndex);
+                  const msg = `✅ 第 ${savedDay} 讲 Step 2 完成：应用 ${data.addedGlossCount || 0} 条释义，${recountNote}${rejectSuffix}；已跳转到第 ${nextPending.dayIndex} 讲。`;
+                  setStep3ImportNotice({ ok: true, message: msg });
+                  setStatusMessage(msg);
+                  return;
+                }
+              }
+
+              const stayMsg = `✅ 第 ${savedDay} 讲 Step 2 已应用 ${data.addedGlossCount || 0} 条释义（${recountNote}${
+                remaining > 0 ? `，仍剩 ${remaining} 词待补` : '，已全部标注'
+              }${rejectSuffix}）。`;
+              setStep3ImportNotice({ ok: true, message: stayMsg });
+              setStatusMessage(stayMsg);
+              return;
+            } finally {
+              setIsSavingStep3Import(false);
+            }
+          }
+        }
+      }
+
       const hasStage1Base = Boolean(step3Stage1BaseLesson && pendingStep3Specs.length > 0);
       const baseForPatch =
         step3PendingDraft || selectedStep3Slot.lesson || selectedStep3Slot.stage1Draft || null;
@@ -2010,6 +2481,84 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
     } finally {
       setGeneratingDayIndex(null);
       setGeneratingDayProgress(null);
+    }
+  };
+
+  const handleRunStep3EnglishStep2Api = async (dayIndex: number) => {
+    setIsRunningStep3Gloss(true);
+    setErrorMessage(null);
+    setStep3ImportNotice(null);
+    try {
+      const res = await fetch(
+        `/api/courses/${encodeURIComponent(course.id)}/days/${dayIndex}/word-glosses`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'generate_api',
+            allowSynonymReplacement: step3SimplifySynonyms,
+          }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || 'Step 2 API 执行失败');
+      onCourseUpdated(data.course);
+      setDraftSlots(data.course.dailyPlan || []);
+      setCurrentStep3Prompts(null);
+      loadDiskFiles(course.id);
+      const before = data?.beforeStats?.associatedWordCount;
+      const after = data?.afterStats?.associatedWordCount;
+      const remaining = Array.isArray(data?.pendingWordGlosses)
+        ? data.pendingWordGlosses.length
+        : 0;
+      const deltaMsg =
+        typeof before === 'number' && typeof after === 'number' && before !== after
+          ? `关联生词 ${before} → ${after} 词`
+          : `关联生词 ${after ?? 0} 词`;
+      const msg = `✅ 第 ${dayIndex} 讲 Step 2 完成（${deltaMsg}${
+        remaining > 0 ? `，仍剩 ${remaining} 词待补` : '，已全部补充简明释义'
+      }）。`;
+      setStep3ImportNotice({ ok: true, message: msg });
+      setStatusMessage(msg);
+    } catch (err: any) {
+      const errMsg = err?.message || 'Step 2 API 补充词义失败';
+      setStep3ImportNotice({ ok: false, message: errMsg });
+      setErrorMessage(errMsg);
+    } finally {
+      setIsRunningStep3Gloss(false);
+    }
+  };
+
+  const handleRecountStep3EnglishStats = async (dayIndex: number) => {
+    setIsRunningStep3Gloss(true);
+    setErrorMessage(null);
+    try {
+      const res = await fetch(
+        `/api/courses/${encodeURIComponent(course.id)}/days/${dayIndex}/word-glosses`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'recount',
+            allowSynonymReplacement: step3SimplifySynonyms,
+          }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || '重算关联生词量失败');
+      onCourseUpdated(data.course);
+      setDraftSlots(data.course.dailyPlan || []);
+      const count = data?.afterStats?.associatedWordCount ?? 0;
+      const pending = Array.isArray(data?.pendingWordGlosses) ? data.pendingWordGlosses.length : 0;
+      const msg = `已完成关联生词量重算：关联生词 ${count} 词，待补释义 ${pending} 词。`;
+      setStep3ImportNotice({ ok: true, message: msg });
+      setStatusMessage(msg);
+    } catch (err: any) {
+      const errMsg = err?.message || '重算关联生词量失败';
+      setStep3ImportNotice({ ok: false, message: errMsg });
+      setErrorMessage(errMsg);
+    } finally {
+      setIsRunningStep3Gloss(false);
     }
   };
 
@@ -2398,12 +2947,18 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
           >
             <div className="text-xs font-semibold">
               {course.category === 'english' && !hasPdfMaterials
-                ? '1. 英语词库差集与词汇分配'
-                : '1. LLM 划分区域与本地切割'}
+                ? '1. 主题、词库与篇数规划'
+                : course.category === 'english'
+                  ? '1. 教材切分与主题词库'
+                  : '1. LLM 划分区域与本地切割'}
             </div>
             <div className="text-[11px] text-neutral-500 mt-0.5">
               {course.category === 'english' && !hasPdfMaterials
-                ? `每节 ${dailyWordCountInput} 词 · 周期内不重复随机抽取`
+                ? courseVocabCoverage && courseVocabCoverage.totalTargetWords > 0
+                  ? `待学 ${courseVocabCoverage.totalTargetWords} 词 · 计划 ${courseVocabCoverage.plannedWordIds.length} · 正文覆盖 ${courseVocabCoverage.actualCoveredWordIds.length} (${courseVocabCoverage.actualCoverageRate}%)`
+                  : `${
+                      course.englishConfig?.learningPurpose === 'exam' ? '备考学习' : '兴趣学习'
+                    } · 纯主题阅读（${draftSlots.length} 篇）`
                 : `已规划 ${draftSplitPlan.length} 区域 · 已切割 ${slicedRegionCount} PDF`}
             </div>
           </button>
@@ -2418,7 +2973,9 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
             }`}
           >
             <div className="text-xs font-semibold">
-              2. LLM 生成与确认课程大纲
+              {course.category === 'english'
+                ? '2. 课程大纲（主题阅读可跳过）'
+                : '2. LLM 生成与确认课程大纲'}
             </div>
             <div className="text-[11px] text-neutral-500 mt-0.5">
               共 {draftSlots.length} 讲 · {course.outlineConfirmed ? '已确认大纲' : '基于第 1 步区域生成'}
@@ -2495,6 +3052,17 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
+                {course.category === 'english' && draftSlots.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => handleSaveOutline(true)}
+                    disabled={isSavingOutline}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors disabled:opacity-50"
+                  >
+                    <Check className="w-3.5 h-3.5" />
+                    <span>跳过大纲，按当前分节直接进入第 3 步 →</span>
+                  </button>
+                )}
                 {workbenchMode === 'api' && (
                   <button
                     type="button"
@@ -2717,6 +3285,38 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
               </div>
             )}
 
+            {/* Unassigned Vocabulary Warning Bar (Language Courses with Vocab) */}
+            {course.category === 'english' &&
+              courseVocabCoverage &&
+              courseVocabCoverage.totalTargetWords > 0 &&
+              courseVocabCoverage.unassignedWordIds.length > 0 && (
+                <div className="border border-amber-800/70 bg-amber-950/25 rounded p-3 flex flex-wrap items-center justify-between gap-3 text-xs">
+                  <div className="space-y-0.5 text-amber-200">
+                    <div className="font-medium">
+                      计划覆盖检查：尚有 {courseVocabCoverage.unassignedWordIds.length} /{' '}
+                      {courseVocabCoverage.totalTargetWords} 个目标词未在大纲中分配（计划覆盖率{' '}
+                      {courseVocabCoverage.plannedCoverageRate}%）
+                    </div>
+                    <div className="text-[11px] text-amber-300/80 font-mono">
+                      未分配词：
+                      {courseVocabCoverage.unassignedWordIds
+                        .slice(0, 10)
+                        .map((id) => vocabWordById.get(id)?.word || id)
+                        .join(', ')}
+                      {courseVocabCoverage.unassignedWordIds.length > 10 ? ' ...' : ''}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleReassignVocab('unassigned')}
+                    disabled={isReallocatingVocab}
+                    className="px-3 py-1.5 text-xs font-medium bg-amber-400 text-black hover:bg-amber-300 rounded transition-colors disabled:opacity-50"
+                  >
+                    {isReallocatingVocab ? '重新分配中...' : '一键分配未分配词汇'}
+                  </button>
+                </div>
+              )}
+
             {/* Outline Preview / Editor List */}
             {draftSlots.length === 0 ? (
               <div className="border border-dashed border-neutral-800 rounded p-6 text-center space-y-3 text-xs bg-neutral-950/30">
@@ -2758,6 +3358,21 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                               }}
                             />
                           </span>
+                          {slot.topicGroup && (
+                            <span className="px-1.5 py-0.5 rounded border border-neutral-700 bg-neutral-900 text-neutral-300 text-[11px] font-sans">
+                              专题：{slot.topicGroup}
+                            </span>
+                          )}
+                          {course.category === 'english' &&
+                            courseVocabCoverage?.bySection?.[secId] &&
+                            courseVocabCoverage.bySection[secId].plannedNewWordIds.length > 0 && (
+                              <span className="px-1.5 py-0.5 rounded border border-sky-900/70 bg-sky-950/30 text-sky-300 text-[11px]">
+                                新词 {courseVocabCoverage.bySection[secId].plannedNewWordIds.length}
+                                {courseVocabCoverage.bySection[secId].plannedReviewWordIds.length > 0
+                                  ? ` · 复习 ${courseVocabCoverage.bySection[secId].plannedReviewWordIds.length}`
+                                  : ''}
+                              </span>
+                            )}
                           {boundSegs.length > 0 ? (
                             boundSegs.map((seg) => (
                               <span
@@ -2812,6 +3427,21 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                             {secId}
                           </span>
                           <span className="text-neutral-400">第 {slot.dayIndex} 讲</span>
+                          {slot.topicGroup && (
+                            <span className="px-1.5 py-0.5 rounded border border-neutral-800 bg-black text-neutral-300 text-[11px] font-sans">
+                              专题：{slot.topicGroup}
+                            </span>
+                          )}
+                          {course.category === 'english' &&
+                            courseVocabCoverage?.bySection?.[secId] &&
+                            courseVocabCoverage.bySection[secId].plannedNewWordIds.length > 0 && (
+                              <span className="px-1.5 py-0.5 rounded border border-sky-900/70 bg-sky-950/30 text-sky-300 text-[11px]">
+                                新词 {courseVocabCoverage.bySection[secId].plannedNewWordIds.length}
+                                {courseVocabCoverage.bySection[secId].plannedReviewWordIds.length > 0
+                                  ? ` · 复习 ${courseVocabCoverage.bySection[secId].plannedReviewWordIds.length}`
+                                  : ''}
+                              </span>
+                            )}
                           {draftSplitPlan.length > 0 && (
                             <>
                               <select
@@ -2996,105 +3626,447 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
         {/* ==================== STEP 2: PDF SMART SPLITTING & ENGLISH VOCAB ==================== */}
         {activeStep === 'split_vocab' && (
           <div className="space-y-6">
-            {/* Section A: English Course Vocabulary Allocation */}
-            {course.category === 'english' && course.englishConfig && (
+            {/* Section A: Language Course Config, Reading Rules & Two-Layer Vocab Coverage */}
+            {course.category === 'english' && (
               <div className="border border-neutral-800 rounded p-4 bg-neutral-950/50 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-3 border-b border-neutral-900 pb-3">
                   <div>
                     <h3 className="text-sm font-semibold text-white">
-                      英语课程每节词汇随机分配（本地差集与去重，不依赖 LLM）
+                      语言课程配置与双层词汇覆盖追踪
                     </h3>
                     <p className="text-xs text-neutral-500 mt-0.5">
-                      词库差集：{course.englishConfig.targetBankName} ({course.englishConfig.totalTargetCount}) −{' '}
-                      {course.englishConfig.excludedBankName} ({course.englishConfig.excludedCount}) = 实际待学{' '}
-                      {course.englishConfig.effectiveWords.length} 词
+                      学习目的：{course.englishConfig?.learningPurpose === 'exam' ? '备考学习' : '兴趣学习'}
+                      {' · '}
+                      {(() => {
+                        const mode =
+                          course.englishConfig?.inputMode ||
+                          resolveLanguageInputMode(
+                            course.englishConfig?.effectiveWords?.length || 0,
+                            course.materials.length
+                          );
+                        return mode === 'vocab_and_material'
+                          ? '词库 + 教材整合'
+                          : mode === 'vocab_only'
+                            ? '仅词库'
+                            : mode === 'material_only'
+                              ? '仅教材'
+                              : 'AI 自主规划';
+                      })()}
+                      {course.englishConfig && course.englishConfig.effectiveWords.length > 0
+                        ? ` · 词库：${course.englishConfig.targetBankName} (${course.englishConfig.totalTargetCount}) − ${course.englishConfig.excludedBankName} (${course.englishConfig.excludedCount}) = 待学 ${course.englishConfig.effectiveWords.length} 词`
+                        : ' · 未绑定外加目标词库'}
                     </p>
+                    {course.englishConfig?.interestPreferences && (
+                      <p className="text-[11px] text-neutral-400 mt-1">
+                        兴趣偏好权重：{course.englishConfig.interestPreferences}
+                      </p>
+                    )}
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-xs text-neutral-400">每节目标单词数：</span>
-                    {[15, 20, 30, 50].map((preset) => (
+                  {course.englishConfig && course.englishConfig.effectiveWords.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <label className="inline-flex items-center gap-1 text-xs text-neutral-400">
+                        <span>每篇新词</span>
+                        <input
+                          type="number"
+                          min={1}
+                          max={100}
+                          value={dailyWordCountInput}
+                          onChange={(e) =>
+                            setDailyWordCountInput(
+                              Math.max(1, Math.min(100, Number(e.target.value) || 15))
+                            )
+                          }
+                          aria-label="每篇引入新词数量"
+                          className="w-16 bg-black border border-neutral-800 rounded px-2 py-1 text-xs font-mono text-white"
+                        />
+                      </label>
+                      <label className="inline-flex items-center gap-1 text-xs text-neutral-400">
+                        <span>密度(%)</span>
+                        <input
+                          type="number"
+                          step={0.5}
+                          min={0.5}
+                          max={25}
+                          value={targetWordDensityPctInput}
+                          onChange={(e) =>
+                            setTargetWordDensityPctInput(
+                              Math.max(0.5, Math.min(25, Number(e.target.value) || 4))
+                            )
+                          }
+                          aria-label="目标词密度百分比"
+                          className="w-16 bg-black border border-neutral-800 rounded px-2 py-1 text-xs font-mono text-white"
+                        />
+                      </label>
+                      <label className="inline-flex items-center gap-1 text-xs text-neutral-400">
+                        <span>复现</span>
+                        <input
+                          type="number"
+                          step={0.5}
+                          min={1}
+                          max={10}
+                          value={expectedRepeatsInput}
+                          onChange={(e) =>
+                            setExpectedRepeatsInput(
+                              Math.max(1, Math.min(10, Number(e.target.value) || 2))
+                            )
+                          }
+                          aria-label="预计复现次数"
+                          className="w-14 bg-black border border-neutral-800 rounded px-2 py-1 text-xs font-mono text-white"
+                        />
+                      </label>
                       <button
-                        key={preset}
                         type="button"
-                        onClick={() => setDailyWordCountInput(preset)}
-                        className={`px-2 py-1 text-xs font-mono rounded border ${
-                          dailyWordCountInput === preset
-                            ? 'bg-neutral-900 border-white text-white'
-                            : 'bg-black border-neutral-800 text-neutral-400'
-                        }`}
+                        onClick={handleSaveLanguageReadingParams}
+                        disabled={isReallocatingVocab}
+                        className="px-2.5 py-1 text-xs font-medium bg-neutral-900 border border-neutral-700 hover:border-white text-white rounded transition-colors disabled:opacity-50"
                       >
-                        {preset}
+                        更新规划参数
                       </button>
-                    ))}
-                    <input
-                      type="number"
-                      min={1}
-                      max={200}
-                      value={dailyWordCountInput}
-                      onChange={(e) =>
-                        setDailyWordCountInput(Math.max(1, Math.min(200, Number(e.target.value) || 20)))
-                      }
-                      aria-label="调整每节目标单词数"
-                      className="w-16 bg-black border border-neutral-800 rounded px-2 py-1 text-xs font-mono text-white"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => handleReallocateEnglishVocab(true)}
-                      disabled={isReallocatingVocab}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors disabled:opacity-50"
-                    >
-                      <Shuffle className="w-3.5 h-3.5" />
-                      <span>
-                        {isReallocatingVocab
-                          ? '正在分配...'
-                          : '重新随机分配尚未开始学习的词汇'}
-                      </span>
-                    </button>
-                  </div>
+                      <button
+                        type="button"
+                        onClick={() => handleReallocateEnglishVocab(true)}
+                        disabled={isReallocatingVocab}
+                        title="按新词数随机重分未生成小节（仅作无主题划分时的兜底方式，推荐使用下方 AI 主题划分）"
+                        className="inline-flex items-center gap-1 px-2 py-1 text-[11px] border border-neutral-800/80 hover:border-neutral-600 text-neutral-400 hover:text-neutral-200 rounded transition-colors disabled:opacity-50"
+                      >
+                        <Shuffle className="w-3 h-3" />
+                        <span>随机重配（兜底）</span>
+                      </button>
+                    </div>
+                  )}
                 </div>
 
-                {vocabCoverage && (
-                  <div
-                    className={`text-xs rounded px-3 py-2 border ${
-                      vocabCoverage.isExceedingCapacity
-                        ? 'border-amber-800/80 bg-amber-950/30 text-amber-300'
-                        : 'border-neutral-800 bg-black text-neutral-300'
-                    }`}
-                  >
-                    {vocabCoverage.message}
+                {englishReadingStats &&
+                  course.englishConfig &&
+                  course.englishConfig.effectiveWords.length > 0 && (
+                    <div className="text-xs rounded px-3 py-2 border border-neutral-800 bg-black text-neutral-300">
+                      {englishReadingStats.message}
+                    </div>
+                  )}
+
+                {course.category === 'english' && course.englishConfig && (
+                  <VocabThemePlanningPanel
+                    course={course}
+                    workbenchMode={workbenchMode}
+                    newWordsPerArticle={dailyWordCountInput}
+                    targetWordDensity={Math.max(
+                      0.005,
+                      (Number(targetWordDensityPctInput) || 4) / 100
+                    )}
+                    expectedRepeatsPerWord={expectedRepeatsInput}
+                    isSyncingAgentInline={isSyncingAgentInline}
+                    onSyncAgentWorkspace={handleInlineAgentSync}
+                    onCourseUpdated={(updated) => {
+                      onCourseUpdated(updated);
+                      setDraftSlots(
+                        updated.dailyPlan.map((s) => ({
+                          ...s,
+                          id: ensureStableSectionId(s.dayIndex, s.id),
+                        }))
+                      );
+                    }}
+                    onGoToStep2Outline={() => setActiveStep('outline')}
+                    onGoToStep3Lessons={() => setActiveStep('lessons')}
+                    onSetStatusMessage={setStatusMessage}
+                    onSetErrorMessage={setErrorMessage}
+                  />
+                )}
+
+                {/* Two-Layer Vocab Coverage Overview */}
+                {courseVocabCoverage && courseVocabCoverage.totalTargetWords > 0 && (
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {/* Layer 1: Planned */}
+                      <div className="border border-neutral-800 rounded p-3 bg-black space-y-2 text-xs">
+                        <div className="flex items-center justify-between">
+                          <span className="font-semibold text-neutral-200">
+                            第 1 层 · 计划覆盖（大纲目标词 ID 分配）
+                          </span>
+                          <span className="font-mono text-sky-300">
+                            {courseVocabCoverage.plannedWordIds.length} /{' '}
+                            {courseVocabCoverage.totalTargetWords} ({courseVocabCoverage.plannedCoverageRate}%)
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-neutral-400">
+                          <span>
+                            未分配词汇：
+                            <strong
+                              className={
+                                courseVocabCoverage.unassignedWordIds.length > 0
+                                  ? 'text-amber-300'
+                                  : 'text-emerald-300'
+                              }
+                            >
+                              {courseVocabCoverage.unassignedWordIds.length} 词
+                            </strong>
+                          </span>
+                          {courseVocabCoverage.unassignedWordIds.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => handleReassignVocab('unassigned')}
+                              disabled={isReallocatingVocab}
+                              className="px-2.5 py-1 text-[11px] font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors disabled:opacity-50"
+                            >
+                              重新分配未分配词
+                            </button>
+                          )}
+                        </div>
+                        {courseVocabCoverage.unassignedWordIds.length > 0 && (
+                          <p className="text-[11px] font-mono text-amber-300/90 break-words">
+                            {courseVocabCoverage.unassignedWordIds
+                              .slice(0, 14)
+                              .map((id) => `${id}:${vocabWordById.get(id)?.word || ''}`)
+                              .join(', ')}
+                            {courseVocabCoverage.unassignedWordIds.length > 14 ? ' ...' : ''}
+                          </p>
+                        )}
+                      </div>
+
+                      {/* Layer 2: Actual Prose Coverage */}
+                      <div className="border border-neutral-800 rounded p-3 bg-black space-y-2 text-xs">
+                        <div className="flex items-center justify-between">
+                          <span className="font-semibold text-neutral-200">
+                            第 2 层 · 实际覆盖（正文用词确定性检测）
+                          </span>
+                          <span className="font-mono text-emerald-300">
+                            {courseVocabCoverage.actualCoveredWordIds.length} /{' '}
+                            {courseVocabCoverage.totalTargetWords} ({courseVocabCoverage.actualCoverageRate}%)
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-neutral-400">
+                          <span>
+                            已覆盖 {courseVocabCoverage.actualCoveredWordIds.length} · 待确认{' '}
+                            <span
+                              className={
+                                courseVocabCoverage.actualUncertainWordIds.length > 0
+                                  ? 'text-amber-300'
+                                  : ''
+                              }
+                            >
+                              {courseVocabCoverage.actualUncertainWordIds.length}
+                            </span>{' '}
+                            · 未覆盖 {courseVocabCoverage.actualUncoveredWordIds.length}
+                          </span>
+                          {courseVocabCoverage.actualUncoveredWordIds.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => handleReassignVocab('uncovered')}
+                              disabled={isReallocatingVocab}
+                              className="px-2.5 py-1 text-[11px] font-medium border border-neutral-700 hover:border-white text-neutral-200 hover:text-white rounded transition-colors disabled:opacity-50"
+                            >
+                              未覆盖词分配至后续/补充文章
+                            </button>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-neutral-500">
+                          仅统计文章正文实际用词（不含词汇表与元数据）；词汇覆盖不等于用户已掌握。
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Semantic Verification Needed Panel (Homographs / Ambiguous Inflections) */}
+                    {pendingReviewMatches.length > 0 && (
+                      <div className="border border-amber-900/60 bg-amber-950/15 rounded p-3 space-y-2.5 text-xs">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div>
+                            <span className="font-semibold text-amber-200">
+                              待确认语义匹配（同形异义 / 词形歧义，共 {pendingReviewMatches.length} 项）
+                            </span>
+                            <p className="text-[11px] text-neutral-400 mt-0.5">
+                              程序已对不确定词义保留待复核状态（不直接算作已覆盖），可结合原文语境人工确认或调用 AI 复核。
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={handleRunAiSemanticReview}
+                            disabled={isRunningAiReview}
+                            className="px-3 py-1.5 text-xs font-medium bg-white text-black hover:bg-neutral-200 rounded transition-colors disabled:opacity-50"
+                          >
+                            {isRunningAiReview
+                              ? '复核中...'
+                              : workbenchMode === 'api'
+                                ? 'AI 自动语义复核'
+                                : '获取 AI 复核提示词'}
+                          </button>
+                        </div>
+
+                        {aiReviewPromptData && aiReviewPromptData.pendingCount > 0 && (
+                          <div className="border border-neutral-800 bg-black rounded p-2.5 space-y-2">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[11px] text-neutral-300">
+                                复制下方复核提示词给外部 AI 后，粘贴返回的 JSON 应用结果：
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  triggerCopyFeedback('ai-review-prompt', aiReviewPromptData.prompt)
+                                }
+                                className="px-2 py-1 text-[11px] border border-neutral-700 hover:border-white text-neutral-200 rounded"
+                              >
+                                {copiedKey === 'ai-review-prompt' ? '已复制提示词' : '复制复核提示词'}
+                              </button>
+                            </div>
+                            <textarea
+                              rows={3}
+                              value={aiReviewJsonInput}
+                              onChange={(e) => setAiReviewJsonInput(e.target.value)}
+                              placeholder='粘贴 AI 返回的 {"reviews": [{"sectionId":"sec-01","wordId":"w-001","status":"confirmed","reason":"..."}]}'
+                              className="w-full bg-neutral-950 border border-neutral-800 rounded p-2 text-[11px] font-mono text-neutral-200"
+                            />
+                            <div className="flex justify-end gap-2">
+                              <button
+                                type="button"
+                                onClick={() => setAiReviewPromptData(null)}
+                                className="px-2.5 py-1 text-[11px] text-neutral-400 hover:text-white"
+                              >
+                                关闭
+                              </button>
+                              <button
+                                type="button"
+                                onClick={handleApplyAiReviewJson}
+                                disabled={isRunningAiReview || !aiReviewJsonInput.trim()}
+                                className="px-2.5 py-1 text-[11px] bg-white text-black font-medium rounded disabled:opacity-40"
+                              >
+                                应用复核结果
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        <div className="space-y-1.5 max-h-52 overflow-y-auto pr-1">
+                          {pendingReviewMatches.map((item) => {
+                            const key = `${item.sectionId}::${item.wordId}`;
+                            const busy = isVerifyingWordKey === key;
+                            return (
+                              <div
+                                key={key}
+                                className="border border-neutral-800 bg-black rounded p-2.5 flex flex-wrap items-center justify-between gap-2"
+                              >
+                                <div className="min-w-0 flex-1 space-y-0.5">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="font-mono text-neutral-400">
+                                      [{item.sectionId}]
+                                    </span>
+                                    <span className="font-semibold text-white">{item.word}</span>
+                                    <span className="text-neutral-400">释义：{item.meaning}</span>
+                                    <span className="text-[11px] font-mono text-amber-300">
+                                      匹配：{item.matchedForms.join(', ')}
+                                    </span>
+                                  </div>
+                                  {item.snippets[0] && (
+                                    <p className="text-[11px] text-neutral-300 italic truncate">
+                                      “{item.snippets[0]}”
+                                    </p>
+                                  )}
+                                  {item.reviewReason && (
+                                    <p className="text-[11px] text-neutral-500">{item.reviewReason}</p>
+                                  )}
+                                </div>
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() =>
+                                      handleVerifyVocabMatch(item.sectionId, item.wordId, 'confirmed')
+                                    }
+                                    className="px-2 py-1 text-[11px] bg-emerald-950/60 border border-emerald-700/70 hover:border-emerald-400 text-emerald-200 rounded disabled:opacity-40"
+                                  >
+                                    确认匹配
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={busy}
+                                    onClick={() =>
+                                      handleVerifyVocabMatch(item.sectionId, item.wordId, 'rejected')
+                                    }
+                                    className="px-2 py-1 text-[11px] bg-red-950/50 border border-red-800/70 hover:border-red-400 text-red-200 rounded disabled:opacity-40"
+                                  >
+                                    标记不符
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 max-h-60 overflow-y-auto pr-1">
-                  {draftSlots.map((slot) => {
-                    const words = slot.assignedWords || [];
-                    return (
-                      <div
-                        key={slot.id}
-                        className="border border-neutral-800 rounded p-2.5 bg-black text-xs space-y-1"
-                      >
-                        <div className="flex items-center justify-between font-mono">
-                          <span className="text-white font-sans font-medium">
-                            {slot.id} · 第 {slot.dayIndex} 节
-                          </span>
-                          <span className="text-neutral-400">
-                            {words.length} 词 {slot.lesson ? '· 已锁定(已学)' : '· 稳定保存'}
-                          </span>
+                {draftSlots.length > 0 && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 max-h-60 overflow-y-auto pr-1">
+                    {draftSlots.map((slot) => {
+                      const secId = ensureStableSectionId(slot.dayIndex, slot.id);
+                      const secCov = courseVocabCoverage?.bySection?.[secId];
+                      const plannedIds = secCov?.plannedNewWordIds || [];
+                      const words =
+                        plannedIds.length > 0
+                          ? plannedIds
+                              .map((id) => vocabWordById.get(id)?.word || id)
+                          : (slot.assignedWords || []).map((w) => w.word);
+                      const reviewCount = secCov?.plannedReviewWordIds?.length || 0;
+                      return (
+                        <div
+                          key={secId}
+                          className="border border-neutral-800 rounded p-2.5 bg-black text-xs space-y-1"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-1 font-mono">
+                            <span className="text-white font-sans font-medium truncate">
+                              {secId} · 第 {slot.dayIndex} 节
+                              {slot.topicGroup ? ` · ${slot.topicGroup}` : ''}
+                            </span>
+                            <span className="text-neutral-400 text-[11px]">
+                              新词 {words.length}
+                              {reviewCount > 0 ? ` · 复习 ${reviewCount}` : ''}
+                              {secCov?.hasLesson && plannedIds.length > 0
+                                ? ` · 正文 ${secCov.coveredNewWordIds.length}/${plannedIds.length}${
+                                    secCov.uncertainNewWordIds.length > 0
+                                      ? `(待定${secCov.uncertainNewWordIds.length})`
+                                      : ''
+                                  } · 密度 ${Math.round(secCov.actualDensity * 1000) / 10}%`
+                                : slot.lesson
+                                  ? ' · 已生成'
+                                  : ' · 待生成'}
+                            </span>
+                          </div>
+                          <p className="text-neutral-400 font-mono truncate">
+                            {words.length > 0
+                              ? words.join(', ')
+                              : '（本节未绑定额外目标词，将围绕主题自由构建词汇与阅读内容）'}
+                          </p>
                         </div>
-                        <p className="text-neutral-400 font-mono truncate">
-                          {words.length > 0
-                            ? words.map((w) => w.word).join(', ')
-                            : '（词库容量已分配完毕，本节无剩余未分配词）'}
-                        </p>
-                      </div>
-                    );
-                  })}
-                </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             )}
 
             {/* Section B: Large PDF Smart Splitting (API / Agent / Chat + Local Script) */}
+            {course.category === 'english' && !hasPdfMaterials && !showEmptyPdfSplitPanel ? (
+              <div className="border border-neutral-800/80 rounded px-4 py-3 bg-neutral-950/40 flex flex-wrap items-center justify-between gap-2 text-xs">
+                <span className="text-neutral-400">
+                  未上传 PDF 教材（当前为词库 / 自主规划课程，可在完成上方主题分配后直接进入第 2 步；如需补充 PDF 切分可展开）。
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowEmptyPdfSplitPanel(true)}
+                    className="px-2.5 py-1 border border-neutral-800 hover:border-neutral-600 text-neutral-300 hover:text-white rounded transition-colors"
+                  >
+                    展开 PDF 切分工具
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveStep('outline')}
+                    className="px-3 py-1 bg-white text-black font-medium rounded hover:bg-neutral-200 transition-colors"
+                  >
+                    进入第 2 步：LLM 生成课程大纲 →
+                  </button>
+                </div>
+              </div>
+            ) : (
             <div className="border border-neutral-800 rounded p-4 bg-neutral-950/50 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-neutral-900 pb-3">
                 <div>
@@ -3108,6 +4080,15 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
 
                 {/* Standalone API Split Action (API mode only) + Optional Add */}
                 <div className="flex flex-wrap items-center gap-2">
+                  {course.category === 'english' && !hasPdfMaterials && (
+                    <button
+                      type="button"
+                      onClick={() => setShowEmptyPdfSplitPanel(false)}
+                      className="px-2.5 py-1 text-xs border border-neutral-800 hover:border-neutral-600 text-neutral-400 hover:text-white rounded transition-colors"
+                    >
+                      收起 PDF 切分
+                    </button>
+                  )}
                   {workbenchMode === 'api' && (
                     <button
                       type="button"
@@ -3718,6 +4699,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                 </div>
               </div>
             </div>
+            )}
           </div>
         )}
 
@@ -3957,14 +4939,41 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                         }`}
                       >
                         {hasFinalLesson
-                          ? '已完成终稿（支持局部补丁或重跑任意阶段）'
-                          : hasStage1
-                          ? `阶段一已存${pendingStep3Specs.length > 0 ? ` · ${pendingStep3Specs.length} 张图示待生成` : ' · 待最终保存'}`
-                          : '待生成阶段一内容'}
+                          ? '已完成终稿（支持局部补丁或重跑）'
+                          : course.category === 'english'
+                            ? '待生成完整阅读课件'
+                            : hasStage1
+                              ? `阶段一已存${pendingStep3Specs.length > 0 ? ` · ${pendingStep3Specs.length} 张图示待生成` : ' · 待最终保存'}`
+                              : '待生成阶段一内容'}
                       </span>
+                      {course.category === 'english' &&
+                        courseVocabCoverage?.bySection?.[secId] &&
+                        courseVocabCoverage.bySection[secId].plannedNewWordIds.length > 0 && (() => {
+                          const sCov = courseVocabCoverage.bySection[secId];
+                          return (
+                            <span
+                              data-testid="step3-section-vocab-coverage"
+                              className="font-mono text-[11px] px-2 py-0.5 rounded border border-neutral-700 bg-black text-neutral-200"
+                            >
+                              {sCov.hasLesson
+                                ? `正文新词 ${sCov.coveredNewWordIds.length}/${sCov.plannedNewWordIds.length} · 密度 ${Math.round(sCov.actualDensity * 1000) / 10}%${
+                                    sCov.uncertainNewWordIds.length > 0
+                                      ? ` · 待确认 ${sCov.uncertainNewWordIds.length}`
+                                      : ''
+                                  }`
+                                : `计划新词 ${sCov.plannedNewWordIds.length}${
+                                    sCov.plannedReviewWordIds.length > 0
+                                      ? ` · 复习 ${sCov.plannedReviewWordIds.length}`
+                                      : ''
+                                  }`}
+                            </span>
+                          );
+                        })()}
                     </div>
                     <p className="text-neutral-400">
-                      两阶段流水线：阶段一专注教学正文、推导与图示规格 ➔ 阶段二仅按图示规格生成 SVG 并自动组装（无需重复上传 PDF）；任一阶段失败可单独重试且不丢失另一阶段成果。
+                      {course.category === 'english'
+                        ? '单步完整阅读课件流程：优先检索最近一个月内真实英文文章完整原文（或标注 AI 原创），先阅读、后词汇/长难句精讲、再阅读理解与词汇练习，并自然复现前一节所学词汇。'
+                        : '两阶段流水线：阶段一专注教学正文、推导与图示规格 ➔ 阶段二仅按图示规格生成 SVG 并自动组装（无需重复上传 PDF）；任一阶段失败可单独重试且不丢失另一阶段成果。'}
                     </p>
                   </div>
 
@@ -4021,7 +5030,9 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="space-y-0.5">
                         <div className="text-sky-200 font-semibold">
-                          Agent 两阶段本地执行指引（{courseRelDir}/lessons/{secId}.stage1.json ➔ {secId}.json）
+                          {course.category === 'english'
+                            ? `Agent 单阶段本地执行指引（直接写入 ${courseRelDir}/lessons/${secId}.json）`
+                            : `Agent 两阶段本地执行指引（${courseRelDir}/lessons/${secId}.stage1.json ➔ ${secId}.json）`}
                         </div>
                         <div className="text-[11px] text-neutral-400">
                           Agent 在同一次对话中生成并组装课件，运行渲染诊断，按错误报告修改并复查；完成后同步磁盘成果。
@@ -4091,37 +5102,155 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                   )}
                 </div>
 
+                {course.category === 'english' &&
+                  selectedStep3Slot.lesson?.englishPayload &&
+                  step3EnglishStats &&
+                  pendingStep3WordGlosses.length > 0 && (
+                    <div
+                      data-testid="step3-english-stats-bar"
+                      className="rounded border border-teal-900/70 bg-teal-950/20 px-3 py-2 text-xs space-y-1.5"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-neutral-300">
+                          <span className="font-medium text-teal-300">Step 2 关联生词统计</span>
+                          <span>
+                            正文 {step3EnglishStats.proseWordCount} 词 · 规划新词{' '}
+                            {step3EnglishStats.plannedNewCount}
+                          </span>
+                          <span>
+                            关联生词{' '}
+                            <strong className="text-white">
+                              {step3EnglishStats.associatedWordCount}
+                            </strong>{' '}
+                            词（{step3EnglishStats.associatedDensityPercent}%）
+                          </span>
+                          {selectedStep3Slot.lesson.englishPayload.step2VocabStats
+                            ?.associatedWordCountBefore !== undefined &&
+                            selectedStep3Slot.lesson.englishPayload.step2VocabStats
+                              .associatedWordCountBefore !==
+                              step3EnglishStats.associatedWordCount && (
+                              <span className="text-teal-200">
+                                简化前后：
+                                {
+                                  selectedStep3Slot.lesson.englishPayload.step2VocabStats
+                                    .associatedWordCountBefore
+                                }{' '}
+                                → {step3EnglishStats.associatedWordCount} 词
+                              </span>
+                            )}
+                          <span
+                            className={
+                              pendingStep3WordGlosses.length > 0
+                                ? 'text-amber-300 font-medium'
+                                : 'text-emerald-400'
+                            }
+                          >
+                            已补 {step3EnglishStats.glossedExtraCount} · 待补{' '}
+                            {pendingStep3WordGlosses.length} 词
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-3">
+                          <label className="inline-flex items-center gap-1.5 text-[11px] text-neutral-300 cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={step3SimplifySynonyms}
+                              onChange={(e) => setStep3SimplifySynonyms(e.target.checked)}
+                              className="rounded border-neutral-700 bg-black text-teal-400 focus:ring-0"
+                            />
+                            <span>基础薄弱同义简化</span>
+                          </label>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleRecountStep3EnglishStats(selectedStep3Slot.dayIndex)
+                            }
+                            disabled={isRunningStep3Gloss}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 border border-neutral-700 hover:border-teal-600 text-neutral-300 rounded text-[11px] transition-colors disabled:opacity-50"
+                          >
+                            <RefreshCw className="w-3 h-3" />
+                            <span>重算关联生词量</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
                 {workbenchMode === 'api' && (
                   <div className="flex flex-wrap items-center gap-2">
                     <button
                       type="button"
                       onClick={() => handleGenerateSingleSectionApi(selectedStep3Slot.dayIndex, 'all')}
-                      disabled={generatingDayIndex !== null || isGeneratingBatch}
+                      disabled={generatingDayIndex !== null || isGeneratingBatch || isRunningStep3Gloss}
                       className={primaryActionClass}
                     >
                       <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
                       <span>{hasFinalLesson ? 'API 重新生成本节' : 'API 生成本节'}</span>
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => handleGenerateSingleSectionApi(selectedStep3Slot.dayIndex, 'stage1')}
-                      disabled={generatingDayIndex !== null || isGeneratingBatch}
-                      className={secondaryActionClass}
-                      title="通过 API 仅重跑或生成阶段一（保留既有终稿直至新内容保存，失败不清空）"
-                    >
-                      <FileText className="h-3.5 w-3.5" aria-hidden="true" />
-                      <span>API 仅执行阶段一</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleGenerateSingleSectionApi(selectedStep3Slot.dayIndex, 'stage2')}
-                      disabled={!hasStage1 || generatingDayIndex !== null || isGeneratingBatch}
-                      className={secondaryActionClass}
-                      title="仅基于阶段一规格通过 API 重跑或生成阶段二图表代码（优先 5 类结构化 diagramSpec，不重写阶段一正文）"
-                    >
-                      <Image className="h-3.5 w-3.5" aria-hidden="true" />
-                      <span>API 仅执行阶段二图表</span>
-                    </button>
+                    {course.category === 'english' ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleGenerateSingleSectionApi(selectedStep3Slot.dayIndex, 'stage1')
+                          }
+                          disabled={generatingDayIndex !== null || isGeneratingBatch || isRunningStep3Gloss}
+                          className={secondaryActionClass}
+                          title="仅执行 Step 1 生成英文阅读文章、重点词汇表与练习题"
+                        >
+                          <FileText className="h-3.5 w-3.5" aria-hidden="true" />
+                          <span>API 仅生成 Step 1 文章</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleRunStep3EnglishStep2Api(selectedStep3Slot.dayIndex)
+                          }
+                          disabled={
+                            !selectedStep3Slot.lesson?.englishPayload ||
+                            isRunningStep3Gloss ||
+                            generatingDayIndex !== null ||
+                            isGeneratingBatch
+                          }
+                          className={secondaryActionClass}
+                          title="保留 Step 1 正文目标词，为待标注生词补充简明释义，并在勾选基础薄弱同义简化时降低关联生词密度后重新统计"
+                        >
+                          <RefreshCw
+                            className={`h-3.5 w-3.5 ${isRunningStep3Gloss ? 'animate-spin' : ''}`}
+                            aria-hidden="true"
+                          />
+                          <span>
+                            {isRunningStep3Gloss
+                              ? 'Step 2 执行中...'
+                              : `API 执行 Step 2（补充 ${pendingStep3WordGlosses.length} 词${
+                                  step3SimplifySynonyms ? '+同义简化' : ''
+                                }）`}
+                          </span>
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => handleGenerateSingleSectionApi(selectedStep3Slot.dayIndex, 'stage1')}
+                          disabled={generatingDayIndex !== null || isGeneratingBatch}
+                          className={secondaryActionClass}
+                          title="通过 API 仅重跑或生成阶段一（保留既有终稿直至新内容保存，失败不清空）"
+                        >
+                          <FileText className="h-3.5 w-3.5" aria-hidden="true" />
+                          <span>API 仅执行阶段一</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleGenerateSingleSectionApi(selectedStep3Slot.dayIndex, 'stage2')}
+                          disabled={!hasStage1 || generatingDayIndex !== null || isGeneratingBatch}
+                          className={secondaryActionClass}
+                          title="仅基于阶段一规格通过 API 重跑或生成阶段二图表代码（优先 5 类结构化 diagramSpec，不重写阶段一正文）"
+                        >
+                          <Image className="h-3.5 w-3.5" aria-hidden="true" />
+                          <span>API 仅执行阶段二图表</span>
+                        </button>
+                      </>
+                    )}
                   </div>
                 )}
 
@@ -4142,6 +5271,38 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                         <p role="status" className="mt-2 text-neutral-400">{agentPromptError || '正在读取本节指令…'}</p>
                       )}
                     </details>
+                    {course.category === 'english' &&
+                      agentStep2Prompt?.dayIndex === selectedStep3Slot.dayIndex &&
+                      (pendingStep3WordGlosses.length > 0 || step3SimplifySynonyms) && (
+                        <details key={`${secId}-step2`} open className="border-t border-neutral-800 pt-2">
+                          <summary className="cursor-pointer font-medium text-teal-300">
+                            {secId} · Step 2 补充词义与关联生词优化指令（待补 {pendingStep3WordGlosses.length} 词）
+                          </summary>
+                          <textarea
+                            readOnly
+                            aria-label="单节 Step 2 补充词义指令"
+                            value={agentStep2Prompt.text}
+                            className="mt-2 h-32 w-full rounded border border-neutral-800 bg-black p-2 text-xs"
+                          />
+                          <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              className="rounded border border-teal-700/80 px-3 py-1.5 text-teal-200 hover:border-teal-500"
+                              onClick={() =>
+                                triggerCopyFeedback(
+                                  'agent-section-step2',
+                                  agentStep2Prompt.text,
+                                  `${secId} Agent Step 2 指令`
+                                )
+                              }
+                            >
+                              {copiedKey === 'agent-section-step2'
+                                ? '已复制 Step 2 指令'
+                                : '一键复制 Step 2 补词指令'}
+                            </button>
+                          </div>
+                        </details>
+                      )}
                   </section>
                 )}
 
@@ -4164,10 +5325,14 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                           {autoStep3Stage === 'repair'
                             ? '检测到异常 · 等待局部修复'
                             : autoStep3Stage === 'stage2'
-                            ? `当前：阶段二 · 图表代码（待生成 ${pendingStep3Specs.length} 张）`
+                            ? course.category === 'english'
+                              ? `当前：Step 2 · 补充词义与关联生词统计（待补 ${pendingStep3WordGlosses.length} 词）`
+                              : `当前：阶段二 · 图表代码（待生成 ${pendingStep3Specs.length} 张）`
                             : autoStep3Stage === 'complete'
                             ? '当前：已完成终稿（可直接粘贴补丁/重跑）'
-                            : '当前：阶段一 · 教学正文与图示规格'}
+                            : course.category === 'english'
+                              ? '当前：Step 1 · 英文阅读文章与词汇练习'
+                              : '当前：阶段一 · 教学正文与图示规格'}
                         </span>
                         <span
                           className="text-neutral-200 font-medium truncate"
@@ -4178,8 +5343,12 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                       </div>
                       <div className="text-[11px] text-neutral-500">
                         {autoStep3Stage === 'stage2'
-                          ? '无需重复上传 PDF，直接复制阶段二提示词（或 .md 文件）发给 AI，再点击粘贴自动组装并跳转下一节。'
-                          : '依次完成「① 复制源文件 → ② 复制提示词（或 .md）→ ③ 粘贴 AI 输出」，系统将自动识别阶段一/阶段二/补丁并推进。'}
+                          ? course.category === 'english'
+                            ? '无需重生成正文，直接复制「② 复制 Step 2 补词提示词」（或 .md），粘贴返回的 JSON 或词表行后程序会自动合并并再次统计关联生词量。'
+                            : '无需重复上传 PDF，直接复制阶段二提示词（或 .md 文件）发给 AI，再点击粘贴自动组装并跳转下一节。'
+                          : course.category === 'english'
+                            ? '点击「② 复制本节阅读课件提示词」发给 AI（若 AI 支持联网将优先检索近 1 个月真实英文原文），再点击「③ 粘贴 AI 输出」自动保存。'
+                            : '依次完成「① 复制源文件 → ② 复制提示词（或 .md）→ ③ 粘贴 AI 输出」，系统将自动识别阶段一/阶段二/补丁并推进。'}
                       </div>
                     </div>
 
@@ -4293,7 +5462,8 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
 
                       {(autoStep3Stage === 'stage2' ||
                         pendingStep3Specs.length > 0 ||
-                        Boolean(step3Stage1BaseLesson?.diagrams?.length)) ? (
+                        Boolean(step3Stage1BaseLesson?.diagrams?.length) ||
+                        showEnglishChatStep2Controls) ? (
                         <>
                           <button
                             type="button"
@@ -4310,8 +5480,16 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                             )}
                             <span>
                               {copiedKey === `stage2-${selectedStep3Slot.dayIndex}`
-                                ? '已复制阶段二提示词'
-                                : '② 复制阶段二图表提示词'}
+                                ? course.category === 'english'
+                                  ? '已复制 Step 2 补词提示词'
+                                  : '已复制阶段二提示词'
+                                : course.category === 'english'
+                                  ? `② 复制 Step 2 补词提示词${
+                                      pendingStep3WordGlosses.length > 0
+                                        ? `（${pendingStep3WordGlosses.length} 词）`
+                                        : ''
+                                    }`
+                                  : '② 复制阶段二图表提示词'}
                             </span>
                           </button>
                           <button
@@ -4321,7 +5499,11 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                               handleCopySectionStagePrompt(selectedStep3Slot.dayIndex, 'stage2', true)
                             }
                             className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
-                            title="将阶段二提示词保存为 .md 文件并复制到系统剪贴板"
+                            title={
+                              course.category === 'english'
+                                ? '将 Step 2 补词提示词保存为 .md 文件并复制到系统剪贴板'
+                                : '将阶段二提示词保存为 .md 文件并复制到系统剪贴板'
+                            }
                           >
                             {copiedKey === `stage2-md-${selectedStep3Slot.dayIndex}` ? (
                               <Check className="w-3.5 h-3.5 text-emerald-400" />
@@ -4330,8 +5512,12 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                             )}
                             <span>
                               {copiedKey === `stage2-md-${selectedStep3Slot.dayIndex}`
-                                ? '已复制阶段二 .md'
-                                : '复制阶段二 .md 文件'}
+                                ? course.category === 'english'
+                                  ? '已复制 Step 2 .md'
+                                  : '已复制阶段二 .md'
+                                : course.category === 'english'
+                                  ? '复制 Step 2 .md 文件'
+                                  : '复制阶段二 .md 文件'}
                             </span>
                           </button>
                           <button
@@ -4341,13 +5527,21 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                               handleCopySectionStagePrompt(selectedStep3Slot.dayIndex, 'stage1', false)
                             }
                             className="inline-flex items-center gap-1 px-2 py-1.5 border border-neutral-800 hover:border-neutral-600 text-neutral-400 hover:text-neutral-200 rounded transition-colors whitespace-nowrap"
-                            title="如需重跑阶段一，可重新复制阶段一提示词"
+                            title={
+                              course.category === 'english'
+                                ? '如需重跑 Step 1 文章，可重新复制文章提示词'
+                                : '如需重跑阶段一，可重新复制阶段一提示词'
+                            }
                           >
                             <Copy className="w-3 h-3" />
                             <span>
                               {copiedKey === `stage1-${selectedStep3Slot.dayIndex}`
-                                ? '已复制阶段一'
-                                : '重复制阶段一'}
+                                ? course.category === 'english'
+                                  ? '已复制 Step 1'
+                                  : '已复制阶段一'
+                                : course.category === 'english'
+                                  ? '重复制 Step 1'
+                                  : '重复制阶段一'}
                             </span>
                           </button>
                           <button
@@ -4357,10 +5551,14 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                               handleCopySectionStagePrompt(selectedStep3Slot.dayIndex, 'stage1', true)
                             }
                             className="inline-flex items-center gap-1 px-2 py-1.5 border border-neutral-800 hover:border-neutral-600 text-neutral-400 hover:text-neutral-200 rounded transition-colors whitespace-nowrap"
-                            title="复制阶段一 .md 文件"
+                            title={
+                              course.category === 'english'
+                                ? '复制 Step 1 .md 文件'
+                                : '复制阶段一 .md 文件'
+                            }
                           >
                             <FileText className="w-3 h-3" />
-                            <span>阶段一 .md</span>
+                            <span>{course.category === 'english' ? 'Step 1 .md' : '阶段一 .md'}</span>
                           </button>
                         </>
                       ) : (
@@ -4380,8 +5578,12 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                             )}
                             <span>
                               {copiedKey === `stage1-${selectedStep3Slot.dayIndex}`
-                                ? '已复制阶段一提示词'
-                                : '② 复制阶段一提示词'}
+                                ? course.category === 'english'
+                                  ? '已复制阅读课件提示词'
+                                  : '已复制阶段一提示词'
+                                : course.category === 'english'
+                                  ? '② 复制本节阅读课件提示词'
+                                  : '② 复制阶段一提示词'}
                             </span>
                           </button>
                           <button
@@ -4391,7 +5593,7 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                               handleCopySectionStagePrompt(selectedStep3Slot.dayIndex, 'stage1', true)
                             }
                             className="inline-flex items-center gap-1 px-2.5 py-1.5 border border-neutral-700 hover:border-neutral-500 text-neutral-200 rounded transition-colors whitespace-nowrap"
-                            title="将阶段一提示词保存为 .md 文件并复制到系统剪贴板"
+                            title="将提示词保存为 .md 文件并复制到系统剪贴板"
                           >
                             {copiedKey === `stage1-md-${selectedStep3Slot.dayIndex}` ? (
                               <Check className="w-3.5 h-3.5 text-emerald-400" />
@@ -4400,8 +5602,10 @@ const CourseOutlineModalInner: React.FC<CourseOutlineModalInnerProps> = ({
                             )}
                             <span>
                               {copiedKey === `stage1-md-${selectedStep3Slot.dayIndex}`
-                                ? '已复制阶段一 .md'
-                                : '复制阶段一 .md 文件'}
+                                ? '已复制 .md'
+                                : course.category === 'english'
+                                  ? '复制本节 .md 文件'
+                                  : '复制阶段一 .md 文件'}
                             </span>
                           </button>
                         </>

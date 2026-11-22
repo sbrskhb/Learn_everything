@@ -150,6 +150,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [showContentCategoryBadges, setShowContentCategoryBadges] = useState<boolean>(
     Boolean(settings.showContentCategoryBadges)
   );
+  const [markedVocabBankId, setMarkedVocabBankId] = useState<string>(
+    settings.markedVocabBankId || ''
+  );
+  const [vocabBankOptions, setVocabBankOptions] = useState<
+    Array<{ id: string; name: string; wordCount: number }>
+  >([]);
   const [remoteAccessEnabled, setRemoteAccessEnabled] = useState<boolean>(
     settings.remoteAccessEnabled ?? true
   );
@@ -201,6 +207,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setShowLessonTools(Boolean(settings.showLessonTools));
     setShowAdvancedWorkflowDetails(Boolean(settings.showAdvancedWorkflowDetails));
     setShowContentCategoryBadges(Boolean(settings.showContentCategoryBadges));
+    setMarkedVocabBankId(settings.markedVocabBankId || '');
     setRemoteAccessEnabled(settings.remoteAccessEnabled ?? true);
     setServerPort(settings.serverPort || 3000);
     setAllowAllHosts(settings.allowAllHosts ?? true);
@@ -234,6 +241,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   useEffect(() => {
     if (isOpen) {
       fetchNetworkInfo();
+      fetch('/api/vocab-banks')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (Array.isArray(data?.vocabBanks)) {
+            setVocabBankOptions(
+              data.vocabBanks.map((b: any) => ({
+                id: String(b.id),
+                name: String(b.name || '未命名词库'),
+                wordCount: Array.isArray(b.words) ? b.words.length : 0,
+              }))
+            );
+          }
+        })
+        .catch(() => {});
     }
   }, [isOpen]);
 
@@ -350,6 +371,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           showLessonTools,
           showAdvancedWorkflowDetails,
           showContentCategoryBadges,
+          markedVocabBankId,
           remoteAccessEnabled,
           serverPort:
             Number.isInteger(Number(serverPort)) &&
@@ -566,6 +588,30 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <input type="checkbox" checked={showLessonTools} onChange={(e) => setShowLessonTools(e.target.checked)} />
               显示课件顶部小节资料与提示词工具（有错误或警告时自动显示）
             </label>
+            <div className="pt-2 border-t border-neutral-900 space-y-1.5">
+              <label
+                htmlFor="settings-marked-vocab-bank"
+                className="block text-xs font-medium text-neutral-200"
+              >
+                阅读标记生词本（保存英文阅读中点击标记的生词）
+              </label>
+              <select
+                id="settings-marked-vocab-bank"
+                value={markedVocabBankId}
+                onChange={(e) => setMarkedVocabBankId(e.target.value)}
+                className="w-full max-w-md bg-neutral-950 border border-neutral-800 rounded px-2.5 py-1.5 text-xs text-neutral-200 focus:outline-none focus:border-rose-500"
+              >
+                <option value="">默认（首次标记时自动创建「阅读标记生词本」）</option>
+                {vocabBankOptions.map((b) => (
+                  <option key={b.id} value={b.id}>
+                    {b.name}（{b.wordCount} 词）
+                  </option>
+                ))}
+              </select>
+              <p className="text-[11px] text-neutral-500">
+                在阅读英文文章时点击任意单词并选择「标记生词」将保存到此词库；执行 Step 2 补充词义时也会一并查询这些词的意思。
+              </p>
+            </div>
             <label
               htmlFor="settings-advanced-workflow-toggle"
               className="flex items-start gap-2.5 text-xs cursor-pointer"
@@ -1045,7 +1091,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       : 'text-neutral-400 hover:text-white'
                   }`}
                 >
-                  英语文章提示词
+                  语言学习提示词
                 </button>
                 <button
                   type="button"
@@ -1254,7 +1300,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     htmlFor="settings-english-prompt"
                     className="text-xs font-medium text-neutral-300"
                   >
-                    英语文章与词汇课件生成提示词
+                    语言学习与语境阅读提示词
                   </label>
                   <div className="flex flex-wrap items-center gap-2">
                     {englishPresets.map((preset) => (

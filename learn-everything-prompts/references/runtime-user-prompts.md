@@ -62,7 +62,7 @@ This file defines the runtime user prompt templates loaded by `src/prompts/promp
      - `plot2d`（函数/切线/定积分/概率密度/伏安特性）：写清函数数学关系、自变量/因变量区间 `[min, max]`、积分阴影边界、关键特征点与参考虚线；
      - `graph`（流程图/树图/状态机 FSM/自控框图）：写清布局方向（`LR`/`TB`）、全部节点标签/形状及有向边标注；
      - `wavedrom`（数字时序波形/寄存器位域）：写清周期拍数、各信号变化规律或各字段比特位宽/名称；
-     - `circuit`（直流/交流/运放原理图）：写清电源、R/L/C/二极管/运放/接地的拓扑连接、关键节点名、参数值、电压极性与电流参考方向；
+     - `circuit`（直流/交流/运放/晶体管原理图）：写清电源、R/L/C/二极管/运放/BJT/MOSFET/接地的拓扑连接，晶体管各引脚（b/c/e 或 g/d/s）所接节点，关键节点名、参数值、电压极性与电流参考方向；
      - `自由图表(svgCode)`：仅当上述 5 类均无法表达本图需求时（如 3D 几何、任意角度受力/斜面滑轮、光路、实验装置/器件物理剖面或复杂专用电路）选用，并写清坐标系、几何构型、微元/矢量箭头与标注文本。
 2. **格式与转义规则**：
    - 仅输出合法 JSON；JSON 字符串内的 LaTeX 反斜杠必须双写为 `\\`（如 `\\frac`、`\\text`）；`\text{...}` 内禁止裸下划线；文内引用图号直接写 `图 diag-1`（不加反引号）。
@@ -119,7 +119,7 @@ This file defines the runtime user prompt templates loaded by `src/prompts/promp
       "diagramId": "diag-ex-1",
       "topologySpec": "[推荐类型: plot2d] 若本题需要专属配图，写明推荐图表类型及具体连接/函数/坐标规格并确保 diagrams 中有对应 diag-ex-1（无需配图则省略）",
       "question": "练习题干",
-      "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
+      "options": ["A. 选项A（四项词数与细节长度大致均衡，严禁正确项明显最长）", "B. ...", "C. ...", "D. ..."],
       "answer": "A",
       "hint": "启发提示（按教学价值选填）",
       "explanation": "分步解析（按需要提供）",
@@ -162,9 +162,11 @@ This file defines the runtime user prompt templates loaded by `src/prompts/promp
      - **表达式规则**：`expr`/`expr2` 必须写标准安全数学表达式（如 `x^2`、`2*x+1`、`sin(x)`、`cos(x)`、`exp(-x)`、`sqrt(x)`、`abs(x)`、`1/x`、`pi`、`e`），**严禁写入 LaTeX 反斜杠命令**（如 `\frac`、`\sin`）。
    - **`graph`**（流程图、FSM 状态机、二叉树/图、自控系统框图、架构图）：`{ "type": "graph", "title"?: "...", "direction": "LR|TB|RL|BT", "nodes": [{"id":"n1","label":"...","subLabel"?: "...","shape":"rect|round|circle|diamond|pill|sum","tone":"default|accent|positive|negative|warn|purple"}], "edges": [{"from":"n1","to":"n2","label"?: "...","style":"solid|dashed|dotted","tone":"default","bidirectional"?: false}] }`
    - **`wavedrom`**（数电时序波形、通信协议时序、芯片寄存器位域）：`{ "type": "wavedrom", "title"?: "...", "signal": [{"name":"CLK","wave":"p...."}], "head"?: {"text":"...","tick":0}, "foot"?: {"tock":1} }` 或 `{ "type": "wavedrom", "title"?: "...", "reg": [{"name":"MODE","bits":4,"attr":"RW"}] }`（`signal` 与 `reg` 必须二选一且非空）。
-   - **`circuit`**（直流/交流/RLC/二极管/运算放大器相对走向原理图）：`{ "type": "circuit", "title"?: "...", "elements": [{"kind":"voltage_dc|voltage_ac|current_source|resistor|capacitor|inductor|diode|ground|wire|node|opamp","dir":"right|down|left|up","label"?: "R_1","value"?: "10kΩ","anchor"?: "n1","fromAnchor"?: "n1","toAnchor"?: "n2","currentLabel"?: "i_1","polarity"?: "+-|-+|none","length"?: 1}] }`
+   - **`circuit`**（直流/交流/RLC/二极管/运放/BJT/MOSFET 相对走向原理图，引擎自动横平竖直）：`{ "type": "circuit", "title"?: "...", "elements": [{"kind":"voltage_dc|voltage_ac|current_source|resistor|capacitor|inductor|diode|ground|wire|node|opamp|npn|pnp|nmos|pmos","id"?: "Q1","dir":"right|down|left|up","label"?: "R_1","value"?: "10kΩ","anchor"?: "n1","fromAnchor"?: "n1","toAnchor"?: "n2","currentLabel"?: "i_1","polarity"?: "+-|-+|none","length"?: 1,"route"?: "auto|hv|vh","pin"?: "b|c|e|g|d|s|in-|in+|out","flip"?: false,"depletion"?: false}] }`
      - 提示：`opamp`（若 `anchor`/`id` 为 `"u1"`）自动注册 `u1.in-`、`u1.in+`、`u1.out`（以及 `in-`、`in+`、`out`）供反馈回路与接地引用。
-   - **回退使用“自由图表（`svgCode`）”**：**仅当上述 5 类结构化图表均不符合本图课件表达需求时**（例如：三维几何体与曲面、任意角度受力分析与滑轮/斜面机械图、光学反射折射光路、物理化学实验装置与分子结构、半导体器件物理剖面、或超出 `circuit` 内置 11 种基础元件的复杂专用器件电路），才省略 `diagramSpec` 并退回输出适配深色背景高对比的原生自由 SVG 填入 `"svgCode"`（`<svg viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg">...</svg>`，文字安全边距 `>= 18px`，长标注用 `<tspan>` 换行，不用 `$` 宏）。
+     - 晶体管：`npn`/`pnp`（BJT，引脚 `b`/`c`/`e`）与 `nmos`/`pmos`（默认增强型，`"depletion": true` 为耗尽型，引脚 `g`/`d`/`s`）。**必须设置 `id`**（如 `"Q1"`、`"M1"`），引擎会自动注册 `Q1.b`、`Q1.c`、`Q1.e`（或 `M1.g`、`M1.d`、`M1.s`）。默认基极/栅极落在起点（当前光标或 `fromAnchor`），从左侧进入；`"dir":"left"` 时镜像为从右侧进入。`npn`/`nmos` 默认 c/d 在上、e/s 在下，`pnp`/`pmos` 默认 e/s 在上、c/d 在下，`"flip": true` 上下翻转。`"pin":"e"` 等可指定由哪个引脚落在起点（opamp 同样支持 `in-`/`in+`/`out`）。放置后光标位于 c/d，其余支路用 `"fromAnchor":"Q1.e"` 等引出。
+     - 横平竖直：每个元件只能沿 `right/down/left/up` 放置，**禁止斜线**。`toAnchor` 与起点不共线时，引擎会自动走直角折线：`route` 为 `hv` 时先水平后竖直，为 `vh` 时先竖直后水平，为 `auto` 时按 `dir` 决定；元件本体放在与 `dir` 同向的那一段上。推荐写法：反馈或旁路支路从节点竖直引出，反馈元件水平放置，最后用一根 `wire` 加 `toAnchor`（如 `"u1.out"`）闭合，无需手算长度。三条及以上支路交汇处会自动画节点圆点。
+   - **回退使用“自由图表（`svgCode`）”**：**仅当上述 5 类结构化图表均不符合本图课件表达需求时**（例如：三维几何体与曲面、任意角度受力分析与滑轮/斜面机械图、光学反射折射光路、物理化学实验装置与分子结构、半导体器件物理剖面、或超出 `circuit` 内置 15 种元件（含 BJT/MOSFET）的复杂专用器件电路（如 JFET、晶闸管、变压器、多发射极晶体管）），才省略 `diagramSpec` 并退回输出适配深色背景高对比的原生自由 SVG 填入 `"svgCode"`（`<svg viewBox="0 0 680 320" xmlns="http://www.w3.org/2000/svg">...</svg>`，文字安全边距 `>= 18px`，长标注用 `<tspan>` 换行，不用 `$` 宏）。
    - 输出合法 JSON，注意双引号按 `\"` 正确转义。
 
 ### 待生成图示规格列表（共 {{specCount}} 幅）
@@ -272,7 +274,7 @@ This file defines the runtime user prompt templates loaded by `src/prompts/promp
       "topologySpec": "如含配图写明拓扑规则，否则省略",
       "diagramId": "diag-ex-1",
       "question": "练习题干",
-      "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
+      "options": ["A. 选项A（四项词数与细节长度大致均衡，严禁正确项明显最长）", "B. ...", "C. ...", "D. ..."],
       "answer": "A",
       "hint": "解题提示（按教学价值选填）",
       "explanation": "分步解析（按需提供）",
@@ -304,20 +306,99 @@ This file defines the runtime user prompt templates loaded by `src/prompts/promp
 ## 5. English Lesson User Prompt (`template: english-lesson-user-prompt`)
 
 ````text
-请为英语课程《{{courseName}}》生成 **第 {{dayIndex}} 节（小节 ID：`{{sectionId}}`）：{{slotTitle}}** 的语境精读与词汇闭环自学课件。
+请为语言课程《{{courseName}}》生成 **第 {{dayIndex}} 节（小节 ID：`{{sectionId}}`）：{{slotTitle}}** 的英语精读课件。
 
-### 一、本节课程与词库上下文
+### 一、本节主题、检索窗口与学习配置
 - **课程目标**：{{courseGoal}}
-- **词库差集与分配信息**：{{bankSummary}}
-- **文章生成模式**：{{articleMode}}（{{articleModeDesc}}）
+- **本节主题与话题范围**：{{topicThemeInfo}}
+- **本节学习目标**：{{slotObjective}}
+- **学习者水平与目的**：{{learnerProfile}}｜{{learningPurpose}}
+- **文章获取三级优先级（`{{oneMonthAgoDate}}` ~ `{{currentDate}}`）**：
+  1. **首选 `authentic_article`**：找到最近一个月内真实英文原文，尽量保留原文主体结构与内容，仅作自然微调融入本节目标词；若搜到的单篇文章过短，可在一节课件中组合放入两篇同主题近期短文章（保留两篇来源、标题、发布日期与链接）；
+  2. **次选 `adapted_article`**：若无法直接展示完整原文或微调难以自然覆盖目标词，则严格根据检索到的近期真实原文内容自己重写完整文章并自然加入目标词汇（保留参考原文的来源、标题、发布日期与链接，并在 `originNote` 注明改写）；
+  3. **兜底 `ai_original`**：仅当确实检索不到合适原文（或无联网能力）时，基于近期可靠信息纯 AI 编写完整文章（`sourceUrl` 留空，严禁虚构链接）。
+- **偏好信源参考**：{{preferredSources}}
+- **内容模式与篇幅参考**：{{articleModeDesc}}｜{{readingLengthHint}}
 - **前后衔接**：前序 {{prevCourseInfo}}；后续 {{nextCourseInfo}}
 - **补充要求**：{{extraRequirements}}
-- **本节目标单词（共 {{wordCount}} 词）**：
-{{wordListText}}
+{{targetWordsSection}}
+{{prevSectionReviewInfo}}
+{{earlierReviewInfo}}
 {{materialSection}}
 
-### 二、格式与数据结构要求
-
-讲解例题、自测和练习必须按教材考点改编。重新组织题干，并至少改变数值、条件、所求量或情境之一，重新校验答案。定义、定理、通用公式和标准证明保持准确。
-- 输出包含 `title`, `summary`, `keyPoints`, `teachingContext`（含 `prerequisiteCheck`）, `markdownBody`（结合 `[!PREREQ]` / `[!TEXTBOOK]` / `[!INTUITION]` / `[!EXTENSION]` 及 `{{heuristic:hq-X}}`、`{{exercise:ex-X}}`）, `diagrams`（如含句法分析图，先写 `topologySpec`）, `heuristicQuestions`, `englishPayload`（`articleTitle`, `sourceReference`, `articleMode`, `targetWords`, `paragraphs`, `grammarAndUsageNotes`）, `exercises`（含必需 `answer`，按教学价值选填 `hint`/`explanation`/`wrongOptionsAnalysis`/`remediation`/`variantCheck`）, `reverseChecks`（按需选填）的合法 JSON 对象。
+### 二、内容组织与 JSON 格式规范
+请严格遵循 **先阅读、后讲解、再练习**，仅输出一个合法 JSON 对象（一次完成终稿，设 `"generationStage": "complete"`，`"diagrams": []`）：
+```json
+{
+  "sectionId": "{{sectionId}}",
+  "generationStage": "complete",
+  "title": "{{slotTitle}}",
+  "summary": "1~2 句话概括文章主题、语言难点与本节学习收获",
+  "keyPoints": ["核心阅读能力或表达要点1", "要点2"],
+  "teachingContext": {
+    "prerequisites": ["已学前序主题/基础语境"],
+    "learningObjectives": ["{{slotObjective}}"],
+    "teachingScope": "{{topicThemeInfo}}",
+    "connectionNote": "与前后节的主题及复习词衔接说明"
+  },
+  "englishPayload": {
+    "articleTitle": "完整英文文章标题",
+    "contentOrigin": "authentic_article | adapted_article | ai_original",
+    "sourceReference": "来源媒体或参考原文刊物（无原文时写「AI 原创（基于近期公开信息）」）",
+    "publishDate": "YYYY-MM-DD（原文发布日期或创作基准日期）",
+    "sourceUrl": "真实/参考原文链接 https://...（仅 ai_original 时留空字符串 \"\"，严禁编造 URL）",
+    "originNote": "注明：真实原文（微调融入词汇）/ 基于近期真实原文改写并加入词汇 / 纯 AI 原创（未能检索到可用原文）",
+    "articleMode": "{{articleMode}}",
+    "targetWords": [
+      {
+        "id": "w-001",
+        "word": "词条原型（与正文用词匹配，支持弹窗点选释义）",
+        "phonetic": "/.../",
+        "meaning": "贴合本文语境的中文释义",
+        "usageNote": "精炼点明熟词生义、语气色彩或近义词区别（可选）",
+        "collocations": ["常用搭配1", "常用搭配2"],
+        "example": "选自或仿照新语境的地道英文例句",
+        "exampleTranslation": "例句中文翻译",
+        "isReview": false
+      }
+    ],
+    "paragraphs": [
+      {
+        "english": "完整英文正文段落（自然地道，不机械堆砌单词；若课程配有词库，除词库词汇以外的其余用词难度应小于等于词库中的词汇；自然出现前一节或前序生词以供跨文章复习）",
+        "chinese": "对应段落的流畅中文译文"
+      }
+    ],
+    "grammarAndUsageNotes": ""
+  },
+  "markdownBody": "## 词汇用法精讲\n精选正文中有学习价值的重点生词，精炼讲解语境词义、固定搭配、熟词生义、近义词区别与常见用法（不必逐词重复）；若有前一节复现词点明其在新语境下的用法。\n\n## 长难句解析\n选取文章中 1～3 个最具代表性的复杂句，使用 `{{quote:P<段落号>:S<句号>}}`（如 `{{quote:P1:S2}}`）直接引用原文句子并清晰拆解关键语法结构（如主干、从句、非谓语/倒装等）与准确句意，确保原文修改时精讲同步。",
+  "exercises": [
+    {
+      "id": "ex-1",
+      "stage": "comprehensive",
+      "type": "choice",
+      "difficulty": "application",
+      "categoryLabel": "阅读理解·主旨概括（可选：细节理解 / 逻辑推断 / 作者观点）",
+      "question": "需基于全篇理解、推断或观点辨析作答的题目（3～5 题，避免原文照抄）",
+      "options": ["A. 选项A（四项词数与细节长度大致均衡，严禁正确项明显最长）", "B. ...", "C. ...", "D. ..."],
+      "answer": "B",
+      "explanation": "清晰解析为何该项符合文章逻辑与作者意图，并简述主要干扰项偏差"
+    },
+    {
+      "id": "ex-2",
+      "stage": "comprehensive",
+      "type": "choice | fill",
+      "difficulty": "application",
+      "categoryLabel": "词汇练习·语境选词（可选：搭配辨析 / 句子改写）",
+      "question": "脱离原文的新语境选词、搭配辨析或句子改写题（2～4 题，可复现前一节词汇）",
+      "options": ["A. 选项A（四项词数与细节长度大致均衡，严禁正确项明显最长）", "B. ...", "C. ...", "D. ..."],
+      "answer": "正确答案（choice 填选项字母如 A；fill 填标准单词或完整改写参考句）",
+      "explanation": "解析语境线索、固定搭配或语法改写要点"
+    }
+  ],
+  "diagrams": [],
+  "heuristicQuestions": [],
+  "reverseChecks": []
+}
+```
+注意：`markdownBody` 与中文译文中若涉及美元等货币金额请写作「100 美元」或 `USD 100`，避免在同一段落中成对出现 `$` 符号误触发公式解析。
 ````

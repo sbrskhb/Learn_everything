@@ -478,11 +478,21 @@ def _copy_windows_file_clipboard_powershell(abs_path: str) -> None:
     env = dict(os.environ)
     env["LEARN_COPY_FILE_PATH"] = abs_path
     proc = subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-STA", "-EncodedCommand", encoded_cmd],
+        [
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-STA",
+            "-EncodedCommand",
+            encoded_cmd,
+        ],
         env=env,
         capture_output=True,
         text=True,
         timeout=10,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or f"PowerShell exit {proc.returncode}")
@@ -795,6 +805,7 @@ class PythonBackendHandler(BaseHTTPRequestHandler):
                     {
                         "ok": True,
                         "engine": "python",
+                        "pid": os.getpid(),
                         "pythonVersion": platform.python_version(),
                         "pythonExecutable": sys.executable,
                         "inVenv": in_venv,

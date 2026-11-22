@@ -50,11 +50,168 @@ export interface PromptModuleToggles {
 }
 
 export interface VocabItem {
+  id?: string;                     // 词库内稳定 ID（如 "w-001"）
   word: string;
   phonetic?: string;
   meaning: string;
+  usageNote?: string;              // 语境词义/搭配/熟词生义/近义词辨析精讲
+  collocations?: string[];         // 常见固定搭配
+  isReview?: boolean;              // 是否为前序小节复现词汇
   example?: string;
   exampleTranslation?: string;
+  tags?: string[];
+}
+
+export type TargetLanguageCode = 'english' | 'japanese' | 'other';
+export type LanguageLearningPurpose = 'interest' | 'exam';
+export type LanguageInputMode =
+  | 'vocab_only'
+  | 'material_only'
+  | 'vocab_and_material'
+  | 'ai_autonomous';
+
+export interface VocabBank {
+  id: string;
+  name: string;
+  language?: TargetLanguageCode;
+  customLanguageName?: string;
+  description?: string;
+  words: VocabItem[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type VocabSemanticStatus = 'confirmed' | 'needs_review' | 'rejected';
+
+export interface VocabManualVerification {
+  sectionId: string;
+  wordId: string;
+  status: 'confirmed' | 'rejected';
+  reviewer: 'manual' | 'ai';
+  reason?: string;
+  snippetHash?: string;
+  updatedAt: string;
+}
+
+export interface SectionWordActualMatch {
+  wordId: string;
+  word: string;
+  role: 'new' | 'review' | 'incidental';
+  count: number;
+  matchedForms: string[];
+  snippets: string[];
+  semanticStatus: VocabSemanticStatus;
+  reviewReason?: string;
+}
+
+export interface SectionVocabCoverageRecord {
+  sectionId: string;
+  plannedNewWordIds: string[];
+  plannedReviewWordIds: string[];
+  hasLesson: boolean;
+  proseWordCount: number;
+  actualTargetOccurrences: number;
+  actualDensity: number;
+  matches: SectionWordActualMatch[];
+  coveredNewWordIds: string[];
+  missingNewWordIds: string[];
+  uncertainNewWordIds: string[];
+  updatedAt: string;
+}
+
+export interface CourseVocabCoverageRecord {
+  totalTargetWords: number;
+  plannedWordIds: string[];
+  unassignedWordIds: string[];
+  plannedCoverageRate: number;
+  actualCoveredWordIds: string[];
+  actualUncertainWordIds: string[];
+  actualUncoveredWordIds: string[];
+  actualCoverageRate: number;
+  bySection: Record<string, SectionVocabCoverageRecord>;
+  verifications?: Record<string, VocabManualVerification>;
+  updatedAt: string;
+}
+
+export interface EnglishReadingPlanStats {
+  effectiveTotal: number;
+  newWordsPerArticle: number;
+  targetWordDensity: number;
+  expectedRepeatsPerWord: number;
+  estimatedArticleCount: number;
+  expectedOccurrencesPerArticle: number;
+  estimatedArticleWordLength: number;
+  minWordLength: number;
+  maxWordLength: number;
+  message: string;
+}
+
+export interface VocabThemeItem {
+  id: string;                      // 主题 ID，如 "T01"
+  name: string;                    // 主题名称，如 "人工智能、数字化与科技创新"
+  description: string;             // 主题语义范围简介
+  weight: number;                  // 分配权重 (0.3 ~ 4.0)，受用户兴趣偏好加成
+  isInterestBoosted?: boolean;     // 是否为用户兴趣偏好的重点主题
+  isGeneralFallback?: boolean;     // 是否作为跨领域/抽象通用词兜底主题
+  keywords: string[];              // 中英双语高频主题词/语义线索词，供本地预标与对齐
+  subtopics?: string[];            // 可选子话题列表，用于大纲命名参考
+}
+
+export interface VocabWordThemeMapping {
+  themeIds: string[];              // 候选主题 ID（按语义契合度从高到低 1~3 个）
+  source: 'ai' | 'local' | 'manual';
+  confidence?: number;
+  updatedAt?: string;
+}
+
+export interface VocabThemePlan {
+  themes: VocabThemeItem[];
+  wordThemes: Record<string, VocabWordThemeMapping>;
+  interleaveThemes?: boolean;      // 是否跨主题穿插排布小节（默认 true）
+  lastThemesUpdatedAt?: string;
+  lastMappingUpdatedAt?: string;
+  lastAllocatedAt?: string;
+  allocationSummary?: {
+    totalWords: number;
+    mappedByAiCount: number;
+    mappedByLocalCount: number;
+    unmappedFallbackCount: number;
+    totalSections: number;
+    themeDistribution: Array<{
+      themeId: string;
+      themeName: string;
+      wordCount: number;
+      sectionCount: number;
+      sharePct: number;
+    }>;
+  };
+}
+
+export interface LanguageCourseConfig {
+  targetBankName: string;
+  excludedBankName: string;
+  totalTargetCount: number;
+  excludedCount: number;
+  effectiveWords: VocabItem[];
+  dailyWordCount: number;        // 每篇目标生词数（兼容历史字段）
+  articleMode: EnglishArticleMode;
+  preferredSources: string;
+  lastAllocatedAt?: string;
+  targetLanguage?: TargetLanguageCode;
+  customLanguageName?: string;
+  learningPurpose?: LanguageLearningPurpose;
+  interestPreferences?: string;
+  inputMode?: LanguageInputMode;
+  targetBankId?: string;
+  excludedBankId?: string;
+  topicCount?: number | null;
+  newWordsPerArticle?: number;
+  targetWordDensity?: number;
+  expectedRepeatsPerWord?: number;
+  estimatedArticleCount?: number;
+  estimatedArticleWordLength?: number;
+  vocabCoverage?: CourseVocabCoverageRecord;
+  vocabThemePlan?: VocabThemePlan;
 }
 
 export type ExerciseDifficulty = 'basic' | 'application' | 'comprehensive';
@@ -137,11 +294,42 @@ export interface EnglishArticleSection {
   chinese: string;
 }
 
+export interface EnglishSynonymReplacementRecord {
+  paragraphIndex: number;
+  originalWord: string;
+  originalWordId?: string;
+  replacedWith: string;
+  reason?: string;
+}
+
+export interface EnglishStep2GlossSummary {
+  updatedAt: string;
+  proseWordCount: number;
+  plannedNewCount: number;
+  reviewWordCount: number;
+  associatedWordCountBefore?: number;
+  associatedWordCount: number;
+  associatedOccurrences: number;
+  associatedDensityPercent: number;
+  totalBankWordCount: number;
+  glossedExtraCount: number;
+  pendingGlossCount: number;
+  synonymReplacementEnabled: boolean;
+  replacedCount: number;
+}
+
 export interface EnglishLessonPayload {
   articleTitle: string;
+  contentOrigin?: 'authentic_article' | 'adapted_article' | 'ai_original';
   sourceReference?: string;
+  publishDate?: string;
+  sourceUrl?: string;
+  originNote?: string;
   articleMode: EnglishArticleMode;
   targetWords: VocabItem[];
+  extraWordGlosses?: VocabItem[];
+  synonymReplacements?: EnglishSynonymReplacementRecord[];
+  step2VocabStats?: EnglishStep2GlossSummary;
   paragraphs: EnglishArticleSection[];
   grammarAndUsageNotes: string;
 }
@@ -246,7 +434,11 @@ export interface DailyPlanSlot {
   connectionNote?: string;         // 与前后课程的联系
   regionId?: string;               // 关联的第 1 步切分 PDF 区域 ID（如 "region-01"）
   regionIds?: string[];            // 关联的多个切分 PDF 区域 ID（当合并多个切分区域时使用）
-  assignedWords?: VocabItem[];     // For English courses (随机不重复抽取并稳定保存的每日词汇)
+  topicGroup?: string;             // 大纲规划的所属主题名
+  themeId?: string;                // 第 1 步主题规划 ID（如 "T01"）
+  targetWordIds?: string[];        // 本节首次引入的目标词稳定 ID 列表
+  reviewWordIds?: string[];        // 此前已引入、本节可复现的复习词 ID 列表
+  assignedWords?: VocabItem[];     // 本节关联的目标词对象列表（向后兼容旧课程）
   pdfSegment?: PdfSplitPlanItem;   // 绑定的本节 PDF 切分信息与小节 PDF 路径
   pdfSegments?: PdfSplitPlanItem[];// 绑定的本节全部 PDF 切分区域列表（多区域覆盖时）
   stage1Draft?: DailyLessonContent;// 阶段一（教学内容+图示规格）中间产物，阶段二失败或重试时保留
@@ -289,6 +481,7 @@ export interface VocabCoverageStats {
 
 export interface ExerciseSubmissionRecord {
   userAnswers: Record<string, string>;
+  selfUnderstoodIds?: string[];
   submittedAt: string;
   score: number;
   total: number;
@@ -321,17 +514,7 @@ export interface Course {
   knowledgeCatalog?: KnowledgeCatalogNode[];
   agentWorkspacePath?: string;     // courses/<folderName>
   customAssets?: Record<string, string>; // 统一图片/附件资源映射表 (fileName -> dataUrl)
-  englishConfig?: {
-    targetBankName: string;
-    excludedBankName: string;
-    totalTargetCount: number;
-    excludedCount: number;
-    effectiveWords: VocabItem[];
-    dailyWordCount: number;        // 每日目标单词数（如 20、30、50）
-    articleMode: EnglishArticleMode;
-    preferredSources: string;
-    lastAllocatedAt?: string;
-  };
+  englishConfig?: LanguageCourseConfig;
   dailyPlan: DailyPlanSlot[];
   dailySchedule?: DailyScheduleDay[];
   masteredWords: string[];
@@ -357,6 +540,7 @@ export interface AppSettings {
   showLessonTools?: boolean;
   showAdvancedWorkflowDetails?: boolean;
   showContentCategoryBadges?: boolean;
+  markedVocabBankId?: string;
   remoteAccessEnabled?: boolean;
   serverPort?: number;
   allowAllHosts?: boolean;

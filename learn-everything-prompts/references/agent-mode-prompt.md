@@ -49,12 +49,15 @@ This file defines the Agent Mode instruction templates loaded by `src/prompts/pr
       "id": "sec-01",
       "regionId": "region-01",
       "regionIds": ["region-01"],
+      "topicGroup": "所属主题（语言课程适用，其他可省略）",
       "title": "第 1 节：逻辑完整的知识点块主题",
       "objective": "本节具体可检验的自学目标",
       "prerequisites": ["本节先修知识"],
       "teachingScope": "对应区域 region-01 与原教材章节页码范围",
       "connectionNote": "承上启下的衔接说明",
-      "keyTopics": ["核心知识点1", "核心知识点2"]
+      "keyTopics": ["核心知识点1", "核心知识点2"],
+      "targetWordIds": ["w-001"],
+      "reviewWordIds": []
     }
   ]
 }
@@ -170,4 +173,110 @@ This file defines the Agent Mode instruction templates loaded by `src/prompts/pr
   ]
 }
 ```{{englishPayloadSchemaNote}}
+````
+
+---
+
+## 3. Agent Mode Language Reading Batch Prompt (`template: agent-english-batch-prompt`)
+
+````text
+# Learn_everything（第 3 步·语言阅读）— Agent 逐节生成完整阅读课件 (`lessons/sec-XX.json`)
+
+你正在本地课程工作区 **`{{workspaceDir}}`** 中，为语言课程 **《{{courseName}}》**（课程 ID：`{{courseId}}`）按序编写阅读课件。本课程为**语言精读课程，采用单阶段完整生成协议**（直接写入 `{{workspaceDir}}/lessons/sec-XX.json`，设 `"generationStage": "complete"`，无需分阶段生成图示）。
+
+## 一、课程配置与资料
+- **语言与学习者水平**：{{profileLabel}}（{{levelLabel}}）
+- **学习目标**：{{courseGoal}}
+- **近期原文检索窗（最近一个月内）**：`{{oneMonthAgoDate}}` ~ `{{currentDate}}`
+- **补充要求**：{{extraRequirements}}
+{{englishVocabSummary}}
+- **工作区资料文件**：
+{{materialFilesList}}
+
+---
+
+## 二、小节任务清单（每次专注一个小节；已完成 `sec-XX.json` 且未要求重写的默认跳过）
+{{dailyScheduleTable}}
+
+---
+
+## 三、单阶段语言课件执行协议
+1. **文章正文严格遵循三级优先级（`{{oneMonthAgoDate}}` ~ `{{currentDate}}`）**：
+   - **① 首选（找到原文章并微调词汇）**：具备联网搜索/抓取能力时，优先检索**最近一个月内**与本节主题匹配的真实英文完整原文，保持主体事实与行文结构并按需轻量微调融入目标词汇；若搜到的单篇文章过短，**可在一节课件中组合放入两篇同主题近期短文章**（在 `paragraphs` 中分篇呈现，并在 `articleTitle` / `sourceReference` / `sourceUrl` / `originNote` 中合并保留两篇来源），设 `"contentOrigin": "authentic_article"`。
+   - **② 次选（根据原文章自己写，加入词汇）**：若无法直接完整展示原文或目标词密集导致微调难以自然融入，请严格基于检索到的近期真实原文观点、事实与脉络**自己重写完整文章并自然加入目标词汇**；保留所参考原文的来源、标题、发布日期与链接，设 `"contentOrigin": "adapted_article"`，并在 `originNote` 注明改写。
+   - **③ 兜底（纯自己编）**：仅当无法检索到可用近期真实文章时，才基于可靠信息纯 AI 原创完整文章，设 `"contentOrigin": "ai_original"`、`sourceUrl: ""`，并在 `originNote` 明确标注（禁止编造虚假新闻链接）。
+2. **自然复现前序词汇（跨文章复习）**：
+   - 按顺序生成时，可将前一节及更早小节学过的词汇自然融入后续文章正文与新语境练习中（不强制重复次数，不计入本节新增目标词数）。
+3. **点击生词弹窗与精炼讲解**：
+   - `englishPayload.targetWords` 收录本节目标词、文章高价值生词及正文中复现的前节词（标 `"isReview": true`），填写语境释义、音标、`collocations`、`usageNote` 与例句，驱动界面阅读时的**点词弹窗释义**。**若课程配有目标词库，正文中除词库词汇以外的其余用词难度应小于等于词库中的词汇**（避免在词库之外引入更生僻的高难词）。
+   - `markdownBody` 保持精简准确，包含「## 词汇用法精讲」（选重点讲搭配、熟词生义与近义辨析）与「## 长难句解析」（1～3 个代表性复杂句；**引用正文句子时优先使用 `{{quote:P<段落号>:S<句号>}}` 如 `{{quote:P1:S2}}` 直接引用原文**，确保原文修改时精讲句子同步更新）。
+   - `exercises` 包含 **3～5 道阅读理解题**（主旨/细节/推断/作者观点，避免照抄原文）+ **2～4 道词汇练习**（语境选词/搭配辨析/句子改写，脱离原文新语境），全部提供答案与解析。**所有选择题（`choice`）的正确选项与干扰项必须保持词数、句式复杂度与细节密度大致均衡，严禁出现“正确选项明显比错误选项长”的特征**，并随机分布正确选项位置。
+4. **验证与自检**：每写完一节 `lessons/sec-XX.json`，请求 `GET /api/courses/{{courseIdEncoded}}/agent-diagnostics/sec-XX`（端口以运行配置为准），确认 `report.hasErrors === false`。中文讲解中的美元金额勿成对写 `$`。
+
+---
+
+## 四、核心教学质量规范
+{{teachingSystemPrompt}}
+
+---
+
+## 五、语言课件 JSON 字段参考（写入 `{{workspaceDir}}/lessons/sec-XX.json`）
+```json
+{
+  "sectionId": "sec-01",
+  "generationStage": "complete",
+  "title": "第 1 节标题",
+  "summary": "文章主旨与语言要点概述",
+  "keyPoints": ["核心阅读技能", "重点表达"],
+  "teachingContext": {
+    "prerequisites": ["前序关联主题"],
+    "learningObjectives": ["本节学习目标"],
+    "teachingScope": "主题范围",
+    "connectionNote": "与前后节衔接说明"
+  },
+  "englishPayload": {
+    "articleTitle": "Article Title",
+    "contentOrigin": "authentic_article | adapted_article | ai_original",
+    "sourceReference": "来源刊物 / 参考原文媒体",
+    "publishDate": "YYYY-MM-DD",
+    "sourceUrl": "https://...（仅 ai_original 时留空）",
+    "originNote": "标注：真实原文微调词汇 / 基于近期真实原文改写加词 / 纯 AI 原创",
+    "articleMode": "media_search | llm_original",
+    "targetWords": [
+      {
+        "id": "w-001",
+        "word": "resilient",
+        "phonetic": "/rɪˈzɪliənt/",
+        "meaning": "adj. 有韧性的；能迅速恢复的",
+        "usageNote": "常用于描述系统、经济或心理在冲击后的恢复能力",
+        "collocations": ["resilient supply chain", "economically resilient"],
+        "example": "A resilient grid recovers rapidly from extreme weather.",
+        "exampleTranslation": "有韧性的电网能从极端天气中迅速恢复。",
+        "isReview": false
+      }
+    ],
+    "paragraphs": [
+      { "english": "Full English paragraph...", "chinese": "流畅中文译文..." }
+    ],
+    "grammarAndUsageNotes": ""
+  },
+  "markdownBody": "## 词汇用法精讲\n...\n\n## 长难句解析\n...",
+  "exercises": [
+    {
+      "id": "ex-1",
+      "stage": "comprehensive",
+      "type": "choice",
+      "difficulty": "application",
+      "categoryLabel": "阅读理解·主旨概括",
+      "question": "题目",
+      "options": ["A. ...", "B. ...", "C. ...", "D. ..."],
+      "answer": "B",
+      "explanation": "解析"
+    }
+  ],
+  "diagrams": [],
+  "heuristicQuestions": [],
+  "reverseChecks": []
+}
+```
 ````
